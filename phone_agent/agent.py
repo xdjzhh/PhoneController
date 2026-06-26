@@ -143,6 +143,7 @@ class PhoneAgent:
         device_factory = get_device_factory()
         screenshot = device_factory.get_screenshot(self.agent_config.device_id)
         current_app = device_factory.get_current_app(self.agent_config.device_id)
+        print("+++++++++++++++current_app" + current_app)
 
         # Build messages
         if is_first:
@@ -171,9 +172,9 @@ class PhoneAgent:
         # Get model response
         try:
             msgs = get_messages(self.agent_config.lang)
-            print("\n" + "=" * 50)
-            print(f"💭 {msgs['thinking']}:")
-            print("-" * 50)
+            # print("\n" + "=" * 50)
+            # print(f"💭 {msgs['thinking']}:")
+            # print("-" * 50)
             response = self.model_client.request(self._context)
         except Exception as e:
             if self.agent_config.verbose:
@@ -216,11 +217,9 @@ class PhoneAgent:
                 finish(message=str(e)), screenshot.width, screenshot.height
             )
 
-        # Add assistant response to context
+        # Add assistant response to context - 只存储 action，不存储思考过程
         self._context.append(
-            MessageBuilder.create_assistant_message(
-                f"<think>{response.thinking}</think><answer>{response.action}</answer>"
-            )
+            MessageBuilder.create_assistant_message(response.action)
         )
 
         # Check if finished

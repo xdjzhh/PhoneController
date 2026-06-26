@@ -1,5 +1,6 @@
 """Model client for AI inference using OpenAI-compatible API."""
 
+from gc import disable
 import json
 import time
 from dataclasses import dataclass, field
@@ -67,7 +68,7 @@ class ModelClient:
         start_time = time.time()
         time_to_first_token = None
         time_to_thinking_end = None
-
+        self.config.extra_body["thinking"] = {"type":"disable"}
         stream = self.client.chat.completions.create(
             messages=messages,
             model=self.config.model_name,

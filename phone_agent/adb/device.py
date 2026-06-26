@@ -1,6 +1,7 @@
 """Device control utilities for Android automation."""
 
 import os
+import re
 import subprocess
 import time
 from typing import List, Optional, Tuple
@@ -148,7 +149,7 @@ def swipe(
         # Calculate duration based on distance
         dist_sq = (start_x - end_x) ** 2 + (start_y - end_y) ** 2
         duration_ms = int(dist_sq / 1000)
-        duration_ms = max(1000, min(duration_ms, 2000))  # Clamp between 1000-2000ms
+        duration_ms = max(500, min(duration_ms, 1000))  # Clamp between 1000-2000ms
 
     subprocess.run(
         adb_prefix

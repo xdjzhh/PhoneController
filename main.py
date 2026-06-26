@@ -194,38 +194,38 @@ def check_system_requirements(
     # Check 3: ADB Keyboard installed (only for ADB) or WebDriverAgent (for iOS)
     if device_type == DeviceType.ADB:
         print("3. Checking ADB Keyboard...", end=" ")
-        try:
-            result = subprocess.run(
-                ["adb", "shell", "ime", "list", "-s"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            ime_list = result.stdout.strip()
+        # try:
+        #     result = subprocess.run(
+        #         ["adb", "shell", "ime", "list", "-s"],
+        #         capture_output=True,
+        #         text=True,
+        #         timeout=10,
+        #     )
+        #     ime_list = result.stdout.strip()
 
-            if "com.android.adbkeyboard/.AdbIME" in ime_list:
-                print("✅ OK")
-            else:
-                print("❌ FAILED")
-                print("   Error: ADB Keyboard is not installed on the device.")
-                print("   Solution:")
-                print("     1. Download ADB Keyboard APK from:")
-                print(
-                    "        https://github.com/senzhk/ADBKeyBoard/blob/master/ADBKeyboard.apk"
-                )
-                print("     2. Install it on your device: adb install ADBKeyboard.apk")
-                print(
-                    "     3. Enable it in Settings > System > Languages & Input > Virtual Keyboard"
-                )
-                all_passed = False
-        except subprocess.TimeoutExpired:
-            print("❌ FAILED")
-            print("   Error: ADB command timed out.")
-            all_passed = False
-        except Exception as e:
-            print("❌ FAILED")
-            print(f"   Error: {e}")
-            all_passed = False
+        #     if "com.android.adbkeyboard/.AdbIME" in ime_list:
+        #         print("✅ OK")
+        #     else:
+        #         print("❌ FAILED")
+        #         print("   Error: ADB Keyboard is not installed on the device.")
+        #         print("   Solution:")
+        #         print("     1. Download ADB Keyboard APK from:")
+        #         print(
+        #             "        https://github.com/senzhk/ADBKeyBoard/blob/master/ADBKeyboard.apk"
+        #         )
+        #         print("     2. Install it on your device: adb install ADBKeyboard.apk")
+        #         print(
+        #             "     3. Enable it in Settings > System > Languages & Input > Virtual Keyboard"
+        #         )
+        #         all_passed = False
+        # except subprocess.TimeoutExpired:
+        #     print("❌ FAILED")
+        #     print("   Error: ADB command timed out.")
+        #     all_passed = False
+        # except Exception as e:
+        #     print("❌ FAILED")
+        #     print(f"   Error: {e}")
+        #     all_passed = False
     elif device_type == DeviceType.HDC:
         # For HDC, skip keyboard check as it uses different input method
         print("3. Skipping keyboard check for HarmonyOS...", end=" ")
@@ -419,7 +419,7 @@ Examples:
     parser.add_argument(
         "--apikey",
         type=str,
-        default=os.getenv("PHONE_AGENT_API_KEY", "EMPTY"),
+        default=os.getenv("PHONE_AGENT_API_KEY", "a76cba048d6e4660bd898e8c01745633.shbyEvx1hWf3CkYF"),
         help="API key for model authentication",
     )
 

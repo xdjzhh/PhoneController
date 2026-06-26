@@ -17,6 +17,7 @@ def type_text(text: str, device_id: str | None = None) -> None:
         Requires ADB Keyboard to be installed on the device.
         See: https://github.com/nicnocquee/AdbKeyboard
     """
+    print("input type_text" + text)
     adb_prefix = _get_adb_prefix(device_id)
     encoded_text = base64.b64encode(text.encode("utf-8")).decode("utf-8")
 
@@ -35,6 +36,39 @@ def type_text(text: str, device_id: str | None = None) -> None:
         capture_output=True,
         text=True,
     )
+        # Step 1: 通过广播设置剪贴板
+    # subprocess.run(
+    #     adb_prefix + [
+    #         "shell", "am", "broadcast",
+    #         "-a", "clipper.set",
+    #         "-e", "text", text
+    #     ],
+    #     capture_output=True, text=True
+    # )
+
+    # # Step 2: 获取剪贴板内容并打印
+    # get_result = subprocess.run(
+    #     adb_prefix + [
+    #         "shell", "am", "broadcast",
+    #         "-a", "clipper.get"
+    #     ],
+    #     capture_output=True, text=True, encoding="utf-8"
+    # )
+    # # 解析输出结果，提取 data="..." 中的内容
+    # clipboard_content = None
+    # if get_result.stdout:
+    #     # 使用正则表达式提取 data="..." 里面的文本
+    #     match = re.search(r'data="([^"]*)"', get_result.stdout)
+    #     if match:
+    #         clipboard_content = match.group(1)
+
+    # print(f"当前剪贴板内容: {clipboard_content}")
+
+    # # Step 3: 模拟粘贴
+    # subprocess.run(
+    #     adb_prefix + ["shell", "input", "keyevent", "279"],
+    #     capture_output=True, text=True
+    # )
 
 
 def clear_text(device_id: str | None = None) -> None:

@@ -176,6 +176,7 @@ class PhoneAgent:
             # print(f"💭 {msgs['thinking']}:")
             # print("-" * 50)
             response = self.model_client.request(self._context)
+            # response = self.model_client.local_ollama_request(self._context)
         except Exception as e:
             if self.agent_config.verbose:
                 traceback.print_exc()
@@ -217,10 +218,11 @@ class PhoneAgent:
                 finish(message=str(e)), screenshot.width, screenshot.height
             )
 
-        # Add assistant response to context - 只存储 action，不存储思考过程
+        # Add assistant response to context
         self._context.append(
-            MessageBuilder.create_assistant_message(response.action)
-        )
+            MessageBuilder.create_assistant_message(
+                f"<think>{response.thinking}</think><answer>{response.action}</answer>"
+            ))
 
         # Check if finished
         finished = action.get("_metadata") == "finish" or result.should_finish

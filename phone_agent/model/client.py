@@ -50,6 +50,8 @@ class ModelClient:
     def __init__(self, config: ModelConfig | None = None):
         self.config = config or ModelConfig()
         self.client = OpenAI(base_url=self.config.base_url, api_key=self.config.api_key)
+        # Ollama 客户端，默认地址 http://localhost:11434/v1
+        self.ollama_client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
     def request(self, messages: list[dict[str, Any]]) -> ModelResponse:
         """
@@ -68,7 +70,6 @@ class ModelClient:
         start_time = time.time()
         time_to_first_token = None
         time_to_thinking_end = None
-        self.config.extra_body["thinking"] = {"type":"disable"}
         stream = self.client.chat.completions.create(
             messages=messages,
             model=self.config.model_name,
@@ -77,6 +78,129 @@ class ModelClient:
             top_p=self.config.top_p,
             frequency_penalty=self.config.frequency_penalty,
             extra_body=self.config.extra_body,
+            stream=True,
+        )
+
+        raw_content = ""
+        buffer = ""  # Buffer to hold content that might be part of a marker
+        action_markers = ["finish(message=", "do(action="]
+        in_action_phase = False  # Track if we've entered the action phase
+        first_token_received = False
+
+        for chunk in stream:
+            if len(chunk.choices) == 0:
+                continue
+            if chunk.choices[0].delta.content is not None:
+                content = chunk.choices[0].delta.content
+                raw_content += content
+
+                # Record time to first token
+                if not first_token_received:
+                    time_to_first_token = time.time() - start_time
+                    first_token_received = True
+
+                if in_action_phase:
+                    # Already in action phase, just accumulate content without printing
+                    continue
+
+                buffer += content
+
+                # Check if any marker is fully present in buffer
+                marker_found = False
+                for marker in action_markers:
+                    if marker in buffer:
+                        # Marker found, print everything before it
+                        thinking_part = buffer.split(marker, 1)[0]
+                        print(thinking_part, end="", flush=True)
+                        print()  # Print newline after thinking is complete
+                        in_action_phase = True
+                        marker_found = True
+
+                        # Record time to thinking end
+                        if time_to_thinking_end is None:
+                            time_to_thinking_end = time.time() - start_time
+
+                        break
+
+                if marker_found:
+                    continue  # Continue to collect remaining content
+
+                # Check if buffer ends with a prefix of any marker
+                # If so, don't print yet (wait for more content)
+                is_potential_marker = False
+                for marker in action_markers:
+                    for i in range(1, len(marker)):
+                        if buffer.endswith(marker[:i]):
+                            is_potential_marker = True
+                            break
+                    if is_potential_marker:
+                        break
+
+                if not is_potential_marker:
+                    # Safe to print the buffer
+                    print(buffer, end="", flush=True)
+                    buffer = ""
+
+        # Calculate total time
+        total_time = time.time() - start_time
+
+        # Parse thinking and action from response
+        thinking, action = self._parse_response(raw_content)
+
+        # Print performance metrics
+        lang = self.config.lang
+        print()
+        print("=" * 50)
+        print(f"⏱️  {get_message('performance_metrics', lang)}:")
+        print("-" * 50)
+        if time_to_first_token is not None:
+            print(
+                f"{get_message('time_to_first_token', lang)}: {time_to_first_token:.3f}s"
+            )
+        if time_to_thinking_end is not None:
+            print(
+                f"{get_message('time_to_thinking_end', lang)}:        {time_to_thinking_end:.3f}s"
+            )
+        print(
+            f"{get_message('total_inference_time', lang)}:          {total_time:.3f}s"
+        )
+        print("=" * 50)
+
+        return ModelResponse(
+            thinking=thinking,
+            action=action,
+            raw_content=raw_content,
+            time_to_first_token=time_to_first_token,
+            time_to_thinking_end=time_to_thinking_end,
+            total_time=total_time,
+        )
+
+    def local_ollama_request(self, messages: list[dict[str, Any]], model_name: str = "yeahdongcn/AutoGLM-Phone-9B") -> ModelResponse:
+        """
+        Send a request to local Ollama model.
+
+        Args:
+            messages: List of message dictionaries in OpenAI format.
+            model_name: Ollama model name (default: llama3.2).
+
+        Returns:
+            ModelResponse containing thinking and action.
+
+        Raises:
+            ValueError: If the response cannot be parsed.
+        """
+        # Start timing
+        start_time = time.time()
+        time_to_first_token = None
+        time_to_thinking_end = None
+
+        stream = self.ollama_client.chat.completions.create(
+            messages=messages,
+            model=model_name,
+            max_tokens=self.config.max_tokens,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            frequency_penalty=self.config.frequency_penalty,
             stream=True,
         )
 

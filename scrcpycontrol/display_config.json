@@ -1,0 +1,50 @@
+{
+  "main_display": {
+    "window_title": "手机桌面",
+    "window_x": 100,
+    "window_y": 100,
+    "window_width": 540,
+    "window_height": 960,
+    "max_fps": 60,
+    "bitrate": "8M",
+    "keep_active": true
+  },
+  "app_displays": {
+    "com.eg.android.AlipayGphone": {
+      "window_title": "支付宝",
+      "window_x": 1200,
+      "window_y": 100,
+      "window_width": 540,
+      "window_height": 960,
+      "max_fps": 60,
+      "bitrate": "8M"
+    },
+    "com.taobao.taobao": {
+      "window_title": "淘宝",
+      "window_x": 1760,
+      "window_y": 100,
+      "window_width": 540,
+      "window_height": 960,
+      "max_fps": 60,
+      "bitrate": "8M"
+    },
+    "com.tencent.mm": {
+      "window_title": "微信",
+      "window_x": 1200,
+      "window_y": 1080,
+      "window_width": 540,
+      "window_height": 960,
+      "max_fps": 60,
+      "bitrate": "8M"
+    },
+    "com.ss.android.ugc.aweme": {
+      "window_title": "抖音",
+      "window_x": 1760,
+      "window_y": 1080,
+      "window_width": 540,
+      "window_height": 960,
+      "max_fps": 60,
+      "bitrate": "8M"
+    }
+  }
+}

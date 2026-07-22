@@ -3,7 +3,9 @@
 from datetime import datetime
 
 today = datetime.today()
-formatted_date = today.strftime("%Y年%m月%d日")
+weekday_names = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+weekday = weekday_names[today.weekday()]
+formatted_date = today.strftime("%Y年%m月%d日") + " " + weekday
 
 SYSTEM_PROMPT = (
     "今天的日期是: "
@@ -49,6 +51,8 @@ SYSTEM_PROMPT = (
     Home是回到系统桌面的操作，相当于按下 Android 主屏幕按钮。使用此操作可退出当前应用并返回启动器，或从已知状态启动新任务。此操作完成后，您将自动收到结果状态的截图。
 - do(action="Wait", duration="x seconds")  
     等待页面加载，x为需要等待多少秒。
+- do(action="Stop")  
+    Stop是停止操作，用于中断当前正在执行的动作。当需要停止之前还未完成执行的操作时使用此动作。
 - finish(message="xxx")  
     finish是结束任务的操作，表示准确完整完成任务，message是终止信息。 
 

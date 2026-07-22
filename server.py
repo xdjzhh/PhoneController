@@ -20,14 +20,15 @@ from phone_agent.agent import AgentConfig
 
 app = Flask(__name__)
 
-# 全局 Agent 实例
-agent = None
-agent_initialized = False
+# 全局配置
+model_config = None
+agent_config = None
+config_initialized = False
 
 
-def initialize_agent(base_url: str, model: str, api_key: str):
-    """初始化 Agent"""
-    global agent, agent_initialized
+def initialize_config(base_url: str, model: str, api_key: str):
+    """初始化配置"""
+    global model_config, agent_config, config_initialized
     
     model_config = ModelConfig(
         base_url=base_url,
@@ -37,25 +38,20 @@ def initialize_agent(base_url: str, model: str, api_key: str):
     
     agent_config = AgentConfig(
         max_steps=100,
-        verbose=True,
+        verbose=False,
     )
     
-    agent = PhoneAgent(
-        model_config=model_config,
-        agent_config=agent_config,
-    )
-    
-    agent_initialized = True
-    print("✅ Agent initialized successfully")
+    config_initialized = True
+    print("✅ Configuration initialized successfully")
 
 
 @app.route('/run', methods=['POST'])
 def run_task():
     """执行任务"""
-    if not agent_initialized:
+    if not config_initialized:
         return jsonify({
             'success': False,
-            'error': 'Agent not initialized'
+            'error': 'Configuration not initialized'
         }), 500
     
     data = request.get_json()
@@ -70,6 +66,11 @@ def run_task():
     
     try:
         print(f"\n📱 Running task: {task}")
+        # 每次调用创建新的 agent 对象
+        agent = PhoneAgent(
+            model_config=model_config,
+            agent_config=agent_config,
+        )
         result = agent.run(task)
         
         return jsonify({
@@ -130,7 +131,7 @@ def main():
     
     # Initialize agent
     print("🔧 Initializing Phone Agent...")
-    initialize_agent(
+    initialize_config(
         base_url=args.base_url,
         model=args.model,
         api_key=args.apikey

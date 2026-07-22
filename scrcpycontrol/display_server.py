@@ -29,7 +29,6 @@ from ctypes import wintypes
 import win32gui
 import win32con
 import win32api
-import win32process
 from flask import Flask, request, jsonify
 from multi_virtualdisplay import MainDisplay
 
@@ -803,58 +802,52 @@ def _setup_scrcpy_control_socket(control_port=27183):
 @app.route('/screen_power_off', methods=['POST'])
 def screen_power_off():
     """
-    实验接口：通过 scrcpy control socket 关闭物理屏幕
+    关闭物理屏幕（通过 ADB 发送 KEYCODE_SLEEP）
     
-    原理：发送 SET_SCREEN_POWER_MODE 消息（type=0x05, mode=0x00=off）
-    这等同于 scrcpy 的 --turn-screen-off 功能
+    原理：adb shell input keyevent 223 (KEYCODE_SLEEP)
+    尝试只关闭屏幕而不触发锁屏
     
     请求体（可选）:
         {
-            "control_port": 27183  # scrcpy 的 control socket 端口，默认 27183
+            "serial": "device_serial"  # 设备序列号，默认自动选择
         }
     """
     try:
-        data = request.get_json() or {}
-        control_port = data.get('control_port', 27183)
+        try:
+            data = request.get_json(force=True) or {}
+        except:
+            data = {}
+        serial = data.get('serial')
         
-        # 自动设置端口转发
-        if not _setup_scrcpy_control_socket(control_port):
+        # 构建 adb 命令
+        cmd = ["adb"]
+        if serial:
+            cmd.extend(["-s", serial])
+        cmd.extend(["shell", "input", "keyevent", "223"])  # KEYCODE_SLEEP
+        
+        print(f"[ScreenPower] Sending KEYCODE_SLEEP (223) via adb: {' '.join(cmd)}")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0:
+            print(f"[ScreenPower] ✅ Screen power OFF command sent via adb (KEYCODE_SLEEP)")
+            return jsonify({
+                "success": True,
+                "message": "Screen power OFF command sent via adb (KEYCODE_SLEEP)",
+                "method": "adb_shell"
+            })
+        else:
+            error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+            print(f"[ScreenPower] ❌ ADB command failed: {error_msg}")
             return jsonify({
                 "success": False,
-                "error": "无法设置端口转发，请确保 adb 和 scrcpy 正在运行"
+                "error": error_msg
             }), 500
-        
-        # 连接到 scrcpy 的 control socket
-        control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        control_socket.settimeout(5)
-        control_socket.connect(("localhost", control_port))
-        
-        # 发送 SET_SCREEN_POWER_MODE 消息
-        # 消息格式: [message_type: 1字节][power_mode: 1字节]
-        # 0x0A (10) = TYPE_SET_DISPLAY_POWER
-        # 0x00 = OFF, 0x02 = NORMAL
-        power_off_msg = bytes([0x0A, 0x00])
-        control_socket.send(power_off_msg)
-        
-        control_socket.close()
-        
-        print(f"[ScreenPower] Sent power OFF command to control socket port {control_port}")
-        
-        return jsonify({
-            "success": True,
-            "message": f"Screen power OFF command sent to port {control_port}",
-            "method": "control_socket"
-        })
-        
-    except socket.timeout:
+            
+    except subprocess.TimeoutExpired:
         return jsonify({
             "success": False,
-            "error": f"Connection timeout to control socket port {control_port}"
-        }), 500
-    except ConnectionRefusedError:
-        return jsonify({
-            "success": False,
-            "error": f"Connection refused on port {control_port}. Is scrcpy running?"
+            "error": "ADB command timeout"
         }), 500
     except Exception as e:
         return jsonify({
@@ -862,72 +855,56 @@ def screen_power_off():
             "error": str(e)
         }), 500
 
-def is_control_socket_ready(port, timeout=1.0):
-    """测试 control socket 是否可连接"""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex(("localhost", port))
-        sock.close()
-        return result == 0  # 0 表示连接成功
-    except:
-        return False
 
 @app.route('/screen_power_on', methods=['POST'])
 def screen_power_on():
     """
-    实验接口：通过 scrcpy control socket 打开物理屏幕
+    打开物理屏幕（通过 ADB 发送 KEYCODE_WAKEUP）
     
-    原理：发送 SET_SCREEN_POWER_MODE 消息（type=0x05, mode=0x02=normal）
+    原理：adb shell input keyevent 224 (KEYCODE_WAKEUP)
+    唤醒屏幕
     
     请求体（可选）:
         {
-            "control_port": 27183  # scrcpy 的 control socket 端口，默认 27183
+            "serial": "device_serial"  # 设备序列号，默认自动选择
         }
     """
-
     try:
-        data = request.get_json() or {}
-        control_port = data.get('control_port', 27183)
-        if is_control_socket_ready(control_port):
-            print(f"✅ is_control_socket_ready已就绪")
-        # 自动设置端口转发
-        if not _setup_scrcpy_control_socket(control_port):
+        try:
+            data = request.get_json(force=True) or {}
+        except:
+            data = {}
+        serial = data.get('serial')
+        
+        # 构建 adb 命令
+        cmd = ["adb"]
+        if serial:
+            cmd.extend(["-s", serial])
+        cmd.extend(["shell", "input", "keyevent", "224"])  # KEYCODE_WAKEUP
+        
+        print(f"[ScreenPower] Sending KEYCODE_WAKEUP (224) via adb: {' '.join(cmd)}")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0:
+            print(f"[ScreenPower] ✅ Screen power ON command sent via adb (KEYCODE_WAKEUP)")
+            return jsonify({
+                "success": True,
+                "message": "Screen power ON command sent via adb (KEYCODE_WAKEUP)",
+                "method": "adb_shell"
+            })
+        else:
+            error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+            print(f"[ScreenPower] ❌ ADB command failed: {error_msg}")
             return jsonify({
                 "success": False,
-                "error": "无法设置端口转发，请确保 adb 和 scrcpy 正在运行"
+                "error": error_msg
             }), 500
-        
-        # 连接到 scrcpy 的 control socket
-        control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        control_socket.settimeout(5)
-        control_socket.connect(("localhost", control_port))
-        
-        # 发送 SET_SCREEN_POWER_MODE 消息
-        # 0x0A (10) = TYPE_SET_DISPLAY_POWER
-        # 0x02 = NORMAL (打开屏幕)
-        power_on_msg = bytes([0x0A, 0x02])
-        control_socket.send(power_on_msg)
-        
-        control_socket.close()
-        
-        print(f"[ScreenPower] Sent power ON command to control socket port {control_port}")
-        
-        return jsonify({
-            "success": True,
-            "message": f"Screen power ON command sent to port {control_port}",
-            "method": "control_socket"
-        })
-        
-    except socket.timeout:
+            
+    except subprocess.TimeoutExpired:
         return jsonify({
             "success": False,
-            "error": f"Connection timeout to control socket port {control_port}"
-        }), 500
-    except ConnectionRefusedError:
-        return jsonify({
-            "success": False,
-            "error": f"Connection refused on port {control_port}. Is scrcpy running?"
+            "error": "ADB command timeout"
         }), 500
     except Exception as e:
         return jsonify({
@@ -958,7 +935,10 @@ def screen_power_off_client():
                 "error": "scrcpy-client-python not installed. Run: pip install scrcpy-client-python"
             }), 500
         
-        data = request.get_json() or {}
+        try:
+            data = request.get_json(force=True) or {}
+        except:
+            data = {}
         serial = data.get('serial')
         
         # 创建客户端
@@ -1007,7 +987,10 @@ def screen_power_on_client():
                 "error": "scrcpy-client-python not installed. Run: pip install scrcpy-client-python"
             }), 500
         
-        data = request.get_json() or {}
+        try:
+            data = request.get_json(force=True) or {}
+        except:
+            data = {}
         serial = data.get('serial')
         
         # 创建客户端

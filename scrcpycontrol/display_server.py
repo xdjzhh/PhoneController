@@ -287,12 +287,19 @@ screen_monitor_stop = False
 
 
 def _monitor_screen_lock():
-    """监控锁屏状态，自动输入密码解锁"""
-    global screen_monitor_stop
+    """监控锁屏状态，自动输入密码解锁并关闭物理屏幕"""
+    global screen_monitor_stop, config
+    
+    # 重新加载配置，确保获取最新的 lock_password
+    try:
+        config = load_config()
+    except Exception as e:
+        print(f"[ScreenMonitor] Failed to reload config: {e}")
     
     lock_password = config.get('lock_password', '')
     if not lock_password:
         print("[ScreenMonitor] No lock password configured, skipping auto-unlock")
+        print(f"[ScreenMonitor] Config keys: {list(config.keys())}")
         return
     
     print(f"[ScreenMonitor] Starting screen lock monitor (password: {'*' * len(lock_password)})")
@@ -302,21 +309,86 @@ def _monitor_screen_lock():
         print("[ScreenMonitor] No ADB device found")
         return
     device = devices[0]
+    print(f"[ScreenMonitor] Device found: {device.serial}")
     
     # 启动宽限期，等待 scrcpy 启动完成
     grace_cycles = 3
+    debug_printed = False
+    last_locked_state = None
+    
+    def check_keyguard_locked(verbose=False):
+        """检测是否锁屏，尝试多种方式"""
+        # 方式1: dumpsys window (最可靠)
+        try:
+            result = device.shell("dumpsys window | grep -i keyguard")
+            if verbose:
+                print(f"[ScreenMonitor] dumpsys window keyguard:\n{result}")
+            
+            # 检测多种关键字
+            if "isKeyguardShowing=true" in result:
+                return True
+            if "mIsShowing=true" in result:
+                return True
+            # 检查 showing=true (需要更精确的匹配，避免 showingAndNotOccluded 干扰)
+            for line in result.split('\n'):
+                line = line.strip()
+                if line.startswith('showing=') and 'showing=true' in line:
+                    return True
+                if line == 'showing=true':
+                    return True
+            
+            # 明确检测到未锁屏
+            if "isKeyguardShowing=false" in result:
+                return False
+            if "mIsShowing=false" in result:
+                return False
+        except Exception as e:
+            print(f"[ScreenMonitor] dumpsys window keyguard failed: {e}")
+        
+        # 方式2: dumpsys keyguard (某些设备可能没有这个服务)
+        try:
+            result = device.shell("dumpsys keyguard")
+            if verbose:
+                lines = result.strip().split('\n')
+                print(f"[ScreenMonitor] dumpsys keyguard first 20 lines:")
+                for line in lines[:20]:
+                    if line.strip():
+                        print(f"  {line.strip()}")
+            
+            if "mShowing=true" in result:
+                return True
+            if "isShowing=true" in result:
+                return True
+            if "mShowing=false" in result:
+                return False
+        except Exception as e:
+            if verbose:
+                print(f"[ScreenMonitor] dumpsys keyguard failed: {e}")
+        
+        # 方式3: 通过 mWakefulness 和 Display Power State 推断
+        # 注意：这种方式不够准确，仅作为兜底
+        return False
     
     while not screen_monitor_stop:
         try:
-            # 检查 Keyguard 状态（真正的锁屏状态）
-            keyguard_result = device.shell("dumpsys keyguard | grep 'mShowing'")
-            is_locked = "mShowing=true" in keyguard_result
+            # 第一次检测时打印详细调试信息
+            verbose = not debug_printed
+            is_locked = check_keyguard_locked(verbose=verbose)
+            if not debug_printed:
+                debug_printed = True
+                print(f"[ScreenMonitor] Initial lock state: is_locked={is_locked}")
             
             # 检查电源状态
-            power_result = device.shell("dumpsys power | grep 'mWakefulness'")
-            is_asleep = "Asleep" in power_result
+            try:
+                power_result = device.shell("dumpsys power | grep 'mWakefulness'")
+                is_asleep = "Asleep" in power_result
+            except:
+                is_asleep = False
             
-            print(f"[ScreenMonitor] is_locked={is_locked}, is_asleep={is_asleep}")
+            # 状态变化时打印
+            if is_locked != last_locked_state:
+                print(f"[ScreenMonitor] Lock state changed: {last_locked_state} -> {is_locked}, is_asleep={is_asleep}")
+                last_locked_state = is_locked
             
             # 宽限期处理
             if grace_cycles > 0:
@@ -337,7 +409,7 @@ def _monitor_screen_lock():
                 time.sleep(2)
                 
                 # 2. 输入密码
-                print(f"[ScreenMonitor] Inputting password: {lock_password}")
+                print(f"[ScreenMonitor] Inputting password: {'*' * len(lock_password)}")
                 device.shell(f"input text {lock_password}")
                 time.sleep(0.5)
                 
@@ -347,11 +419,18 @@ def _monitor_screen_lock():
                 time.sleep(2)
                 
                 # 4. 验证解锁成功
-                keyguard_check = device.shell("dumpsys keyguard | grep 'mShowing'")
-                print(f"[ScreenMonitor] Keyguard state after unlock: {keyguard_check.strip()}")
+                keyguard_check = check_keyguard_locked(verbose=True)
+                print(f"[ScreenMonitor] Unlock result: is_locked={keyguard_check}")
                 
-                if "mShowing=false" in keyguard_check:
+                if not keyguard_check:
                     print("[ScreenMonitor] ✅ Screen unlocked successfully")
+                    # 5. 解锁成功后，关闭物理屏幕（只关背光，不锁屏）
+                    print("[ScreenMonitor] Turning off physical screen after unlock...")
+                    try:
+                        import scrcpy
+                        _set_screen_power_mode_via_scrcpy_client(scrcpy.POWER_MODE_OFF)
+                    except ImportError:
+                        print("[ScreenMonitor] scrcpy-client not available, skipping screen off")
                 else:
                     print("[ScreenMonitor] ❌ Unlock may have failed")
             
@@ -913,6 +992,57 @@ def screen_power_on():
         }), 500
 
 
+def _set_screen_power_mode_via_scrcpy_client(mode, serial=None):
+    """
+    通过 scrcpy-client 设置屏幕电源模式（内部公共函数）
+    
+    Args:
+        mode: 电源模式 (scrcpy.POWER_MODE_OFF 或 scrcpy.POWER_MODE_NORMAL)
+        serial: 设备序列号，默认自动选择
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        try:
+            import scrcpy
+            from scrcpy import Client
+        except ImportError:
+            return False, "scrcpy-client not installed"
+        
+        mode_name = "OFF" if mode == scrcpy.POWER_MODE_OFF else "NORMAL"
+        print(f"[ScreenPower] Setting screen power mode to {mode_name} via scrcpy-client...")
+        
+        # 创建客户端
+        if serial:
+            client = Client(serial=serial)
+        else:
+            client = Client()
+        
+        # 启动客户端（建立 video 和 control 连接）
+        client.start(threaded=True)
+        
+        # 等待一下确保连接建立
+        import time
+        time.sleep(1)
+        
+        # 使用内置方法设置屏幕电源模式
+        client.control.set_screen_power_mode(mode)
+        
+        time.sleep(0.5)
+        
+        # 停止客户端
+        client.stop()
+        
+        print(f"[ScreenPower] ✅ Screen power mode set to {mode_name} via scrcpy-client")
+        return True, f"Screen power mode set to {mode_name} via scrcpy-client"
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return False, str(e)
+
+
 @app.route('/screen_power_off_client', methods=['POST'])
 def screen_power_off_client():
     """
@@ -930,7 +1060,6 @@ def screen_power_off_client():
         # 尝试导入 scrcpy 客户端库
         try:
             import scrcpy
-            from scrcpy import Client
         except ImportError:
             return jsonify({
                 "success": False,
@@ -943,38 +1072,19 @@ def screen_power_off_client():
             data = {}
         serial = data.get('serial')
         
-        # 创建客户端
-        print(f"[ScreenPower] Creating scrcpy client...")
-        if serial:
-            client = Client(serial=serial)
+        success, message = _set_screen_power_mode_via_scrcpy_client(scrcpy.POWER_MODE_OFF, serial)
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": message,
+                "method": "scrcpy_client_control_sender"
+            })
         else:
-            client = Client()
-        
-        # 启动客户端（建立 video 和 control 连接）
-        print(f"[ScreenPower] Starting scrcpy client (threaded=True)...")
-        client.start(threaded=True)
-        
-        # 等待一下确保连接建立
-        import time
-        time.sleep(1)
-        
-        # 使用内置方法设置屏幕电源模式为 OFF
-        print(f"[ScreenPower] Setting screen power mode to OFF...")
-        client.control.set_screen_power_mode(scrcpy.POWER_MODE_OFF)
-        
-        time.sleep(0.5)
-        
-        # 停止客户端
-        print(f"[ScreenPower] Stopping scrcpy client...")
-        client.stop()
-        
-        print(f"[ScreenPower] ✅ Screen power OFF command sent via scrcpy-client (set_screen_power_mode)")
-        
-        return jsonify({
-            "success": True,
-            "message": "Screen power OFF command sent via scrcpy-client (set_screen_power_mode)",
-            "method": "scrcpy_client_control_sender"
-        })
+            return jsonify({
+                "success": False,
+                "error": message
+            }), 500
         
     except Exception as e:
         import traceback
@@ -1002,7 +1112,6 @@ def screen_power_on_client():
         # 尝试导入 scrcpy 客户端库
         try:
             import scrcpy
-            from scrcpy import Client
         except ImportError:
             return jsonify({
                 "success": False,
@@ -1015,38 +1124,19 @@ def screen_power_on_client():
             data = {}
         serial = data.get('serial')
         
-        # 创建客户端
-        print(f"[ScreenPower] Creating scrcpy client...")
-        if serial:
-            client = Client(serial=serial)
+        success, message = _set_screen_power_mode_via_scrcpy_client(scrcpy.POWER_MODE_NORMAL, serial)
+        
+        if success:
+            return jsonify({
+                "success": True,
+                "message": message,
+                "method": "scrcpy_client_control_sender"
+            })
         else:
-            client = Client()
-        
-        # 启动客户端（建立 video 和 control 连接）
-        print(f"[ScreenPower] Starting scrcpy client (threaded=True)...")
-        client.start(threaded=True)
-        
-        # 等待一下确保连接建立
-        import time
-        time.sleep(1)
-        
-        # 使用内置方法设置屏幕电源模式为 NORMAL
-        print(f"[ScreenPower] Setting screen power mode to NORMAL...")
-        client.control.set_screen_power_mode(scrcpy.POWER_MODE_NORMAL)
-        
-        time.sleep(0.5)
-        
-        # 停止客户端
-        print(f"[ScreenPower] Stopping scrcpy client...")
-        client.stop()
-        
-        print(f"[ScreenPower] ✅ Screen power ON command sent via scrcpy-client (set_screen_power_mode)")
-        
-        return jsonify({
-            "success": True,
-            "message": "Screen power ON command sent via scrcpy-client (set_screen_power_mode)",
-            "method": "scrcpy_client_control_sender"
-        })
+            return jsonify({
+                "success": False,
+                "error": message
+            }), 500
         
     except Exception as e:
         import traceback

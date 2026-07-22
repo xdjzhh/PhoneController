@@ -916,9 +916,10 @@ def screen_power_on():
 @app.route('/screen_power_off_client', methods=['POST'])
 def screen_power_off_client():
     """
-    实验接口：通过 scrcpy-client-python 库关闭物理屏幕
+    关闭物理屏幕（通过 scrcpy-client 库的内置接口）
     
-    原理：使用第三方库 scrcpy-client-python 控制屏幕电源模式
+    原理：使用 scrcpy-client 的 ControlSender.set_screen_power_mode()
+    只关闭物理屏幕背光，不触发锁屏
     
     请求体（可选）:
         {
@@ -928,11 +929,12 @@ def screen_power_off_client():
     try:
         # 尝试导入 scrcpy 客户端库
         try:
+            import scrcpy
             from scrcpy import Client
         except ImportError:
             return jsonify({
                 "success": False,
-                "error": "scrcpy-client-python not installed. Run: pip install scrcpy-client-python"
+                "error": "scrcpy-client not installed. Run: pip install scrcpy-client"
             }), 500
         
         try:
@@ -942,23 +944,41 @@ def screen_power_off_client():
         serial = data.get('serial')
         
         # 创建客户端
+        print(f"[ScreenPower] Creating scrcpy client...")
         if serial:
             client = Client(serial=serial)
         else:
             client = Client()
         
-        # 设置屏幕电源模式为 OFF (0)
-        client.screen_power_mode = 0
+        # 启动客户端（建立 video 和 control 连接）
+        print(f"[ScreenPower] Starting scrcpy client (threaded=True)...")
+        client.start(threaded=True)
         
-        print(f"[ScreenPower] Sent power OFF command via scrcpy-client-python")
+        # 等待一下确保连接建立
+        import time
+        time.sleep(1)
+        
+        # 使用内置方法设置屏幕电源模式为 OFF
+        print(f"[ScreenPower] Setting screen power mode to OFF...")
+        client.control.set_screen_power_mode(scrcpy.POWER_MODE_OFF)
+        
+        time.sleep(0.5)
+        
+        # 停止客户端
+        print(f"[ScreenPower] Stopping scrcpy client...")
+        client.stop()
+        
+        print(f"[ScreenPower] ✅ Screen power OFF command sent via scrcpy-client (set_screen_power_mode)")
         
         return jsonify({
             "success": True,
-            "message": "Screen power OFF command sent via scrcpy-client-python",
-            "method": "scrcpy_client_library"
+            "message": "Screen power OFF command sent via scrcpy-client (set_screen_power_mode)",
+            "method": "scrcpy_client_control_sender"
         })
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "success": False,
             "error": str(e)
@@ -968,9 +988,10 @@ def screen_power_off_client():
 @app.route('/screen_power_on_client', methods=['POST'])
 def screen_power_on_client():
     """
-    实验接口：通过 scrcpy-client-python 库打开物理屏幕
+    打开物理屏幕（通过 scrcpy-client 库的内置接口）
     
-    原理：使用第三方库 scrcpy-client-python 控制屏幕电源模式
+    原理：使用 scrcpy-client 的 ControlSender.set_screen_power_mode()
+    点亮物理屏幕
     
     请求体（可选）:
         {
@@ -980,11 +1001,12 @@ def screen_power_on_client():
     try:
         # 尝试导入 scrcpy 客户端库
         try:
+            import scrcpy
             from scrcpy import Client
         except ImportError:
             return jsonify({
                 "success": False,
-                "error": "scrcpy-client-python not installed. Run: pip install scrcpy-client-python"
+                "error": "scrcpy-client not installed. Run: pip install scrcpy-client"
             }), 500
         
         try:
@@ -994,23 +1016,41 @@ def screen_power_on_client():
         serial = data.get('serial')
         
         # 创建客户端
+        print(f"[ScreenPower] Creating scrcpy client...")
         if serial:
             client = Client(serial=serial)
         else:
             client = Client()
         
-        # 设置屏幕电源模式为 NORMAL (2)
-        client.screen_power_mode = 2
+        # 启动客户端（建立 video 和 control 连接）
+        print(f"[ScreenPower] Starting scrcpy client (threaded=True)...")
+        client.start(threaded=True)
         
-        print(f"[ScreenPower] Sent power ON command via scrcpy-client-python")
+        # 等待一下确保连接建立
+        import time
+        time.sleep(1)
+        
+        # 使用内置方法设置屏幕电源模式为 NORMAL
+        print(f"[ScreenPower] Setting screen power mode to NORMAL...")
+        client.control.set_screen_power_mode(scrcpy.POWER_MODE_NORMAL)
+        
+        time.sleep(0.5)
+        
+        # 停止客户端
+        print(f"[ScreenPower] Stopping scrcpy client...")
+        client.stop()
+        
+        print(f"[ScreenPower] ✅ Screen power ON command sent via scrcpy-client (set_screen_power_mode)")
         
         return jsonify({
             "success": True,
-            "message": "Screen power ON command sent via scrcpy-client-python",
-            "method": "scrcpy_client_library"
+            "message": "Screen power ON command sent via scrcpy-client (set_screen_power_mode)",
+            "method": "scrcpy_client_control_sender"
         })
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "success": False,
             "error": str(e)

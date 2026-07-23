@@ -1,0 +1,54 @@
+# ============================================================
+# scrcpycontrol 模块依赖
+# ============================================================
+
+# ---- 核心依赖 ----
+flask>=3.0.0
+adbutils==0.14.1
+pyautogui>=0.9.50
+pywin32>=300; sys_platform == 'win32'
+pillow>=10.0.0
+numpy>=1.20.0
+opencv-python>=4.5.3
+
+# ---- scrcpy 相关 ----
+# scrcpy-client: 用于通过 control socket 控制屏幕电源模式
+# 注意：仅使用 control 功能（set_screen_power_mode），不使用 video/audio
+scrcpy-client==0.4.1
+
+# ============================================================
+# 版本冲突说明
+# ============================================================
+#
+# 1. adbutils 版本冲突
+#    - scrcpy-client 0.4.1 要求: adbutils>=0.14.1,<0.15.0
+#    - mysc-core 1.0.1 要求:     adbutils>=2.12.0
+#    - 当前使用: adbutils==0.14.1（为兼容 scrcpy-client 降级）
+#    - 影响: mysc-core 可能无法正常工作（如果用到 adbutils 2.x 的新 API）
+#
+# 2. av 版本冲突
+#    - scrcpy-client 0.4.1 要求: av>=9.2.0,<10.0.0
+#    - 当前安装: av==18.0.0
+#    - 影响: scrcpy-client 的 video/audio 功能不可用
+#    - 规避: 本模块仅使用 scrcpy-client 的 control socket 功能（set_screen_power_mode），
+#            不依赖 video/audio 解码，因此 av 版本不兼容不影响息屏控制功能
+#
+# 3. opencv-python 版本冲突
+#    - scrcpy-client 0.4.1 要求: opencv-python>=4.5.3,<5.0.0
+#    - 当前安装: opencv-python==5.0.0.93
+#    - 影响: scrcpy-client 的 video 显示功能可能异常
+#    - 规避: 同上，仅使用 control 功能，不依赖 video 处理
+#
+# ============================================================
+# 说明
+# ============================================================
+#
+# scrcpy-client 仅用于发送控制命令（如 set_screen_power_mode），
+# 每次调用时创建独立连接，发送命令后立即断开。
+# 视频流和屏幕镜像是由独立的 scrcpy.exe 进程处理的，
+# 与 scrcpy-client Python 库无关。
+#
+# 如果未来需要解决版本冲突，可以考虑：
+# 1. 直接通过 socket 发送 control 命令（不使用 scrcpy-client 库）
+# 2. 使用虚拟环境隔离依赖
+#

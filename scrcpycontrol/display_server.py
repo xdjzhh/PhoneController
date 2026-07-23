@@ -13,7 +13,6 @@ API Endpoints:
 """
 
 import os
-import sys
 import json
 import subprocess
 import shutil
@@ -21,16 +20,10 @@ import threading
 import time
 import atexit
 import re
-import socket
 import adbutils
-import pyautogui
-import ctypes
-from ctypes import wintypes
-import win32gui
-import win32con
-import win32api
 from flask import Flask, request, jsonify
 from multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
+from screen_control_keyhot import ScreenControlKeyHot
 
 app = Flask(__name__)
 
@@ -40,6 +33,7 @@ main_display_running = False
 app_displays = {}  # {app_package: display_info}  # TODO: remove after migration
 multi_display = None  # MultiVirtualDisplay instance
 app_display_map = {}  # {app_package: AppVirtualDisplay}
+screen_keyhot = None  # ScreenControlKeyHot instance
 config = None
 config_path = None
 lock = threading.Lock()
@@ -1098,387 +1092,42 @@ def screen_power_on_client():
 
 # ==================== 键盘快捷键控制接口 ====================
 
-# Windows API 常量
-VK_MENU = 0x12  # Alt 键
-VK_SHIFT = 0x10  # Shift 键
-VK_O = 0x4F  # O 键
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_EXTENDEDKEY = 0x0001
-INPUT_KEYBOARD = 1
-SW_SHOW = 5
-SW_RESTORE = 9
-WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
-WM_SYSKEYDOWN = 0x0104
-WM_SYSKEYUP = 0x0105
-
-# 加载 Windows API 函数
-user32 = ctypes.windll.user32
-FindWindowW = user32.FindWindowW
-SetForegroundWindow = user32.SetForegroundWindow
-GetForegroundWindow = user32.GetForegroundWindow
-SendInput = user32.SendInput
-ShowWindow = user32.ShowWindow
-SetWindowPos = user32.SetWindowPos
-PostMessageW = user32.PostMessageW
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
-
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [
-        ("uMsg", wintypes.DWORD),
-        ("wParamL", wintypes.WORD),
-        ("wParamH", wintypes.WORD),
-    ]
-
-class INPUT_UNION(ctypes.Union):
-    _fields_ = [
-        ("ki", KEYBDINPUT),
-        ("mi", MOUSEINPUT),
-        ("hi", HARDWAREINPUT),
-    ]
-
-class INPUT(ctypes.Structure):
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("union", INPUT_UNION),
-    ]
-
-def _enum_scrcpy_windows():
-    """枚举所有 scrcpy 窗口（调试用）"""
-    windows = []
-    
-    def callback(hwnd, _):
-        if win32gui.IsWindowVisible(hwnd):
-            title = win32gui.GetWindowText(hwnd)
-            # 检查是否是 scrcpy 窗口（通过类名或标题）
-            class_name = win32gui.GetClassName(hwnd)
-            if 'scrcpy' in class_name.lower() or (title and len(title) > 0):
-                windows.append({
-                    'hwnd': hwnd,
-                    'title': title,
-                    'class_name': class_name
-                })
-        return True
-    
-    win32gui.EnumWindows(callback, None)
-    return windows
-
-def find_scrcpy_window(title=None):
-    """查找 scrcpy 窗口句柄
-    
-    Args:
-        title: 窗口标题，如果为 None 则使用主显示配置的标题
-    """
-    # scrcpy 窗口标题通常是配置中的 window_title
-    if title is None:
-        title = config.get('main_display', {}).get('window_title', '手机桌面')
-    
-    print(f"[ScreenPower] Looking for window with title: '{title}'")
-    
-    hwnd = FindWindowW(None, title)
-    if hwnd:
-        print(f"[ScreenPower] ✅ Found window: '{title}' (hwnd={hwnd})")
-        return hwnd
-    
-    # 如果没找到，枚举所有窗口进行调试
-    print(f"[ScreenPower] Window with title '{title}' not found, enumerating all windows...")
-    all_windows = _enum_scrcpy_windows()
-    for w in all_windows:
-        print(f"[ScreenPower]   - hwnd={w['hwnd']}, title='{w['title']}', class='{w['class_name']}'")
-    
-    # 尝试其他可能的标题
-    for alt_title in ['手机桌面', 'scrcpy', 'Screen Mirror']:
-        if alt_title == title:
-            continue
-        hwnd = FindWindowW(None, alt_title)
-        if hwnd:
-            print(f"[ScreenPower] ✅ Found scrcpy window with title: '{alt_title}' (hwnd={hwnd})")
-            return hwnd
-    
-    print(f"[ScreenPower] ❌ No scrcpy window found")
-    
-    # 调试：获取当前前台窗口
-    current_fg = GetForegroundWindow()
-    print(f"[ScreenPower] DEBUG: Current foreground window: {current_fg}")
-    
-    return None
-
-def force_activate_window(hwnd):
-    """使用多种方法强制激活窗口（绕过 Windows 前台锁定限制）
-    
-    即使激活失败也返回 True，让 pyautogui 继续尝试。
-    """
-    if not hwnd:
-        print("[ScreenPower] ❌ Invalid window handle for force_activate")
-        return False
-    
-    try:
-        # 先检查窗口是否有效
-        if not win32gui.IsWindow(hwnd):
-            print("[ScreenPower] ❌ Window handle is not a valid window")
-            return False
-        
-        if not win32gui.IsWindowVisible(hwnd):
-            print("[ScreenPower] ⚠️ Window is not visible, trying to show it...")
-            try:
-                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-                time.sleep(0.1)
-            except:
-                pass
-        
-        # 如果窗口已经是前台窗口，直接返回成功
-        try:
-            current_fg = win32gui.GetForegroundWindow()
-            if current_fg == hwnd:
-                print(f"[ScreenPower] ✅ Window is already foreground (hwnd={hwnd})")
-                return True
-        except:
-            pass
-        
-        print(f"[ScreenPower] Activating window hwnd={hwnd}...")
-        
-        # 方法 1: 先模拟 Alt 键（绕过前台锁定）
-        try:
-            win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
-            time.sleep(0.05)
-            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
-            time.sleep(0.05)
-        except:
-            pass
-        
-        # 方法 2: 恢复窗口（如果最小化）
-        try:
-            if win32gui.IsIconic(hwnd):
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                time.sleep(0.1)
-        except:
-            pass
-        
-        # 方法 3: BringWindowToTop
-        try:
-            win32gui.BringWindowToTop(hwnd)
-        except:
-            pass
-        
-        # 方法 4: SetForegroundWindow
-        try:
-            result = win32gui.SetForegroundWindow(hwnd)
-            print(f"[ScreenPower] SetForegroundWindow result: {result}")
-        except Exception as e:
-            print(f"[ScreenPower] ⚠️ SetForegroundWindow failed: {e}")
-        
-        time.sleep(0.2)
-        
-        # 验证是否成功
-        try:
-            new_foreground = win32gui.GetForegroundWindow()
-            if new_foreground == hwnd:
-                print(f"[ScreenPower] ✅ Window activated successfully (hwnd={hwnd})")
-                return True
-            else:
-                try:
-                    fg_title = win32gui.GetWindowText(new_foreground)
-                    print(f"[ScreenPower] ⚠️ Window not activated, current fg: {new_foreground} ('{fg_title}')")
-                except:
-                    print(f"[ScreenPower] ⚠️ Window not activated, current fg: {new_foreground}")
-        except:
-            pass
-        
-        # 即使激活失败也返回 True，让流程继续
-        print(f"[ScreenPower] ⚠️ Activation may have failed, proceeding anyway...")
-        return True
-        
-    except Exception as e:
-        print(f"[ScreenPower] ⚠️ Unexpected error in force_activate_window: {e}")
-        # 即使出错也返回 True，让 pyautogui 继续尝试
-        return True
-
-
-def _make_keybd_input(vk, scan, flags):
-    """创建一个键盘输入结构"""
-    ki = KEYBDINPUT()
-    ki.wVk = vk
-    ki.wScan = scan
-    ki.dwFlags = flags
-    ki.time = 0
-    ki.dwExtraInfo = ctypes.POINTER(ctypes.c_ulong)()
-    inp = INPUT()
-    inp.type = INPUT_KEYBOARD
-    inp.union.ki = ki
-    return inp
-
-def send_hotkey_to_scrcpy(hwnd, vk_code, modifiers=None):
-    """向 scrcpy 窗口发送快捷键（pyautogui 方案：成熟可靠的键盘模拟）
-    
-    使用 pyautogui 而不是直接调用 SendInput，因为 pyautogui 已经处理了各种
-    Windows 输入问题（权限、结构对齐、错误处理等）。
-    """
-    if not hwnd:
-        print("[ScreenPower] ❌ Invalid window handle")
-        return False
-
-    modifiers = modifiers or []
-
-    print(f"[ScreenPower] Using pyautogui method for window {hwnd}...")
-    print(f"[ScreenPower] modifiers={modifiers}, vk_code={vk_code}")
-
-    # 第一步：强制激活 scrcpy 窗口（必须是前台窗口才能接收键盘输入）
-    print("[ScreenPower] Activating scrcpy window...")
-    if not force_activate_window(hwnd):
-        print("[ScreenPower] ⚠️ Window activation may have failed, continuing anyway...")
-    time.sleep(0.3)  # 等待窗口激活完成
-
-    # 第二步：将虚拟键码转换为 pyautogui 的键名
-    vk_to_name = {
-        VK_MENU: 'alt',
-        VK_SHIFT: 'shift',
-        VK_O: 'o',
-    }
-    
-    pyautogui_keys = []
-    for mod in modifiers:
-        name = vk_to_name.get(mod)
-        if name:
-            pyautogui_keys.append(name)
-        else:
-            print(f"[ScreenPower] ⚠️ Unknown modifier vk: {mod}")
-    
-    main_key_name = vk_to_name.get(vk_code)
-    if not main_key_name:
-        print(f"[ScreenPower] ❌ Unknown main key vk: {vk_code}")
-        return False
-    
-    pyautogui_keys.append(main_key_name)
-    
-    print(f"[ScreenPower] pyautogui hotkey: {'+'.join(pyautogui_keys)}")
-    
-    try:
-        # 使用 pyautogui 的 hotkey 函数
-        pyautogui.hotkey(*pyautogui_keys)
-        print(f"[ScreenPower] ✅ Hotkey sent successfully via pyautogui")
-        return True
-    except Exception as e:
-        print(f"[ScreenPower] ❌ pyautogui hotkey failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
 @app.route('/screen_off_hotkey', methods=['POST'])
 def screen_off_hotkey():
     """
     通过向 scrcpy 窗口发送 Alt+O 命令关闭物理屏幕
-    
+
     原理：
     1. 查找 scrcpy 窗口句柄
     2. 激活窗口并模拟键盘按键
     3. scrcpy 收到按键后通过 control socket 发送 SET_SCREEN_POWER_MODE(OFF)
     4. Android 设备执行 SurfaceControl.setDisplayPowerMode() 关闭屏幕
     """
-    try:
-        # 查找 scrcpy 窗口
-        hwnd = find_scrcpy_window()
-        if not hwnd:
-            return jsonify({
-                "success": False,
-                "error": "scrcpy window not found. Make sure scrcpy is running."
-            }), 500
-        
-        print(f"[ScreenPower] Sending Alt+O to scrcpy window (hwnd={hwnd})...")
-        
-        # 发送 Alt+O
-        success = send_hotkey_to_scrcpy(hwnd, VK_O, [VK_MENU])
-        time.sleep(0.5)
-        
-        if success:
-            print("[ScreenPower] ✅ Alt+O sent successfully")
-            return jsonify({
-                "success": True,
-                "message": "Alt+O command sent to scrcpy window",
-                "method": "windows_api",
-                "hwnd": hwnd
-            })
-        else:
-            return jsonify({
-                "success": False,
-                "error": "Failed to send key message"
-            }), 500
-        
-    except Exception as e:
-        print(f"[ScreenPower] ❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+    global screen_keyhot, config
+    if screen_keyhot is None:
+        screen_keyhot = ScreenControlKeyHot(config)
+    result = screen_keyhot.screen_off()
+    status_code = 200 if result.get('success') else 500
+    return jsonify(result), status_code
 
 
 @app.route('/screen_on_hotkey', methods=['POST'])
 def screen_on_hotkey():
     """
     通过向 scrcpy 窗口发送 Alt+Shift+O 命令点亮物理屏幕
-    
+
     原理：
     1. 查找 scrcpy 窗口句柄
     2. 激活窗口并模拟键盘按键
     3. scrcpy 收到按键后通过 control socket 发送 SET_SCREEN_POWER_MODE(NORMAL)
     4. Android 设备执行 SurfaceControl.setDisplayPowerMode() 打开屏幕
     """
-    try:
-        # 查找 scrcpy 窗口
-        hwnd = find_scrcpy_window()
-        if not hwnd:
-            return jsonify({
-                "success": False,
-                "error": "scrcpy window not found. Make sure scrcpy is running."
-            }), 500
-        
-        print(f"[ScreenPower] Sending Alt+Shift+O to scrcpy window (hwnd={hwnd})...")
-        
-        # 发送 Alt+Shift+O
-        success = send_hotkey_to_scrcpy(hwnd, VK_O, [VK_MENU, VK_SHIFT])
-        time.sleep(0.5)
-        
-        if success:
-            print("[ScreenPower] ✅ Alt+Shift+O sent successfully")
-            return jsonify({
-                "success": True,
-                "message": "Alt+Shift+O command sent to scrcpy window",
-                "method": "windows_api",
-                "hwnd": hwnd
-            })
-        else:
-            return jsonify({
-                "success": False,
-                "error": "Failed to send key message"
-            }), 500
-        
-    except Exception as e:
-        print(f"[ScreenPower] ❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+    global screen_keyhot, config
+    if screen_keyhot is None:
+        screen_keyhot = ScreenControlKeyHot(config)
+    result = screen_keyhot.screen_on()
+    status_code = 200 if result.get('success') else 500
+    return jsonify(result), status_code
 
 
 # ==================== 键盘快捷键控制接口结束 ====================

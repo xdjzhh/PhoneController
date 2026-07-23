@@ -134,7 +134,7 @@ class MainDisplay:
 
         return cmd
 
-    def start(self, port=27183):
+    def start(self, port=8887):
         """Start this main display."""
         if self.running:
             print(f"[{self.window_title}] Already running")
@@ -226,11 +226,13 @@ class AppVirtualDisplay:
     def __init__(self, app_package, display_id=None,
                  window_title=None, window_x=None, window_y=None,
                  window_width=None, window_height=None,
+                 new_display_width=1260, new_display_height=2844,
                  max_fps=60, bitrate='8M', video_codec='h264',
                  no_vd_system_decorations=True, flex_display=False,
                  borderless=False, background_color=None,
                  keep_active=True, turn_screen_off=True, stay_awake=True,
-                 record=None, scrcpy_path=None, device_serial=None):
+                 record=None, scrcpy_path=None, device_serial=None,
+                 base_port=8887):
         """
         Initialize a virtual display for an app.
 
@@ -242,6 +244,8 @@ class AppVirtualDisplay:
             window_y: Window Y position on desktop
             window_width: Window width
             window_height: Window height
+            new_display_width: Virtual display resolution width (default: 1260)
+            new_display_height: Virtual display resolution height (default: 2844)
             max_fps: Maximum frames per second
             bitrate: Video bitrate (e.g., '8M', '16M')
             video_codec: Video codec ('h264', 'h265', 'av1')
@@ -255,6 +259,7 @@ class AppVirtualDisplay:
             record: Record to file
             scrcpy_path: Path to scrcpy executable
             device_serial: ADB device serial number
+            base_port: Base port number for scrcpy server (default: 8887)
         """
         self.app_package = app_package
         self.display_id = display_id
@@ -263,6 +268,8 @@ class AppVirtualDisplay:
         self.window_y = window_y
         self.window_width = window_width
         self.window_height = window_height
+        self.new_display_width = new_display_width
+        self.new_display_height = new_display_height
         self.max_fps = max_fps
         self.bitrate = bitrate
         self.video_codec = video_codec
@@ -275,6 +282,7 @@ class AppVirtualDisplay:
         self.stay_awake = stay_awake
         self.record = record
         self.device_serial = device_serial
+        self.base_port = base_port
 
         self.scrcpy_path = scrcpy_path or self._find_scrcpy()
         self.process = None
@@ -314,8 +322,10 @@ class AppVirtualDisplay:
             cmd.extend(["-s", self.device_serial])
 
         # Create new virtual display with resolution
-        if self.window_width and self.window_height:
-            cmd.append(f"--new-display={self.window_width}x{self.window_height}")
+        nd_w = self.new_display_width
+        nd_h = self.new_display_height
+        if nd_w and nd_h:
+            cmd.append(f"--new-display={nd_w}x{nd_h}")
         else:
             cmd.append("--new-display")
 
@@ -371,9 +381,8 @@ class AppVirtualDisplay:
             cmd.extend(["--record", self.record])
 
         # Use different ports for multiple instances to avoid conflicts
-        # Default port is 27183, increment by display_id
-        base_port = 27183
-        port = base_port + (self.display_id or 0)
+        # Port = base_port + display_id
+        port = self.base_port + (self.display_id or 0)
         cmd.extend(["--port", str(port)])
 
         return cmd
@@ -630,7 +639,9 @@ class MultiVirtualDisplay:
     """
 
     def __init__(self, device_serial=None, scrcpy_path=None,
-                 turn_screen_off=True, keep_active=True):
+                 turn_screen_off=True, keep_active=True,
+                 new_display_width=1260, new_display_height=2844,
+                 base_port=8887):
         """
         Initialize multi virtual display manager.
 
@@ -639,11 +650,17 @@ class MultiVirtualDisplay:
             scrcpy_path: Path to scrcpy executable
             turn_screen_off: Turn off physical screen
             keep_active: Prevent device auto sleep
+            new_display_width: Default virtual display resolution width (default: 1260)
+            new_display_height: Default virtual display resolution height (default: 2844)
+            base_port: Base port number for scrcpy servers (default: 8887)
         """
         self.device_serial = device_serial
         self.scrcpy_path = scrcpy_path
         self.turn_screen_off = turn_screen_off
         self.keep_active = keep_active
+        self.new_display_width = new_display_width
+        self.new_display_height = new_display_height
+        self.base_port = base_port
         self.displays = []
         self.running = False
 
@@ -651,6 +668,7 @@ class MultiVirtualDisplay:
 
     def add_display(self, app_package, window_x=None, window_y=None,
                     window_width=None, window_height=None,
+                    new_display_width=None, new_display_height=None,
                     window_title=None, max_fps=60, bitrate='8M',
                     video_codec='h264', flex_display=False,
                     borderless=False, background_color=None,
@@ -664,6 +682,8 @@ class MultiVirtualDisplay:
             window_y: Window Y position
             window_width: Window width
             window_height: Window height
+            new_display_width: Virtual display resolution width (uses manager default if None)
+            new_display_height: Virtual display resolution height (uses manager default if None)
             window_title: Custom window title
             max_fps: Maximum frames per second
             bitrate: Video bitrate
@@ -684,6 +704,8 @@ class MultiVirtualDisplay:
             window_y=window_y,
             window_width=window_width,
             window_height=window_height,
+            new_display_width=new_display_width or self.new_display_width,
+            new_display_height=new_display_height or self.new_display_height,
             max_fps=max_fps,
             bitrate=bitrate,
             video_codec=video_codec,
@@ -694,7 +716,8 @@ class MultiVirtualDisplay:
             turn_screen_off=self.turn_screen_off,
             record=record,
             scrcpy_path=self.scrcpy_path,
-            device_serial=self.device_serial
+            device_serial=self.device_serial,
+            base_port=self.base_port
         )
         self.displays.append(display)
         return self

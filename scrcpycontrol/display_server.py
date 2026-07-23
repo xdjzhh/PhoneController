@@ -30,14 +30,16 @@ import win32gui
 import win32con
 import win32api
 from flask import Flask, request, jsonify
-from multi_virtualdisplay import MainDisplay
+from multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
 
 app = Flask(__name__)
 
 # Global state
 main_display = None  # MainDisplay instance
 main_display_running = False
-app_displays = {}  # {app_package: display_info}
+app_displays = {}  # {app_package: display_info}  # TODO: remove after migration
+multi_display = None  # MultiVirtualDisplay instance
+app_display_map = {}  # {app_package: AppVirtualDisplay}
 config = None
 config_path = None
 lock = threading.Lock()
@@ -115,18 +117,6 @@ def read_output(process, title, stop_event, display_info=None):
     except Exception as e:
         if not stop_event.is_set():
             print(f"[{title}] Output reader error: {e}")
-
-
-def _resolve_activity(device, app_package):
-    """Resolve the launcher activity for an app package."""
-    intent_result = device.shell(f"cmd package resolve-activity --brief {app_package}")
-    if intent_result and "/" in intent_result:
-        lines = intent_result.strip().split('\n')
-        for line in lines:
-            if '/' in line and not line.startswith('#'):
-                return line.strip()
-        return intent_result.strip().split('\n')[-1]
-    return None
 
 
 def launch_app_on_display(app_package, display_info, title):
@@ -285,36 +275,9 @@ def stop_main_display():
 screen_monitor_thread = None
 screen_monitor_stop = False
 
-
 def _monitor_screen_lock():
     """监控锁屏状态，自动输入密码解锁并关闭物理屏幕"""
     global screen_monitor_stop, config
-    
-    # 重新加载配置，确保获取最新的 lock_password
-    try:
-        config = load_config()
-    except Exception as e:
-        print(f"[ScreenMonitor] Failed to reload config: {e}")
-    
-    lock_password = config.get('lock_password', '')
-    if not lock_password:
-        print("[ScreenMonitor] No lock password configured, skipping auto-unlock")
-        print(f"[ScreenMonitor] Config keys: {list(config.keys())}")
-        return
-    
-    print(f"[ScreenMonitor] Starting screen lock monitor (password: {'*' * len(lock_password)})")
-    
-    devices = adbutils.adb.device_list()
-    if not devices:
-        print("[ScreenMonitor] No ADB device found")
-        return
-    device = devices[0]
-    print(f"[ScreenMonitor] Device found: {device.serial}")
-    
-    # 启动宽限期，等待 scrcpy 启动完成
-    grace_cycles = 3
-    debug_printed = False
-    last_locked_state = None
     
     def check_keyguard_locked(verbose=False):
         """检测是否锁屏，尝试多种方式"""
@@ -368,6 +331,32 @@ def _monitor_screen_lock():
         # 方式3: 通过 mWakefulness 和 Display Power State 推断
         # 注意：这种方式不够准确，仅作为兜底
         return False
+    
+    # 重新加载配置，确保获取最新的 lock_password
+    try:
+        config = load_config()
+    except Exception as e:
+        print(f"[ScreenMonitor] Failed to reload config: {e}")
+    
+    lock_password = config.get('lock_password', '')
+    if not lock_password:
+        print("[ScreenMonitor] No lock password configured, skipping auto-unlock")
+        print(f"[ScreenMonitor] Config keys: {list(config.keys())}")
+        return
+    
+    print(f"[ScreenMonitor] Starting screen lock monitor (password: {'*' * len(lock_password)})")
+    
+    devices = adbutils.adb.device_list()
+    if not devices:
+        print("[ScreenMonitor] No ADB device found")
+        return
+    device = devices[0]
+    print(f"[ScreenMonitor] Device found: {device.serial}")
+    
+    # 启动宽限期，等待 scrcpy 启动完成
+    grace_cycles = 3
+    debug_printed = False
+    last_locked_state = None
     
     while not screen_monitor_stop:
         try:
@@ -461,21 +450,17 @@ def cleanup():
     """Cleanup all displays on exit."""
     print("\nCleaning up all displays...")
     
-    # Stop all app displays
+    # Stop all app virtual displays via MultiVirtualDisplay
+    global multi_display
+    if multi_display:
+        try:
+            multi_display.stop_all()
+        except Exception as e:
+            print(f"Error stopping multi_display: {e}")
+    
+    # Also clean up the display map
     with lock:
-        for app_package in list(app_displays.keys()):
-            display_info = app_displays[app_package]
-            if display_info.get('stop_event'):
-                display_info['stop_event'].set()
-            if display_info.get('process'):
-                try:
-                    display_info['process'].terminate()
-                    display_info['process'].wait(timeout=5)
-                except:
-                    try:
-                        display_info['process'].kill()
-                    except:
-                        pass
+        app_display_map.clear()
     
     # Stop main display
     stop_main_display()
@@ -496,7 +481,7 @@ def start_display():
             "app_package": "com.eg.android.AlipayGphone"
         }
     
-    If app is in config: creates a new virtual display
+    If app is in config: creates a new virtual display using MultiVirtualDisplay
     If app is not in config: launches on main display (phone screen)
     """
     data = request.get_json()
@@ -548,105 +533,53 @@ def start_display():
     
     with lock:
         # Check if display already exists
-        if app_package in app_displays and app_displays[app_package].get('running'):
+        if app_package in app_display_map and app_display_map[app_package].running:
             return jsonify({
                 'success': False,
                 'error': f'Display for {app_package} already running'
             }), 409
         
         display_config = app_displays_cfg[app_package]
-        scrcpy_path = find_scrcpy()
-        
-        global next_port
-        port = next_port
-        next_port += 1
-        
-        # Build command with --new-display
-        cmd = [scrcpy_path]
-        
-        # Create virtual display with configured resolution
-        nd_w = display_config.get('new_display_width', 1080)
-        nd_h = display_config.get('new_display_height', 1920)
-        cmd.append(f"--new-display={nd_w}x{nd_h}")
-        
-        # Window size
-        w = display_config.get('window_width', 540)
-        h = display_config.get('window_height', 960)
-        cmd.extend(["--window-width", str(w)])
-        cmd.extend(["--window-height", str(h)])
-        
-        # Window position
-        if display_config.get('window_x') is not None:
-            cmd.extend(["--window-x", str(display_config['window_x'])])
-        if display_config.get('window_y') is not None:
-            cmd.extend(["--window-y", str(display_config['window_y'])])
-        
-        # Window title
-        cmd.extend(["--window-title", display_config.get('window_title', app_package)])
-        
-        # Video settings
-        cmd.extend(["--max-fps", str(display_config.get('max_fps', 60))])
-        cmd.extend(["--video-bit-rate", display_config.get('bitrate', '8M')])
-        
-        # Virtual display decorations
-        cmd.append("--no-vd-system-decorations")
-        
-        # Keep active
-        cmd.append("--keep-active")
-        
-        # Turn screen off
-        cmd.append("--turn-screen-off")
-        
-        # Port
-        cmd.extend(["--port", str(port)])
-        
-        print(f"[{display_config.get('window_title', app_package)}] Starting: {' '.join(cmd)}")
-        
-        env = os.environ.copy()
-        env['PYTHONIOENCODING'] = 'utf-8'
-        
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-            env=env
-        )
-        
-        stop_event = threading.Event()
         title = display_config.get('window_title', app_package)
         
-        # Create display_info dict first so read_output can update it
-        display_info = {
-            'process': process,
-            'stop_event': stop_event,
-            'config': display_config,
-            'running': True,
-            'port': port,
-            'android_display_id': None
-        }
-        
-        output_thread = threading.Thread(
-            target=read_output,
-            args=(process, title, stop_event, display_info),
-            daemon=True
+        # Create AppVirtualDisplay instance through MultiVirtualDisplay
+        display_id = len(multi_display.displays)
+        app_display = AppVirtualDisplay(
+            app_package=app_package,
+            display_id=display_id,
+            window_title=title,
+            window_x=display_config.get('window_x'),
+            window_y=display_config.get('window_y'),
+            window_width=display_config.get('window_width', 540),
+            window_height=display_config.get('window_height', 960),
+            new_display_width=display_config.get('new_display_width', 1260),
+            new_display_height=display_config.get('new_display_height', 2844),
+            max_fps=display_config.get('max_fps', 60),
+            bitrate=display_config.get('bitrate', '8M'),
+            no_vd_system_decorations=True,
+            keep_active=True,
+            turn_screen_off=False,
+            stay_awake=True,
+            scrcpy_path=multi_display.scrcpy_path,
+            device_serial=multi_display.device_serial,
+            base_port=multi_display.base_port
         )
-        output_thread.start()
-        display_info['output_thread'] = output_thread
         
-        app_displays[app_package] = display_info
+        # Add to MultiVirtualDisplay manager
+        multi_display.displays.append(app_display)
         
-        # Launch app on the virtual display in a separate thread
-        app_thread = threading.Thread(
-            target=launch_app_on_display,
-            args=(app_package, display_info, title),
-            daemon=True
-        )
-        app_thread.start()
+        # Add to our app -> display mapping
+        app_display_map[app_package] = app_display
+        
+        # Start the display
+        print(f"[{title}] Starting virtual display via MultiVirtualDisplay...")
+        app_display.start()
     
     return jsonify({
         'success': True,
         'app_package': app_package,
+        'display_type': 'virtual',
+        'display_id': display_id,
         'message': f'Display for {app_package} started successfully'
     })
 
@@ -671,30 +604,37 @@ def stop_display():
     app_package = data['app_package']
     
     with lock:
-        if app_package not in app_displays or not app_displays[app_package].get('running'):
+        if app_package not in app_display_map or not app_display_map[app_package].running:
             return jsonify({
                 'success': False,
                 'error': f'No display running for {app_package}'
             }), 404
         
-        display_info = app_displays[app_package]
-        title = display_info['config'].get('window_title', app_package)
+        app_display = app_display_map[app_package]
+        title = app_display.window_title
         
-        print(f"[{title}] Stopping display...")
+        print(f"[{title}] Stopping display via MultiVirtualDisplay...")
         
-        display_info['stop_event'].set()
+        # Stop the display
+        app_display.stop()
         
-        try:
-            display_info['process'].terminate()
-            display_info['process'].wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            display_info['process'].kill()
-            display_info['process'].wait()
-        except Exception as e:
-            print(f"[{title}] Error stopping: {e}")
+        # Remove from our mapping
+        del app_display_map[app_package]
         
-        display_info['running'] = False
-        del app_displays[app_package]
+        # Also remove from multi_display.displays
+        if app_display in multi_display.displays:
+            multi_display.displays.remove(app_display)
+        
+        # Ensure physical screen stays off if main display is still running
+        if main_display_running:
+            print(f"[{title}] Ensuring physical screen stays off...")
+            try:
+                import scrcpy
+                _set_screen_power_mode_via_scrcpy_client(scrcpy.POWER_MODE_OFF)
+            except ImportError:
+                pass
+            except Exception as e:
+                print(f"[{title}] Failed to turn off physical screen: {e}")
     
     return jsonify({
         'success': True,
@@ -716,15 +656,16 @@ def list_displays():
         'running': main_display_running
     })
     
-    # App displays
+    # App virtual displays (from MultiVirtualDisplay)
     with lock:
-        for app_package, display_info in app_displays.items():
+        for app_package, app_display in app_display_map.items():
             displays_info.append({
-                'type': 'app',
+                'type': 'virtual',
                 'app_package': app_package,
-                'window_title': display_info['config'].get('window_title', app_package),
-                'running': display_info['running'],
-                'port': display_info['port']
+                'window_title': app_display.window_title,
+                'running': app_display.running,
+                'display_id': app_display.display_id,
+                'android_display_id': app_display.android_display_id
             })
     
     return jsonify({
@@ -737,7 +678,7 @@ def list_displays():
 def health_check():
     """Health check endpoint."""
     with lock:
-        active_app_displays = sum(1 for d in app_displays.values() if d.get('running'))
+        active_app_displays = sum(1 for d in app_display_map.values() if d.running)
     
     return jsonify({
         'status': 'healthy',
@@ -1561,6 +1502,30 @@ def main():
     print("Starting permanent main display (phone screen)...")
     start_main_display()
     time.sleep(2)  # Wait for main display to initialize
+    
+    # Initialize MultiVirtualDisplay manager
+    global multi_display
+    scrcpy_path = find_scrcpy()
+    
+    # Get device serial
+    device_serial = None
+    try:
+        devices = adbutils.adb.device_list()
+        if devices:
+            device_serial = devices[0].serial
+    except Exception as e:
+        print(f"Warning: Failed to get device serial: {e}")
+    
+    multi_display = MultiVirtualDisplay(
+        scrcpy_path=scrcpy_path,
+        device_serial=device_serial,
+        turn_screen_off=False,
+        keep_active=True,
+        new_display_width=1260,
+        new_display_height=2844,
+        base_port=next_port
+    )
+    print("MultiVirtualDisplay manager initialized")
     
     print(f"\n🚀 Starting Display Server on {args.host}:{args.port}")
     print(f"📡 API endpoints:")

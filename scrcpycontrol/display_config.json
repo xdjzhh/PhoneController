@@ -17,6 +17,8 @@
       "window_y": 100,
       "window_width": 540,
       "window_height": 960,
+      "new_display_width": 1260,
+      "new_display_height": 2844,
       "max_fps": 60,
       "bitrate": "8M"
     },
@@ -26,6 +28,8 @@
       "window_y": 100,
       "window_width": 540,
       "window_height": 960,
+      "new_display_width": 1260,
+      "new_display_height": 2844,
       "max_fps": 60,
       "bitrate": "8M"
     },
@@ -35,6 +39,8 @@
       "window_y": 1080,
       "window_width": 540,
       "window_height": 960,
+      "new_display_width": 1260,
+      "new_display_height": 2844,
       "max_fps": 60,
       "bitrate": "8M"
     },
@@ -44,6 +50,8 @@
       "window_y": 1080,
       "window_width": 540,
       "window_height": 960,
+      "new_display_width": 1260,
+      "new_display_height": 2844,
       "max_fps": 60,
       "bitrate": "8M"
     }

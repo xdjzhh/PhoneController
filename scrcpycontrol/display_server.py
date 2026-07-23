@@ -216,11 +216,13 @@ def start_main_display():
     port = next_port
     next_port += 1
     
-    # 设置 stayon true，让屏幕休眠后不锁屏
+    # Get device serial
+    device_serial = None
     try:
         devices = adbutils.adb.device_list()
         if devices:
             device = devices[0]
+            device_serial = device.serial
             device.shell("svc power stayon true")
             print("[Main] Set svc power stayon true (screen will not lock after sleep)")
     except Exception as e:
@@ -235,10 +237,12 @@ def start_main_display():
         window_height=main_cfg.get('window_height'),
         max_fps=main_cfg.get('max_fps', 60),
         bitrate=main_cfg.get('bitrate', '8M'),
+        video_codec=main_cfg.get('video_codec', 'h264'),
         keep_active=main_cfg.get('keep_active', True),
-        turn_screen_off=True,  # Always turn off screen for main display
-        stay_awake=True,  # Keep device awake to prevent lock screen
-        scrcpy_path=scrcpy_path
+        turn_screen_off=main_cfg.get('turn_screen_off', True),
+        stay_awake=main_cfg.get('stay_awake', True),
+        scrcpy_path=scrcpy_path,
+        device_serial=device_serial
     )
     
     # Start the main display
@@ -556,10 +560,11 @@ def start_display():
             new_display_height=display_config.get('new_display_height', 2844),
             max_fps=display_config.get('max_fps', 60),
             bitrate=display_config.get('bitrate', '8M'),
+            video_codec=display_config.get('video_codec', 'h264'),
             no_vd_system_decorations=True,
-            keep_active=True,
+            keep_active=display_config.get('keep_active', True),
             turn_screen_off=False,
-            stay_awake=True,
+            stay_awake=display_config.get('stay_awake', True),
             scrcpy_path=multi_display.scrcpy_path,
             device_serial=multi_display.device_serial,
             base_port=multi_display.base_port

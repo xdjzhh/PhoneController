@@ -8,7 +8,10 @@
     "window_height": 960,
     "max_fps": 60,
     "bitrate": "8M",
-    "keep_active": true
+    "video_codec": "h264",
+    "keep_active": true,
+    "turn_screen_off": true,
+    "stay_awake": true
   },
   "app_displays": {
     "com.eg.android.AlipayGphone": {
@@ -20,7 +23,10 @@
       "new_display_width": 1260,
       "new_display_height": 2844,
       "max_fps": 60,
-      "bitrate": "8M"
+      "bitrate": "8M",
+      "video_codec": "h264",
+      "keep_active": true,
+      "stay_awake": true
     },
     "com.taobao.taobao": {
       "window_title": "淘宝",
@@ -31,7 +37,10 @@
       "new_display_width": 1260,
       "new_display_height": 2844,
       "max_fps": 60,
-      "bitrate": "8M"
+      "bitrate": "8M",
+      "video_codec": "h264",
+      "keep_active": true,
+      "stay_awake": true
     },
     "com.tencent.mm": {
       "window_title": "微信",
@@ -42,7 +51,10 @@
       "new_display_width": 1260,
       "new_display_height": 2844,
       "max_fps": 60,
-      "bitrate": "8M"
+      "bitrate": "8M",
+      "video_codec": "h264",
+      "keep_active": true,
+      "stay_awake": true
     },
     "com.ss.android.ugc.aweme": {
       "window_title": "抖音",
@@ -53,7 +65,10 @@
       "new_display_width": 1260,
       "new_display_height": 2844,
       "max_fps": 60,
-      "bitrate": "8M"
+      "bitrate": "8M",
+      "video_codec": "h264",
+      "keep_active": true,
+      "stay_awake": true
     }
   }
 }

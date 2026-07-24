@@ -172,9 +172,9 @@ class PhoneAgent:
         # Get model response
         try:
             msgs = get_messages(self.agent_config.lang)
-            # print("\n" + "=" * 50)
-            # print(f"💭 {msgs['thinking']}:")
-            # print("-" * 50)
+            print("\n" + "=" * 50)
+            print(f"💭 {msgs['thinking']}:")
+            print("-" * 50)
             response = self.model_client.request(self._context)
             # response = self.model_client.local_ollama_request(self._context)
         except Exception as e:

@@ -38,7 +38,7 @@ def initialize_config(base_url: str, model: str, api_key: str):
     
     agent_config = AgentConfig(
         max_steps=100,
-        verbose=False,
+        verbose=True,
     )
     
     config_initialized = True
@@ -116,10 +116,10 @@ def main():
     parser = argparse.ArgumentParser(description='Phone Agent HTTP Server')
     parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
     parser.add_argument('--port', type=int, default=8080, help='Port to listen on')
-    parser.add_argument('--base-url', default='http://open.bigmodel.cn/api/paas/v4', 
+    parser.add_argument('--base-url', default='https://open.bigmodel.cn/api/paas/v4', 
                         help='Model API base URL')
     parser.add_argument('--model', default='autoglm-phone', help='Model name')
-    parser.add_argument('--apikey', default='a76cba048d6e4660bd898e8c01745633.shbyEvx1hWf3CkYF', help='API key')
+    parser.add_argument('--apikey', default='cae66fb0786343ee9e078a00ec683721.3HmwuIx9d5Vf22DD', help='API key')
     # parser.add_argument(
     #     "--connect",
     #     "-c",

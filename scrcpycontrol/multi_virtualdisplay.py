@@ -28,6 +28,7 @@ class MainDisplay:
                  window_width=None, window_height=None,
                  max_fps=60, bitrate='8M', video_codec='h264',
                  keep_active=True, turn_screen_off=True, stay_awake=True,
+                 rotation=0,
                  scrcpy_path=None, device_serial=None):
         """
         Initialize main display.
@@ -58,6 +59,7 @@ class MainDisplay:
         self.keep_active = keep_active
         self.turn_screen_off = turn_screen_off
         self.stay_awake = stay_awake
+        self.rotation = rotation  # 0, 1, 2, 3 (0=0°, 1=90°, 2=180°, 3=270°)
         self.device_serial = device_serial
 
         self.scrcpy_path = scrcpy_path or self._find_scrcpy()
@@ -117,6 +119,10 @@ class MainDisplay:
         cmd.extend(["--video-bit-rate", self.bitrate])
         cmd.extend(["--video-codec", self.video_codec])
 
+        # Rotation (0, 90, 180, 270 degrees clockwise)
+        if self.rotation and self.rotation != 0:
+            cmd.extend(["--display-orientation", str(self.rotation)])
+
         # Keep active
         if self.keep_active:
             cmd.append("--keep-active")
@@ -143,7 +149,6 @@ class MainDisplay:
         cmd = self._build_command(port)
         print(f"[{self.window_title}] Starting: {' '.join(cmd)}")
 
-        # Use UTF-8 encoding to handle Chinese characters
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
 
@@ -151,7 +156,7 @@ class MainDisplay:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            bufsize=0,  # Unbuffered
+            bufsize=0,
             env=env
         )
 
@@ -159,7 +164,21 @@ class MainDisplay:
         self.stop_event.clear()
         print(f"[{self.window_title}] Main display started (PID: {self.process.pid})")
 
-        # Start output reader thread
+        time.sleep(1.5)
+        if self.process.poll() is not None:
+            self.running = False
+            exit_code = self.process.returncode
+            output = ""
+            try:
+                output = self.process.stdout.read().decode('utf-8', errors='replace')
+            except:
+                pass
+            print(f"[{self.window_title}] FAILED to start (exit code: {exit_code})")
+            if output:
+                print(f"[{self.window_title}] Output:\n{output[:1000]}")
+            self.process = None
+            return
+
         self.output_thread = threading.Thread(
             target=self._read_output, daemon=True
         )
@@ -396,35 +415,46 @@ class AppVirtualDisplay:
         cmd = self._build_command()
         print(f"[{self.window_title}] Starting: {' '.join(cmd)}")
 
-        # Use UTF-8 encoding to handle Chinese characters
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
-        
+
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            bufsize=0,  # Unbuffered
+            bufsize=0,
             env=env
         )
 
         self.running = True
         print(f"[{self.window_title}] Virtual display started (PID: {self.process.pid})")
 
-        # Start output reader thread
+        time.sleep(1.5)
+        if self.process.poll() is not None:
+            self.running = False
+            exit_code = self.process.returncode
+            output = ""
+            try:
+                output = self.process.stdout.read().decode('utf-8', errors='replace')
+            except:
+                pass
+            print(f"[{self.window_title}] FAILED to start (exit code: {exit_code})")
+            if output:
+                print(f"[{self.window_title}] Output:\n{output[:1500]}")
+            self.process = None
+            return
+
         self.output_thread = threading.Thread(
             target=self._read_output, daemon=True
         )
         self.output_thread.start()
 
-        # Start app launch thread (wait for display to initialize, then launch app)
         if self.app_package:
             self.app_thread = threading.Thread(
                 target=self._launch_app, daemon=True
             )
             self.app_thread.start()
 
-        # Start app monitor
         if self.app_package:
             self._start_app_monitor()
 

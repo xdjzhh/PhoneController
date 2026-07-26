@@ -256,6 +256,40 @@ def screen_monitor_status():
     })
 
 
+@app.route('/display/opacity', methods=['POST'])
+def set_window_opacity():
+    """设置窗口透明度"""
+    global display_manager
+    if not display_manager:
+        return jsonify({'success': False, 'error': 'Display manager not initialized'}), 500
+    data = request.get_json() or {}
+    app_package = data.get('app_package')
+    opacity = data.get('opacity', 1.0)
+    try:
+        opacity = float(opacity)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'opacity must be a number between 0.0 and 1.0'}), 400
+    result = display_manager.set_window_opacity(app_package, opacity)
+    status_code = 200 if result.get('success') else 500
+    return jsonify(result), status_code
+
+
+@app.route('/display/orientation', methods=['POST'])
+def set_display_orientation():
+    """设置屏幕方向（横屏/竖屏），支持主屏和虚拟屏"""
+    global display_manager
+    if not display_manager:
+        return jsonify({'success': False, 'error': 'Display manager not initialized'}), 500
+    data = request.get_json() or {}
+    app_package = data.get('app_package')  # None 或 "main" 表示主屏
+    orientation = data.get('orientation', 'portrait')
+    if orientation not in ('portrait', 'landscape'):
+        return jsonify({'success': False, 'error': "orientation must be 'portrait' or 'landscape'"}), 400
+    result = display_manager.set_display_orientation(app_package, orientation)
+    status_code = 200 if result.get('success') else 500
+    return jsonify(result), status_code
+
+
 def main():
     parser = argparse.ArgumentParser(description='Phone Agent HTTP Server')
     parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
@@ -299,6 +333,8 @@ def main():
     print(f"   POST http://{args.host}:{args.port}/display/screen_monitor/start")
     print(f"   POST http://{args.host}:{args.port}/display/screen_monitor/stop")
     print(f"   GET  http://{args.host}:{args.port}/display/screen_monitor/status")
+    print(f"   POST http://{args.host}:{args.port}/display/opacity")
+    print(f"   POST http://{args.host}:{args.port}/display/orientation")
     print("\nPress Ctrl+C to stop")
     
     app.run(host=args.host, port=args.port, debug=False, threaded=True)

@@ -7,5 +7,5 @@ functionality for Android device automation.
 
 from scrcpycontrol.display_interface import DisplayManager, get_display_manager
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["DisplayManager", "get_display_manager"]

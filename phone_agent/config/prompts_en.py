@@ -64,12 +64,6 @@ Your output should STRICTLY follow the format:
   <answer>
   do(action="Back")
   </answer>
-- **Stop**
-  Stop the currently executing action. Use this action to interrupt an operation that has not yet completed.
-  **Example**:
-  <answer>
-  do(action="Stop")
-  </answer>
 - **Finish**
   Terminate the program and optionally print a message.
   **Example**:

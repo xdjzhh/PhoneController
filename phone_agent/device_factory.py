@@ -3,6 +3,9 @@
 from enum import Enum
 from typing import Any
 
+from scrcpycontrol.display_interface import get_display_manager
+from phone_agent.config.apps import APP_PACKAGES
+
 
 class DeviceType(Enum):
     """Type of device connection tool."""
@@ -28,6 +31,29 @@ class DeviceFactory:
         """
         self.device_type = device_type
         self._module = None
+        self._active_display_id = None
+
+    @property
+    def active_display_id(self):
+        """Get the currently active virtual display ID. None means main display."""
+        return self._active_display_id
+
+    def set_active_display(self, display_id: int | None = None):
+        """
+        Set the active virtual display.
+
+        Args:
+            display_id: Virtual display ID. None or 0 means main display.
+        """
+        if display_id is not None and display_id == 0:
+            display_id = None
+        self._active_display_id = display_id
+        print(f"[DeviceFactory] Active display set to: {display_id if display_id else 'main'}")
+
+    def reset_display(self):
+        """Reset to main display."""
+        self._active_display_id = None
+        print("[DeviceFactory] Reset to main display")
 
     @property
     def module(self):
@@ -47,23 +73,51 @@ class DeviceFactory:
 
     def get_screenshot(self, device_id: str | None = None, timeout: int = 10):
         """Get screenshot from device."""
-        return self.module.get_screenshot(device_id, timeout)
+        return self.module.get_screenshot(device_id, timeout, self._active_display_id)
 
     def get_current_app(self, device_id: str | None = None) -> str:
-        """Get current app name."""
+        """Get current app name.
+
+        If a virtual display is active, returns the app name for that display.
+        Otherwise, queries the device for the current foreground app.
+        """
+        if self._active_display_id is not None and self._active_display_id != 0:
+            app_name = self._get_app_name_for_display(self._active_display_id)
+            if app_name:
+                return app_name
         return self.module.get_current_app(device_id)
+
+    def _get_app_name_for_display(self, display_id: int) -> str | None:
+        """Get app name for a virtual display ID.
+
+        Returns the app name (e.g. "微信") if found, None otherwise.
+        """
+        try:
+            dm = get_display_manager()
+            displays = dm.list_displays().get("displays", [])
+            for d in displays:
+                if d.get("android_display_id") == display_id:
+                    app_package = d.get("app_package")
+                    if app_package:
+                        for name, pkg in APP_PACKAGES.items():
+                            if pkg == app_package:
+                                return name
+                        return app_package
+            return None
+        except Exception:
+            return None
 
     def tap(
         self, x: int, y: int, device_id: str | None = None, delay: float | None = None
     ):
         """Tap at coordinates."""
-        return self.module.tap(x, y, device_id, delay)
+        return self.module.tap(x, y, device_id, delay, self._active_display_id)
 
     def double_tap(
         self, x: int, y: int, device_id: str | None = None, delay: float | None = None
     ):
         """Double tap at coordinates."""
-        return self.module.double_tap(x, y, device_id, delay)
+        return self.module.double_tap(x, y, device_id, delay, self._active_display_id)
 
     def long_press(
         self,
@@ -74,7 +128,7 @@ class DeviceFactory:
         delay: float | None = None,
     ):
         """Long press at coordinates."""
-        return self.module.long_press(x, y, duration_ms, device_id, delay)
+        return self.module.long_press(x, y, duration_ms, device_id, delay, self._active_display_id)
 
     def swipe(
         self,
@@ -88,16 +142,29 @@ class DeviceFactory:
     ):
         """Swipe from start to end."""
         return self.module.swipe(
-            start_x, start_y, end_x, end_y, duration_ms, device_id, delay
+            start_x, start_y, end_x, end_y, duration_ms, device_id, delay, self._active_display_id
         )
 
     def back(self, device_id: str | None = None, delay: float | None = None):
         """Press back button."""
-        return self.module.back(device_id, delay)
+        return self.module.back(device_id, delay, self._active_display_id)
 
     def home(self, device_id: str | None = None, delay: float | None = None):
-        """Press home button."""
-        return self.module.home(device_id, delay)
+        """Press home button.
+
+        If a virtual display is active, switches back to main display instead
+        of pressing home key. On main display, presses home key as normal.
+        """
+        if self._active_display_id is not None and self._active_display_id != 0:
+            print("[DeviceFactory] Virtual display active, switching to main display instead of home")
+            self.reset_display()
+            try:
+                dm = get_display_manager()
+                dm.activate_app_window(None)
+            except Exception:
+                pass
+            return
+        return self.module.home(device_id, delay, self._active_display_id)
 
     def launch_app(
         self, app_name: str, device_id: str | None = None, delay: float | None = None

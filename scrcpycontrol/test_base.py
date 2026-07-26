@@ -66,35 +66,35 @@ def test_imports():
     section("1. 模块导入测试")
 
     try:
-        from multi_virtualdisplay import MainDisplay
+        from .multi_virtualdisplay import MainDisplay
         test("MainDisplay 导入", True)
     except Exception as e:
         test("MainDisplay 导入", False, str(e))
         return False
 
     try:
-        from multi_virtualdisplay import MultiVirtualDisplay
+        from .multi_virtualdisplay import MultiVirtualDisplay
         test("MultiVirtualDisplay 导入", True)
     except Exception as e:
         test("MultiVirtualDisplay 导入", False, str(e))
         return False
 
     try:
-        from multi_virtualdisplay import AppVirtualDisplay
+        from .multi_virtualdisplay import AppVirtualDisplay
         test("AppVirtualDisplay 导入", True)
     except Exception as e:
         test("AppVirtualDisplay 导入", False, str(e))
         return False
 
     try:
-        from screen_control_keyhot import ScreenControlKeyHot
+        from .screen_control_keyhot import ScreenControlKeyHot
         test("ScreenControlKeyHot 导入", True)
     except Exception as e:
         test("ScreenControlKeyHot 导入", False, str(e))
         return False
 
     try:
-        import display_server
+        from . import display_server
         test("display_server 模块导入", True)
     except Exception as e:
         test("display_server 模块导入", False, str(e))
@@ -148,8 +148,8 @@ def test_config():
 def test_classes():
     section("3. 类实例化测试")
 
-    from multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
-    from screen_control_keyhot import ScreenControlKeyHot
+    from .multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
+    from .screen_control_keyhot import ScreenControlKeyHot
 
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         cfg = json.load(f)

@@ -22,8 +22,8 @@ import atexit
 import re
 import adbutils
 from flask import Flask, request, jsonify
-from multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
-from screen_control_keyhot import ScreenControlKeyHot
+from .multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
+from .screen_control_keyhot import ScreenControlKeyHot
 
 app = Flask(__name__)
 

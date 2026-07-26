@@ -22,13 +22,14 @@ class Screenshot:
     is_sensitive: bool = False
 
 
-def get_screenshot(device_id: str | None = None, timeout: int = 10) -> Screenshot:
+def get_screenshot(device_id: str | None = None, timeout: int = 10, display_id: int | None = None) -> Screenshot:
     """
     Capture a screenshot from the connected Android device.
 
     Args:
         device_id: Optional ADB device ID for multi-device setups.
         timeout: Timeout in seconds for screenshot operations.
+        display_id: Optional virtual display ID. None or 0 means main display.
 
     Returns:
         Screenshot object containing base64 data and dimensions.
@@ -40,10 +41,14 @@ def get_screenshot(device_id: str | None = None, timeout: int = 10) -> Screensho
     temp_path = os.path.join(tempfile.gettempdir(), f"screenshot_{uuid.uuid4()}.png")
     adb_prefix = _get_adb_prefix(device_id)
 
+    screencap_cmd = ["shell", "screencap", "-p", "/sdcard/tmp.png"]
+    if display_id is not None and display_id != 0:
+        screencap_cmd = ["shell", "screencap", "-d", str(display_id), "-p", "/sdcard/tmp.png"]
+
     try:
         # Execute screenshot command
         result = subprocess.run(
-            adb_prefix + ["shell", "screencap", "-p", "/sdcard/tmp.png"],
+            adb_prefix + screencap_cmd,
             capture_output=True,
             text=True,
             timeout=timeout,

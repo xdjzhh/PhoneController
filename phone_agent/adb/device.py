@@ -1,13 +1,45 @@
 """Device control utilities for Android automation."""
 
+import atexit
+import json
 import os
 import re
 import subprocess
+import sys
 import time
 from typing import List, Optional, Tuple
 
+from scrcpycontrol.display_interface import get_display_manager
 from phone_agent.config.apps import APP_PACKAGES
 from phone_agent.config.timing import TIMING_CONFIG
+
+USE_VIRTUAL_DISPLAY = os.environ.get("USE_VIRTUAL_DISPLAY", "1") == "1"
+
+
+def _launch_app_via_virtual_display(package: str) -> bool:
+    """
+    Launch an app via virtual display using DisplayManager.
+
+    Args:
+        package: App package name.
+
+    Returns:
+        True if launched via virtual display, False otherwise.
+    """
+    try:
+        dm = get_display_manager()
+        result = dm.start_app_display(package)
+        if result.get("success"):
+            print(f"[VirtualDisplay] App {package} launched via virtual display")
+            return True
+        else:
+            print(f"[VirtualDisplay] Failed to start virtual display for {package}: {result.get('error')}")
+            return False
+    except Exception as e:
+        print(f"[VirtualDisplay] Error launching {package}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def get_current_app(device_id: str | None = None) -> str:
@@ -40,7 +72,8 @@ def get_current_app(device_id: str | None = None) -> str:
 
 
 def tap(
-    x: int, y: int, device_id: str | None = None, delay: float | None = None
+    x: int, y: int, device_id: str | None = None, delay: float | None = None,
+    display_id: int | None = None,
 ) -> None:
     """
     Tap at the specified coordinates.
@@ -50,20 +83,22 @@ def tap(
         y: Y coordinate.
         device_id: Optional ADB device ID.
         delay: Delay in seconds after tap. If None, uses configured default.
+        display_id: Optional virtual display ID. None or 0 means main display.
     """
     if delay is None:
         delay = TIMING_CONFIG.device.default_tap_delay
 
-    adb_prefix = _get_adb_prefix(device_id)
+    input_cmd = _get_input_cmd(device_id, display_id)
 
     subprocess.run(
-        adb_prefix + ["shell", "input", "tap", str(x), str(y)], capture_output=True
+        input_cmd + ["tap", str(x), str(y)], capture_output=True
     )
     time.sleep(delay)
 
 
 def double_tap(
-    x: int, y: int, device_id: str | None = None, delay: float | None = None
+    x: int, y: int, device_id: str | None = None, delay: float | None = None,
+    display_id: int | None = None,
 ) -> None:
     """
     Double tap at the specified coordinates.
@@ -73,18 +108,19 @@ def double_tap(
         y: Y coordinate.
         device_id: Optional ADB device ID.
         delay: Delay in seconds after double tap. If None, uses configured default.
+        display_id: Optional virtual display ID. None or 0 means main display.
     """
     if delay is None:
         delay = TIMING_CONFIG.device.default_double_tap_delay
 
-    adb_prefix = _get_adb_prefix(device_id)
+    input_cmd = _get_input_cmd(device_id, display_id)
 
     subprocess.run(
-        adb_prefix + ["shell", "input", "tap", str(x), str(y)], capture_output=True
+        input_cmd + ["tap", str(x), str(y)], capture_output=True
     )
     time.sleep(TIMING_CONFIG.device.double_tap_interval)
     subprocess.run(
-        adb_prefix + ["shell", "input", "tap", str(x), str(y)], capture_output=True
+        input_cmd + ["tap", str(x), str(y)], capture_output=True
     )
     time.sleep(delay)
 
@@ -95,6 +131,7 @@ def long_press(
     duration_ms: int = 3000,
     device_id: str | None = None,
     delay: float | None = None,
+    display_id: int | None = None,
 ) -> None:
     """
     Long press at the specified coordinates.
@@ -105,15 +142,16 @@ def long_press(
         duration_ms: Duration of press in milliseconds.
         device_id: Optional ADB device ID.
         delay: Delay in seconds after long press. If None, uses configured default.
+        display_id: Optional virtual display ID. None or 0 means main display.
     """
     if delay is None:
         delay = TIMING_CONFIG.device.default_long_press_delay
 
-    adb_prefix = _get_adb_prefix(device_id)
+    input_cmd = _get_input_cmd(device_id, display_id)
 
     subprocess.run(
-        adb_prefix
-        + ["shell", "input", "swipe", str(x), str(y), str(x), str(y), str(duration_ms)],
+        input_cmd
+        + ["swipe", str(x), str(y), str(x), str(y), str(duration_ms)],
         capture_output=True,
     )
     time.sleep(delay)
@@ -127,6 +165,7 @@ def swipe(
     duration_ms: int | None = None,
     device_id: str | None = None,
     delay: float | None = None,
+    display_id: int | None = None,
 ) -> None:
     """
     Swipe from start to end coordinates.
@@ -139,11 +178,12 @@ def swipe(
         duration_ms: Duration of swipe in milliseconds (auto-calculated if None).
         device_id: Optional ADB device ID.
         delay: Delay in seconds after swipe. If None, uses configured default.
+        display_id: Optional virtual display ID. None or 0 means main display.
     """
     if delay is None:
         delay = TIMING_CONFIG.device.default_swipe_delay
 
-    adb_prefix = _get_adb_prefix(device_id)
+    input_cmd = _get_input_cmd(device_id, display_id)
 
     if duration_ms is None:
         # Calculate duration based on distance
@@ -152,10 +192,8 @@ def swipe(
         duration_ms = max(500, min(duration_ms, 1000))  # Clamp between 1000-2000ms
 
     subprocess.run(
-        adb_prefix
+        input_cmd
         + [
-            "shell",
-            "input",
             "swipe",
             str(start_x),
             str(start_y),
@@ -168,40 +206,42 @@ def swipe(
     time.sleep(delay)
 
 
-def back(device_id: str | None = None, delay: float | None = None) -> None:
+def back(device_id: str | None = None, delay: float | None = None, display_id: int | None = None) -> None:
     """
     Press the back button.
 
     Args:
         device_id: Optional ADB device ID.
         delay: Delay in seconds after pressing back. If None, uses configured default.
+        display_id: Optional virtual display ID. None or 0 means main display.
     """
     if delay is None:
         delay = TIMING_CONFIG.device.default_back_delay
 
-    adb_prefix = _get_adb_prefix(device_id)
+    input_cmd = _get_input_cmd(device_id, display_id)
 
     subprocess.run(
-        adb_prefix + ["shell", "input", "keyevent", "4"], capture_output=True
+        input_cmd + ["keyevent", "4"], capture_output=True
     )
     time.sleep(delay)
 
 
-def home(device_id: str | None = None, delay: float | None = None) -> None:
+def home(device_id: str | None = None, delay: float | None = None, display_id: int | None = None) -> None:
     """
     Press the home button.
 
     Args:
         device_id: Optional ADB device ID.
         delay: Delay in seconds after pressing home. If None, uses configured default.
+        display_id: Optional virtual display ID. None or 0 means main display.
     """
     if delay is None:
         delay = TIMING_CONFIG.device.default_home_delay
 
-    adb_prefix = _get_adb_prefix(device_id)
+    input_cmd = _get_input_cmd(device_id, display_id)
 
     subprocess.run(
-        adb_prefix + ["shell", "input", "keyevent", "KEYCODE_HOME"], capture_output=True
+        input_cmd + ["keyevent", "KEYCODE_HOME"], capture_output=True
     )
     time.sleep(delay)
 
@@ -211,6 +251,9 @@ def launch_app(
 ) -> bool:
     """
     Launch an app by name.
+
+    If USE_VIRTUAL_DISPLAY is enabled, tries to launch via virtual display first.
+    Falls back to ADB monkey if virtual display fails or is not configured.
 
     Args:
         app_name: The app name (must be in APP_PACKAGES).
@@ -226,8 +269,16 @@ def launch_app(
     if app_name not in APP_PACKAGES:
         return False
 
-    adb_prefix = _get_adb_prefix(device_id)
     package = APP_PACKAGES[app_name]
+
+    if USE_VIRTUAL_DISPLAY:
+        success = _launch_app_via_virtual_display(package)
+        if success:
+            time.sleep(delay)
+            return True
+        print(f"[VirtualDisplay] Falling back to ADB monkey launch for {package}")
+
+    adb_prefix = _get_adb_prefix(device_id)
 
     subprocess.run(
         adb_prefix
@@ -251,3 +302,19 @@ def _get_adb_prefix(device_id: str | None) -> list:
     if device_id:
         return ["adb", "-s", device_id]
     return ["adb"]
+
+
+def _get_input_cmd(device_id: str | None, display_id: int | None = None) -> list:
+    """Get input command prefix with optional display ID.
+
+    Args:
+        device_id: Optional ADB device ID.
+        display_id: Optional virtual display ID.
+
+    Returns:
+        Command prefix list (e.g., ['adb', 'shell', 'input'] or ['adb', 'shell', 'input', '-d', '144'])
+    """
+    cmd = _get_adb_prefix(device_id) + ["shell", "input"]
+    if display_id is not None and display_id != 0:
+        cmd += ["-d", str(display_id)]
+    return cmd

@@ -5,6 +5,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from scrcpycontrol.display_interface import get_display_manager
 from phone_agent.actions import ActionHandler
 from phone_agent.actions.handler import do, finish, parse_action
 from phone_agent.config import get_messages, get_system_prompt
@@ -94,6 +95,8 @@ class PhoneAgent:
         self._context = []
         self._step_count = 0
 
+        self._check_and_switch_display(task)
+
         # First step with user prompt
         result = self._execute_step(task, is_first=True)
 
@@ -132,6 +135,64 @@ class PhoneAgent:
         """Reset the agent state for a new task."""
         self._context = []
         self._step_count = 0
+        device_factory = get_device_factory()
+        device_factory.reset_display()
+
+    def _check_and_switch_display(self, text: str) -> None:
+        """
+        Check user input for display switch intent and switch if needed.
+
+        If the target app's virtual display is not running, start it first.
+
+        Args:
+            text: User input text to analyze.
+        """
+        if not text:
+            return
+
+        try:
+            from phone_agent.display_switcher import get_display_switcher
+            switcher = get_display_switcher()
+            target_type, target = switcher.detect_switch_intent(text)
+
+            if target_type == "main":
+                device_factory = get_device_factory()
+                device_factory.reset_display()
+                print("[Agent] Switched to main display (detected from user input)")
+            elif target_type == "app" and target:
+                try:
+                    dm = get_display_manager()
+                    displays = dm.list_displays().get("displays", [])
+                    found = False
+                    for d in displays:
+                        if d.get("app_package") == target:
+                            android_display_id = d.get("android_display_id")
+                            if android_display_id is not None:
+                                device_factory = get_device_factory()
+                                device_factory.set_active_display(android_display_id)
+                                print(f"[Agent] Switched to virtual display for {target} (id={android_display_id})")
+                                found = True
+                            break
+
+                    if not found:
+                        print(f"[Agent] Virtual display for {target} not running, starting it...")
+                        result = dm.start_app_display(target)
+                        if result.get("success"):
+                            android_display_id = result.get("android_display_id")
+                            if android_display_id is not None:
+                                device_factory = get_device_factory()
+                                device_factory.set_active_display(android_display_id)
+                                print(f"[Agent] Started and switched to virtual display for {target} (id={android_display_id})")
+                            else:
+                                print(f"[Agent] Virtual display started but no display ID found")
+                        else:
+                            print(f"[Agent] Failed to start virtual display for {target}: {result.get('error')}")
+                except Exception as e:
+                    print(f"[Agent] Failed to switch display via user input: {e}")
+                    import traceback
+                    traceback.print_exc()
+        except Exception as e:
+            print(f"[Agent] Display switch detection failed: {e}")
 
     def _execute_step(
         self, user_prompt: str | None = None, is_first: bool = False

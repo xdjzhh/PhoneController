@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from scrcpycontrol.display_interface import get_display_manager
+from phone_agent.config.apps import APP_PACKAGES
 from phone_agent.config.timing import TIMING_CONFIG
 from phone_agent.device_factory import get_device_factory
 
@@ -123,7 +125,25 @@ class ActionHandler:
 
         device_factory = get_device_factory()
         success = device_factory.launch_app(app_name, self.device_id)
+
         if success:
+            try:
+                app_package = APP_PACKAGES.get(app_name)
+                if app_package:
+                    try:
+                        dm = get_display_manager()
+                        result = dm.start_app_display(app_package)
+                        if result.get("success"):
+                            android_display_id = result.get("android_display_id")
+                            if android_display_id is not None:
+                                device_factory.set_active_display(android_display_id)
+                                print(f"[ActionHandler] Switched to virtual display for {app_name} (id={android_display_id})")
+                        else:
+                            print(f"[ActionHandler] No virtual display for {app_name}, using main display")
+                    except Exception as e:
+                        print(f"[ActionHandler] Failed to switch display: {e}")
+            except Exception:
+                pass
             return ActionResult(True, False)
         return ActionResult(False, False, f"App not found: {app_name}")
 

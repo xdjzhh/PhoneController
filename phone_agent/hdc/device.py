@@ -2,13 +2,42 @@
 
 import os
 import subprocess
+import sys
 import time
 from typing import List, Optional, Tuple
 
+from scrcpycontrol.display_interface import get_display_manager
 from phone_agent.config.apps_harmonyos import APP_ABILITIES, APP_PACKAGES
 from phone_agent.config.timing import TIMING_CONFIG
 from phone_agent.hdc.connection import _run_hdc_command
 import re
+
+USE_VIRTUAL_DISPLAY = os.environ.get("USE_VIRTUAL_DISPLAY", "1") == "1"
+
+
+def _launch_app_via_virtual_display(bundle: str) -> bool:
+    """
+    Try to launch an app via virtual display using DisplayManager.
+
+    Args:
+        bundle: HarmonyOS app bundle name.
+
+    Returns:
+        True if launched via virtual display, False otherwise.
+    """
+    try:
+        dm = get_display_manager()
+        result = dm.start_app_display(bundle)
+        if result.get("success"):
+            display_type = result.get("display_type", "unknown")
+            print(f"[VirtualDisplay] App {bundle} launched via {display_type} display")
+            return True
+        else:
+            print(f"[VirtualDisplay] Failed to launch {bundle}: {result.get('error')}")
+            return False
+    except Exception as e:
+        print(f"[VirtualDisplay] Error: {e}")
+        return False
 
 def get_current_app(device_id: str | None = None) -> str:
     """
@@ -258,6 +287,9 @@ def launch_app(
     """
     Launch an app by name.
 
+    If USE_VIRTUAL_DISPLAY is enabled, tries to launch via virtual display first.
+    Falls back to HDC aa start if virtual display fails or is not configured.
+
     Args:
         app_name: The app name (must be in APP_PACKAGES).
         device_id: Optional HDC device ID.
@@ -274,8 +306,16 @@ def launch_app(
         print(f"[HDC] Available apps: {', '.join(sorted(APP_PACKAGES.keys())[:10])}...")
         return False
 
-    hdc_prefix = _get_hdc_prefix(device_id)
     bundle = APP_PACKAGES[app_name]
+
+    if USE_VIRTUAL_DISPLAY:
+        success = _launch_app_via_virtual_display(bundle)
+        if success:
+            time.sleep(delay)
+            return True
+        print(f"[VirtualDisplay] Falling back to HDC aa start for {bundle}")
+
+    hdc_prefix = _get_hdc_prefix(device_id)
 
     # Get the ability name for this bundle
     # Default to "EntryAbility" if not specified in APP_ABILITIES

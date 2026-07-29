@@ -234,7 +234,7 @@ class DisplayManager:
             )
         return self._multi_display
 
-    def start_app_display(self, app_package, orientation="portrait"):
+    def start_app_display(self, app_package, orientation=None):
         """
         Start a virtual display for an app.
 
@@ -242,11 +242,18 @@ class DisplayManager:
 
         Args:
             app_package: Android app package name.
-            orientation: Display orientation - "portrait" (default) or "landscape".
+            orientation: Display orientation - "portrait", "landscape", or None to use config default.
 
         Returns:
             Dict with success status and display info.
         """
+        cfg = self.load_config()
+        app_cfg = cfg.get("app_displays", {}).get(app_package, {}) or {}
+
+        # 若未显式指定orientation，则使用config中的default_orientation，默认portrait
+        if orientation is None:
+            orientation = app_cfg.get("default_orientation", "portrait")
+
         if orientation not in ("portrait", "landscape"):
             return {"success": False, "error": "orientation must be 'portrait' or 'landscape'"}
 
@@ -267,13 +274,12 @@ class DisplayManager:
                             "orientation": orientation,
                         }
                     else:
-                        print(f"[DisplayManager] App {app_package} running but orientation mismatch, restarting...")
-                        self._stop_app_display_locked(app_package)
+                        print(f"[DisplayManager] App {app_package} running but orientation mismatch (current={current_orient}, target={orientation}), restarting...")
+                        stopped = self._stop_app_display_locked(app_package)
+                        print(f"[DisplayManager] Old display stopped result: {stopped}")
+                        time.sleep(3.0)  # 等待旧scrcpy进程退出、端口释放、Android端虚拟屏销毁
                 else:
                     del self._app_display_map[app_package]
-
-            cfg = self.load_config()
-            app_cfg = cfg.get("app_displays", {}).get(app_package)
 
             if not app_cfg:
                 print(f"[DisplayManager] No display config for {app_package}, using main display")
@@ -291,16 +297,54 @@ class DisplayManager:
             nd_w = app_cfg.get("new_display_width", 1260)
             nd_h = app_cfg.get("new_display_height", 2844)
 
+            # ===== CarPlay式方案：根据横竖屏使用不同物理分辨率的VirtualDisplay =====
+            # 核心原理：Android VirtualDisplay的natural orientation由width/height比例决定：
+            #   - width < height → natural=竖屏(portrait)，rotation=0=竖屏
+            #   - width > height → natural=横屏(landscape)，rotation=0=横屏
+            # 之前用竖屏new_display + rotation=270只是视频编码旋转，app始终认为竖屏。
+            # CarPlay/HiCar的做法是直接创建横屏分辨率的VirtualDisplay，然后锁定user-rotation=0
+            # （natural方向），app启动时就看到横屏屏幕，渲染原生横屏UI。
+            #
+            # 竖屏模式：使用app配置中的竖屏分辨率（如1260x2844），wm lock 0
+            # 横屏模式：使用独立的横屏分辨率配置（默认1920x1080/320dpi），wm lock 0
+            # wm user-rotation=lock 0 锁定natural方向，防止FLAG_ROTATES_WITH_CONTENT
+            # 导致app强制竖屏时系统自动旋转display。
+            nd_dpi = app_cfg.get("new_display_dpi", None)
             if orientation == "landscape":
-                win_w, win_h = win_h, win_w
-                nd_w, nd_h = nd_h, nd_w
+                # 横屏：窗口横屏，new_display使用横屏分辨率
+                if win_w < win_h:
+                    win_w, win_h = win_h, win_w
+                nd_w = app_cfg.get("landscape_new_display_width", 1920)
+                nd_h = app_cfg.get("landscape_new_display_height", 1080)
+                nd_dpi = app_cfg.get("landscape_new_display_dpi", 320)
+                target_rotation = 0
+                target_user_rotation = 0  # lock 0 = natural方向=横屏（因为w>h）
+                nd_orient_desc = f"{nd_w}x{nd_h}/{nd_dpi}dpi(横屏natural)"
+            else:
+                # 竖屏：窗口竖屏，new_display使用竖屏分辨率
+                if win_w > win_h:
+                    win_w, win_h = win_h, win_w
+                if nd_w > nd_h:
+                    nd_w, nd_h = nd_h, nd_w
+                target_rotation = 0
+                target_user_rotation = 0  # lock 0 = natural方向=竖屏（因为h>w）
+                nd_orient_desc = f"{nd_w}x{nd_h}/{nd_dpi or 'default'}dpi(竖屏natural)"
 
             mvd = self._get_multi_display()
 
             try:
+                ur_desc = "lock 0 (natural方向)" if target_user_rotation == 0 else f"lock {target_user_rotation}"
+                print(f"[DisplayManager] ========== 创建{orientation}虚拟屏参数 ==========")
+                print(f"[DisplayManager] app_package           : {app_package}")
+                print(f"[DisplayManager] window 尺寸           : {win_w}x{win_h} ({'横屏✅' if win_w > win_h else '竖屏'})")
+                print(f"[DisplayManager] new_display (安卓)    : {nd_orient_desc}")
+                print(f"[DisplayManager] scrcpy rotation       : {target_rotation} (不做编码旋转)")
+                print(f"[DisplayManager] wm user-rotation      : {ur_desc} (锁定natural方向，防FLAG_ROTATES_WITH_CONTENT)")
+                print(f"[DisplayManager] =================================================")
+
                 display = AppVirtualDisplay(
                     app_package=app_package,
-                    display_id=len(mvd.displays),
+                    display_id=mvd._alloc_display_id(),
                     window_title=app_cfg.get("window_title", app_package),
                     window_x=app_cfg.get("window_x"),
                     window_y=app_cfg.get("window_y"),
@@ -308,6 +352,7 @@ class DisplayManager:
                     window_height=win_h,
                     new_display_width=nd_w,
                     new_display_height=nd_h,
+                    new_display_dpi=nd_dpi,
                     max_fps=app_cfg.get("max_fps", 60),
                     bitrate=app_cfg.get("bitrate", "8M"),
                     video_codec=app_cfg.get("video_codec", "h264"),
@@ -318,6 +363,8 @@ class DisplayManager:
                     scrcpy_path=self.scrcpy_path,
                     device_serial=self.device_serial,
                     base_port=mvd.base_port,
+                    rotation=target_rotation,
+                    user_rotation=target_user_rotation,
                 )
 
                 mvd.displays.append(display)
@@ -341,9 +388,12 @@ class DisplayManager:
                         "orientation": orientation,
                     }
                 else:
+                    failed_id = display.display_id
                     if display in mvd.displays:
                         mvd.displays.remove(display)
-                    del self._app_display_map[app_package]
+                    mvd._free_display_id(failed_id)  # 启动失败，归还id
+                    if app_package in self._app_display_map:
+                        del self._app_display_map[app_package]
                     self._app_orientation.pop(app_package, None)
                     return {
                         "success": False,
@@ -354,6 +404,15 @@ class DisplayManager:
                 print(f"[DisplayManager] Failed to start app display: {e}")
                 import traceback
                 traceback.print_exc()
+                # 异常情况下也归还id
+                try:
+                    if 'display' in dir() and display is not None:
+                        fid = display.display_id
+                        if display in mvd.displays:
+                            mvd.displays.remove(display)
+                        mvd._free_display_id(fid)
+                except Exception:
+                    pass
                 return {"success": False, "error": str(e)}
 
     def stop_app_display(self, app_package):
@@ -379,12 +438,15 @@ class DisplayManager:
 
         display = self._app_display_map[app_package]
         try:
+            old_display_id = display.display_id
             display.stop()
-            if self._multi_display and display in self._multi_display.displays:
-                self._multi_display.displays.remove(display)
+            if self._multi_display:
+                if display in self._multi_display.displays:
+                    self._multi_display.displays.remove(display)
+                self._multi_display._free_display_id(old_display_id)  # 归还id到空闲池，供后续安全复用
             del self._app_display_map[app_package]
             self._app_orientation.pop(app_package, None)
-            print(f"[DisplayManager] Stopped virtual display for {app_package}")
+            print(f"[DisplayManager] Stopped virtual display for {app_package} (display_id={old_display_id} returned to pool)")
             time.sleep(0.5)
             return {"success": True, "message": "App display stopped"}
         except Exception as e:

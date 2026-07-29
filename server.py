@@ -180,7 +180,8 @@ def start_app_display():
     app_package = data.get('app_package', '')
     if not app_package:
         return jsonify({'success': False, 'error': 'app_package is required'}), 400
-    result = display_manager.start_app_display(app_package)
+    orientation = data.get('orientation', None)
+    result = display_manager.start_app_display(app_package, orientation=orientation)
     status_code = 200 if result.get('success') else 500
     return jsonify(result), status_code
 

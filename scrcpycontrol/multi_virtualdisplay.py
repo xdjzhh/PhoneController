@@ -246,12 +246,13 @@ class AppVirtualDisplay:
                  window_title=None, window_x=None, window_y=None,
                  window_width=None, window_height=None,
                  new_display_width=1260, new_display_height=2844,
+                 new_display_dpi=None,
                  max_fps=60, bitrate='8M', video_codec='h264',
                  no_vd_system_decorations=True, flex_display=False,
                  borderless=False, background_color=None,
                  keep_active=True, turn_screen_off=True, stay_awake=True,
                  record=None, scrcpy_path=None, device_serial=None,
-                 base_port=8887):
+                 base_port=8887, rotation=0, user_rotation=0):
         """
         Initialize a virtual display for an app.
 
@@ -265,6 +266,7 @@ class AppVirtualDisplay:
             window_height: Window height
             new_display_width: Virtual display resolution width (default: 1260)
             new_display_height: Virtual display resolution height (default: 2844)
+            new_display_dpi: Virtual display DPI (e.g., 320 for landscape car mode; None for default)
             max_fps: Maximum frames per second
             bitrate: Video bitrate (e.g., '8M', '16M')
             video_codec: Video codec ('h264', 'h265', 'av1')
@@ -279,6 +281,12 @@ class AppVirtualDisplay:
             scrcpy_path: Path to scrcpy executable
             device_serial: ADB device serial number
             base_port: Base port number for scrcpy server (default: 8887)
+            rotation: scrcpy编码级旋转(0/90/180/270)，CarPlay方案中为0（不旋转）
+            user_rotation: Android wm user-rotation值。CarPlay式方案：
+                          - 竖屏VD(h>w): natural=portrait, lock 0=竖屏
+                          - 横屏VD(w>h): natural=landscape, lock 0=横屏
+                          锁定natural方向可防止FLAG_ROTATES_WITH_CONTENT导致
+                          强制竖屏app触发display旋转回竖屏。
         """
         self.app_package = app_package
         self.display_id = display_id
@@ -289,6 +297,7 @@ class AppVirtualDisplay:
         self.window_height = window_height
         self.new_display_width = new_display_width
         self.new_display_height = new_display_height
+        self.new_display_dpi = new_display_dpi
         self.max_fps = max_fps
         self.bitrate = bitrate
         self.video_codec = video_codec
@@ -302,6 +311,8 @@ class AppVirtualDisplay:
         self.record = record
         self.device_serial = device_serial
         self.base_port = base_port
+        self.rotation = rotation  # scrcpy --display-orientation参数（编码级旋转），0=不旋转
+        self.user_rotation = user_rotation  # Android wm user-rotation值（系统级旋转）
 
         self.scrcpy_path = scrcpy_path or self._find_scrcpy()
         self.process = None
@@ -340,11 +351,15 @@ class AppVirtualDisplay:
         if self.device_serial:
             cmd.extend(["-s", self.device_serial])
 
-        # Create new virtual display with resolution
+        # Create new virtual display with resolution and optional DPI
         nd_w = self.new_display_width
         nd_h = self.new_display_height
+        nd_dpi = self.new_display_dpi
         if nd_w and nd_h:
-            cmd.append(f"--new-display={nd_w}x{nd_h}")
+            nd_arg = f"{nd_w}x{nd_h}"
+            if nd_dpi:
+                nd_arg += f"/{nd_dpi}"
+            cmd.append(f"--new-display={nd_arg}")
         else:
             cmd.append("--new-display")
 
@@ -366,6 +381,10 @@ class AppVirtualDisplay:
         cmd.extend(["--max-fps", str(self.max_fps)])
         cmd.extend(["--video-bit-rate", self.bitrate])
         cmd.extend(["--video-codec", self.video_codec])
+
+        # Rotation (0, 90, 180, 270 degrees). 270 = landscape (CCW 90°)
+        if self.rotation and self.rotation != 0:
+            cmd.extend(["--display-orientation", str(self.rotation)])
 
         # Virtual display decorations
         if self.no_vd_system_decorations:
@@ -490,7 +509,10 @@ class AppVirtualDisplay:
                 print(f"[{self.window_title}] Output reader error: {e}")
 
     def _launch_app(self):
-        """Launch the app on this virtual display after it initializes."""
+        """Launch/move the app to this virtual display after it initializes.
+        重启虚拟屏（如切换横竖屏）时，app进程通常还在后台运行，优先用am start把已有task
+        移到新display，避免冷启动重新走splash页。
+        """
         try:
             if self.device_serial:
                 device = adbutils.adb.device(self.device_serial)
@@ -510,7 +532,6 @@ class AppVirtualDisplay:
             
             if self.android_display_id is None:
                 print(f"[{self.window_title}] Warning: Could not parse Android display ID, using fallback")
-                # Fallback: try to get display ID from dumpsys
                 dumpsys_result = device.shell("dumpsys display")
                 import re
                 match = re.search(r'Display Id=(\d+).*VirtualDisplay', dumpsys_result, re.DOTALL)
@@ -523,37 +544,68 @@ class AppVirtualDisplay:
             
             display_id = self.android_display_id
             
-            # Try to launch app using monkey command with display ID
-            print(f"[{self.window_title}] Launching app {self.app_package} on display {display_id}...")
-            
-            # Method 1: Use monkey to launch on specific display
-            monkey_cmd = f"monkey -p {self.app_package} --display {display_id} -c android.intent.category.LAUNCHER 1"
-            result = device.shell(monkey_cmd)
-            
-            if "No activities found" in result or "Error" in result:
-                # Method 2: Try am start with display flag
-                print(f"[{self.window_title}] Monkey failed, trying am start...")
-                # Get launch intent
-                intent_result = device.shell(f"cmd package resolve-activity --brief {self.app_package}")
-                if intent_result and "/" in intent_result:
-                    # Extract activity name
-                    lines = intent_result.strip().split('\n')
-                    for line in lines:
-                        if '/' in line and not line.startswith('#'):
-                            activity = line.strip()
-                            break
+            # 在启动app之前，先锁定display的natural方向（wm user-rotation lock 0）。
+            # CarPlay式方案核心：横屏VD(w>h)的natural=landscape，lock 0=横屏；
+            # 竖屏VD(h>w)的natural=portrait，lock 0=竖屏。
+            # 锁定后可防止FLAG_ROTATES_WITH_CONTENT导致强制竖屏app触发display旋转。
+            if hasattr(self, 'user_rotation'):
+                try:
+                    wm_cmd = f"wm user-rotation -d {display_id} lock {self.user_rotation}"
+                    wm_result = device.shell(wm_cmd)
+                    if wm_result and ("Error" in wm_result or "Unknown" in wm_result or "Exception" in wm_result):
+                        print(f"[{self.window_title}] wm user-rotation failed: {wm_result.strip()[:200]}")
                     else:
-                        activity = intent_result.strip().split('\n')[-1]
-                    
+                        is_landscape_nd = (self.new_display_width or 0) > (self.new_display_height or 0)
+                        if self.user_rotation == 0:
+                            orient_desc = "natural(横屏)" if is_landscape_nd else "natural(竖屏)"
+                        else:
+                            orient_desc = f"rot={self.user_rotation}"
+                        print(f"[{self.window_title}] Set wm user-rotation to lock {self.user_rotation} ({orient_desc}) on display {display_id}")
+                        time.sleep(0.5)
+                except Exception as wm_err:
+                    print(f"[{self.window_title}] wm user-rotation error (non-critical): {wm_err}")
+            
+            print(f"[{self.window_title}] Moving app {self.app_package} to display {display_id}...")
+            
+            # Method 1 (preferred for restart cases): 用 am start 把app task移到新display
+            # 这样即使app已在后台运行（重启虚拟屏场景），也只是把已有task bring to front到新display，
+            # 而不是冷启动app重新创建Activity走splash页
+            intent_result = device.shell(f"cmd package resolve-activity --brief {self.app_package}")
+            am_launched = False
+            if intent_result and "/" in intent_result and "No activity found" not in intent_result:
+                lines = intent_result.strip().split('\n')
+                activity = None
+                for line in lines:
+                    if '/' in line and not line.startswith('#'):
+                        activity = line.strip()
+                        break
+                if activity is None:
+                    activity = lines[-1].strip()
+                
+                if activity and '/' in activity:
                     am_cmd = f"am start -n {activity} --display {display_id}"
                     result = device.shell(am_cmd)
                     
-                    if "Error" in result or "Exception" in result:
-                        print(f"[{self.window_title}] Failed to launch app: {result}")
+                    if "Error" not in result and "Exception" not in result:
+                        print(f"[{self.window_title}] App moved to display via am start (no cold start)")
+                        am_launched = True
                     else:
-                        print(f"[{self.window_title}] App launched successfully")
-            else:
-                print(f"[{self.window_title}] App launched via monkey")
+                        print(f"[{self.window_title}] am start returned: {result.strip()[:200]}")
+            
+            # Method 2 (fallback / cold start): monkey LAUNCHER
+            if not am_launched:
+                print(f"[{self.window_title}] Trying monkey launcher...")
+                monkey_cmd = f"monkey -p {self.app_package} --display {display_id} -c android.intent.category.LAUNCHER 1"
+                result = device.shell(monkey_cmd)
+                
+                if "No activities found" in result or "Error" in result:
+                    print(f"[{self.window_title}] Monkey also failed: {result.strip()[:200]}")
+                else:
+                    print(f"[{self.window_title}] App launched via monkey (cold start)")
+            
+            # 等待app启动和旋转重绘完成
+            if hasattr(self, 'user_rotation') and self.user_rotation != 0:
+                time.sleep(2.0)  # 横屏模式等待app完成横屏布局
                 
         except Exception as e:
             print(f"[{self.window_title}] Launch app error: {e}")
@@ -693,8 +745,24 @@ class MultiVirtualDisplay:
         self.base_port = base_port
         self.displays = []
         self.running = False
+        # 注意：主屏固定用port=base_port(8887)，所以AppVirtualDisplay的id从1开始，避免端口冲突
+        self._next_display_id = 1
+        self._free_display_ids = []  # 已停止display的id池，安全复用以避免端口无限增长
 
         atexit.register(self.stop_all)
+
+    def _alloc_display_id(self):
+        """分配display_id：优先复用已停止display的id(端口已释放)，否则递增。"""
+        if self._free_display_ids:
+            return self._free_display_ids.pop(0)  # 复用最早释放的id
+        did = self._next_display_id
+        self._next_display_id += 1
+        return did
+
+    def _free_display_id(self, display_id):
+        """归还display_id到空闲池（display完全停止后调用）。"""
+        if display_id is not None and display_id not in self._free_display_ids:
+            self._free_display_ids.append(display_id)
 
     def add_display(self, app_package, window_x=None, window_y=None,
                     window_width=None, window_height=None,
@@ -702,7 +770,7 @@ class MultiVirtualDisplay:
                     window_title=None, max_fps=60, bitrate='8M',
                     video_codec='h264', flex_display=False,
                     borderless=False, background_color=None,
-                    record=None):
+                    record=None, rotation=0):
         """
         Add a virtual display for an app.
 
@@ -722,13 +790,14 @@ class MultiVirtualDisplay:
             borderless: Borderless window
             background_color: Background color
             record: Record to file
+            rotation: Display rotation (0, 90, 180, 270). 0=portrait, 270=landscape
 
         Returns:
             self for chaining
         """
         display = AppVirtualDisplay(
             app_package=app_package,
-            display_id=len(self.displays),
+            display_id=self._alloc_display_id(),
             window_title=window_title,
             window_x=window_x,
             window_y=window_y,
@@ -747,7 +816,8 @@ class MultiVirtualDisplay:
             record=record,
             scrcpy_path=self.scrcpy_path,
             device_serial=self.device_serial,
-            base_port=self.base_port
+            base_port=self.base_port,
+            rotation=rotation,
         )
         self.displays.append(display)
         return self

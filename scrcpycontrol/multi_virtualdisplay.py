@@ -250,6 +250,8 @@ class AppVirtualDisplay:
                  max_fps=60, bitrate='8M', video_codec='h264',
                  no_vd_system_decorations=True, flex_display=False,
                  borderless=False, background_color=None,
+                 always_on_top=False, corner_radius=None,
+                 card_style=False,
                  keep_active=True, turn_screen_off=True, stay_awake=True,
                  record=None, scrcpy_path=None, device_serial=None,
                  base_port=8887, rotation=0, user_rotation=0):
@@ -274,6 +276,9 @@ class AppVirtualDisplay:
             flex_display: Enable flexible display (resize with window drag)
             borderless: Borderless window
             background_color: Background color (e.g., '#2a2a2a')
+            always_on_top: Keep window always on top (floating widget)
+            corner_radius: Window corner radius in pixels (0=no round, None=system default, e.g. 16=Mac-style)
+            card_style: Mac-style card (borderless + always-on-top + rounded corners + shadow)
             keep_active: Prevent device auto sleep
             turn_screen_off: Turn off physical screen
             stay_awake: Keep device awake (prevent screen timeout)
@@ -305,6 +310,17 @@ class AppVirtualDisplay:
         self.flex_display = flex_display
         self.borderless = borderless
         self.background_color = background_color
+        self.always_on_top = always_on_top
+        self.corner_radius = corner_radius
+        self.card_style = card_style
+        # card_style快捷方式：开启borderless+always_on_top+圆角+阴影
+        if self.card_style:
+            self.borderless = True
+            self.always_on_top = True
+            if self.corner_radius is None:
+                self.corner_radius = 20
+            if self.background_color is None:
+                self.background_color = "#1a1a2e"
         self.keep_active = keep_active
         self.turn_screen_off = turn_screen_off
         self.stay_awake = stay_awake
@@ -398,6 +414,10 @@ class AppVirtualDisplay:
         if self.borderless:
             cmd.append("--window-borderless")
 
+        # Always on top (floating widget)
+        if self.always_on_top:
+            cmd.append("--always-on-top")
+
         # Background color
         if self.background_color:
             cmd.extend(["--background-color", self.background_color])
@@ -468,6 +488,13 @@ class AppVirtualDisplay:
         )
         self.output_thread.start()
 
+        # 应用Mac风格卡片窗口样式（圆角、阴影）
+        if self.corner_radius is not None or self.card_style:
+            self._style_thread = threading.Thread(
+                target=self._apply_window_style_delayed, daemon=True
+            )
+            self._style_thread.start()
+
         if self.app_package:
             self.app_thread = threading.Thread(
                 target=self._launch_app, daemon=True
@@ -507,6 +534,141 @@ class AppVirtualDisplay:
         except Exception as e:
             if self.running:
                 print(f"[{self.window_title}] Output reader error: {e}")
+
+    def _apply_window_style_delayed(self):
+        """Wait for scrcpy window to appear, then apply Mac-style card effects (rounded corners + shadow)."""
+        try:
+            # scrcpy窗口创建需要一点时间，轮询查找窗口
+            hwnd = None
+            for attempt in range(30):
+                time.sleep(0.3)
+                hwnd = self._find_window_by_title(self.window_title)
+                if hwnd:
+                    break
+            if not hwnd:
+                print(f"[{self.window_title}] Could not find window for styling")
+                return
+
+            print(f"[{self.window_title}] Applying Mac card style (corner_radius={self.corner_radius})...")
+
+            if os.name == 'nt':
+                self._apply_windows_card_style(hwnd)
+            else:
+                # Linux/macOS could use other approaches
+                pass
+
+        except Exception as e:
+            print(f"[{self.window_title}] Window style error: {e}")
+
+    def _find_window_by_title(self, title):
+        """Find window HWND by exact title match using Win32 API."""
+        if os.name != 'nt':
+            return None
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        result = [None]
+
+        def enum_windows_proc(hwnd, lparam):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if buf.value == title:
+                    # Ensure it's a visible top-level window
+                    if user32.IsWindowVisible(hwnd):
+                        result[0] = hwnd
+                        return 0
+            return 1
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
+        return result[0]
+
+    def _apply_windows_card_style(self, hwnd):
+        """Apply Mac-style card look to a window on Windows: rounded corners + shadow.
+        Uses DWM API (Windows 11 native rounded corners) + SetWindowRgn fallback for older Windows.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+
+        # --- 1. DWM rounded corners (Windows 11) ---
+        # DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        # Values: DWMWCP_DEFAULT=0, DWMWCP_DONOTROUND=1, DWMWCP_ROUND=2, DWMWCP_ROUNDSMALL=3
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWCP_ROUND = 2
+        try:
+            corner_pref = ctypes.c_int(DWMWCP_ROUND)
+            hr = dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd),
+                ctypes.c_uint(DWMWA_WINDOW_CORNER_PREFERENCE),
+                ctypes.byref(corner_pref),
+                ctypes.sizeof(corner_pref)
+            )
+            if hr == 0:
+                print(f"[{self.window_title}] DWM rounded corners applied (DWMWCP_ROUND)")
+            else:
+                # Win10 or older, use SetWindowRgn fallback
+                self._apply_rounded_region(hwnd)
+        except Exception as e:
+            print(f"[{self.window_title}] DWM rounded corners not available: {e}")
+            self._apply_rounded_region(hwnd)
+
+        # --- 2. Drop shadow (ensure it's enabled) ---
+        # For borderless windows on Windows, extending a tiny margin into client area
+        # tricks DWM into drawing the drop shadow around the window.
+        # Using 1px margins (not -1 which would cover content with glass).
+        try:
+            class MARGINS(ctypes.Structure):
+                _fields_ = [("cxLeftWidth", ctypes.c_int),
+                            ("cxRightWidth", ctypes.c_int),
+                            ("cyTopHeight", ctypes.c_int),
+                            ("cyBottomHeight", ctypes.c_int)]
+            margins = MARGINS(1, 1, 1, 1)  # 1px frame extension to enable shadow
+            dwmapi.DwmExtendFrameIntoClientArea(wintypes.HWND(hwnd), ctypes.byref(margins))
+            print(f"[{self.window_title}] Drop shadow enabled via DwmExtendFrameIntoClientArea")
+        except Exception as e:
+            print(f"[{self.window_title}] Shadow setup error: {e}")
+
+        # --- 3. Add CS_DROPSHADOW class style (additional shadow for Win10) ---
+        try:
+            GCL_STYLE = -26
+            CS_DROPSHADOW = 0x00020000
+            class_style = user32.GetClassLongW(wintypes.HWND(hwnd), GCL_STYLE)
+            user32.SetClassLongW(wintypes.HWND(hwnd), GCL_STYLE, class_style | CS_DROPSHADOW)
+        except Exception:
+            pass  # non-critical
+
+        # --- 4. Force a repaint ---
+        try:
+            user32.SetWindowPos(wintypes.HWND(hwnd), None, 0, 0, 0, 0,
+                                0x0001 | 0x0002 | 0x0004 | 0x0020)  # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+        except Exception:
+            pass
+
+    def _apply_rounded_region(self, hwnd):
+        """Fallback: use SetWindowRgn to create rounded corners on older Windows."""
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        radius = self.corner_radius if self.corner_radius else 20
+        rect = wintypes.RECT()
+        user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect))
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+
+        # Create rounded rect region
+        rgn = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2)
+        if rgn:
+            user32.SetWindowRgn(wintypes.HWND(hwnd), rgn, True)
+            print(f"[{self.window_title}] Rounded region applied (radius={radius}) via SetWindowRgn")
 
     def _launch_app(self):
         """Launch/move the app to this virtual display after it initializes.

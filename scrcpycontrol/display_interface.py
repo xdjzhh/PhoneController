@@ -873,19 +873,61 @@ class DisplayManager:
                     print("[ScreenMonitor] Device locked! Attempting to unlock...")
                     time.sleep(0.5)
 
+                    # === 快速解锁方案（优先）：唤醒→input text→回车 ===
+                    # 适用于密码框已可输入的场景（如刚锁屏、密码键盘已显示）
                     print("[ScreenMonitor] Waking up screen...")
                     device.shell("input keyevent KEYCODE_WAKEUP")
-                    time.sleep(2)
+                    time.sleep(1.5)
 
-                    print(f"[ScreenMonitor] Inputting password: {'*' * len(lock_password)}")
+                    print(f"[ScreenMonitor] Quick unlock: inputting password ({'*' * len(lock_password)})...")
                     device.shell(f"input text {lock_password}")
-                    time.sleep(0.5)
-
-                    print("[ScreenMonitor] Pressing enter...")
+                    time.sleep(0.3)
                     device.shell("input keyevent KEYCODE_ENTER")
-                    time.sleep(2)
+                    time.sleep(1.5)
 
-                    keyguard_check = self._is_keyguard_locked(device, verbose=True)
+                    keyguard_check = self._is_keyguard_locked(device)
+                    if not keyguard_check:
+                        print("[ScreenMonitor] Quick unlock succeeded!")
+                    else:
+                        # === 备用方案：上滑→逐位按键 ===
+                        # 快速方案失败（通常是华为/鸿蒙锁屏遮罩遮挡了密码框），走完整流程
+                        print("[ScreenMonitor] Quick unlock failed, trying swipe + keyevent fallback...")
+
+                        # 获取屏幕分辨率计算滑动坐标
+                        try:
+                            size_output = device.shell("wm size").strip()
+                            import re as _re
+                            size_match = _re.search(r'(\d+)x(\d+)', size_output)
+                            sw = int(size_match.group(1)) if size_match else 1080
+                            sh = int(size_match.group(2)) if size_match else 1920
+                        except Exception:
+                            sw, sh = 1080, 1920
+
+                        # 上滑显示密码键盘
+                        print("[ScreenMonitor] Swiping up to show unlock keyboard...")
+                        device.shell(f"input swipe {sw//2} {int(sh*0.85)} {sw//2} {int(sh*0.35)} 300")
+                        time.sleep(1.5)
+
+                        # 检查上滑是否直接解锁（智能锁/无密码场景）
+                        keyguard_pre = self._is_keyguard_locked(device)
+                        if not keyguard_pre:
+                            print("[ScreenMonitor] Screen unlocked by swipe (smart lock / no PIN required)")
+                        else:
+                            # 输入密码/PIN
+                            print(f"[ScreenMonitor] Fallback: inputting password/PIN via keyevents...")
+                            if lock_password.isdigit():
+                                for ch in lock_password:
+                                    device.shell(f"input keyevent KEYCODE_{ch}")
+                                    time.sleep(0.15)
+                            else:
+                                device.shell(f"input text {lock_password}")
+                                time.sleep(0.5)
+                                device.shell("input keyevent KEYCODE_ENTER")
+                            time.sleep(1.5)
+
+                        keyguard_check = self._is_keyguard_locked(device, verbose=True)
+
+                    # 最终验证
                     print(f"[ScreenMonitor] Unlock result: is_locked={keyguard_check}")
 
                     if not keyguard_check:
@@ -896,7 +938,7 @@ class DisplayManager:
                         except Exception as e:
                             print(f"[ScreenMonitor] Failed to turn off screen after unlock: {e}")
                     else:
-                        print("[ScreenMonitor] Unlock may have failed")
+                        print("[ScreenMonitor] Unlock may have failed - retrying on next cycle")
 
             except Exception as e:
                 print(f"[ScreenMonitor] Error: {e}")

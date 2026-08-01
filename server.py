@@ -11,10 +11,26 @@ API 端点：
     POST /reset - 重置 Agent
 """
 
-import argparse
-import json
+import ctypes
 import os
 import sys
+
+# Set DPI awareness BEFORE any imports/window creation to ensure
+# GetWindowRect and mouse hook coordinates use physical pixels.
+if os.name == 'nt':
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+import argparse
+import json
 from flask import Flask, request, jsonify
 from phone_agent import PhoneAgent
 from phone_agent.model import ModelConfig
@@ -291,6 +307,20 @@ def set_display_orientation():
     return jsonify(result), status_code
 
 
+@app.route('/display/edit_mode', methods=['POST'])
+def set_edit_mode():
+    """切换窗口编辑模式（显示/隐藏红绿灯和缩放热区）"""
+    global display_manager
+    if not display_manager:
+        return jsonify({'success': False, 'error': 'Display manager not initialized'}), 500
+    data = request.get_json() or {}
+    app_package = data.get('app_package')  # None 或 "main" 表示主屏
+    editing = data.get('editing', True)
+    result = display_manager.set_edit_mode(app_package, editing=editing)
+    status_code = 200 if result.get('success') else 500
+    return jsonify(result), status_code
+
+
 def main():
     parser = argparse.ArgumentParser(description='Phone Agent HTTP Server')
     parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
@@ -301,6 +331,8 @@ def main():
     parser.add_argument('--apikey', default='cae66fb0786343ee9e078a00ec683721.3HmwuIx9d5Vf22DD', help='API key')
     parser.add_argument('--no-main-display', action='store_true', help='Do not start main display on startup')
     parser.add_argument('--no-screen-monitor', action='store_true', help='Do not start screen lock monitor')
+    parser.add_argument('--auto-start', default='com.huawei.android.totemweather',
+                        help='Comma-separated app packages to auto-start on launch (default: weather)')
     args = parser.parse_args()
     
     # Initialize agent config
@@ -318,6 +350,19 @@ def main():
             start_main=True,
             start_monitor=not args.no_screen_monitor
         )
+
+    # Auto-start configured app cards (e.g. weather)
+    if display_manager and args.auto_start:
+        auto_apps = [p.strip() for p in args.auto_start.split(',') if p.strip()]
+        for app_pkg in auto_apps:
+            print(f"📱 Auto-starting app card: {app_pkg}...")
+            import time as _time
+            _time.sleep(3)  # wait for main display to settle
+            result = display_manager.start_app_display(app_pkg)
+            if result.get('success'):
+                print(f"✅ {app_pkg} started: {result.get('message', '')}")
+            else:
+                print(f"⚠️  Failed to start {app_pkg}: {result.get('error', '')}")
     
     # Start server
     print(f"\n🚀 Starting server on {args.host}:{args.port}")
@@ -336,7 +381,13 @@ def main():
     print(f"   GET  http://{args.host}:{args.port}/display/screen_monitor/status")
     print(f"   POST http://{args.host}:{args.port}/display/opacity")
     print(f"   POST http://{args.host}:{args.port}/display/orientation")
-    print("\nPress Ctrl+C to stop")
+    print(f"   POST http://{args.host}:{args.port}/display/edit_mode")
+    print(f"\n🖱️  Window controls:")
+    print(f"   🟥 Red button    → Close window")
+    print(f"   🟨 Yellow button → Minimize")
+    print(f"   🟩 Green button  → Pin/fix window (hide controls)")
+    print(f"   🖱️  Right-click (on pinned card) → Re-enter edit mode")
+    print(f"\nPress Ctrl+C to stop")
     
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 

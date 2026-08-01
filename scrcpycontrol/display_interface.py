@@ -179,6 +179,11 @@ class DisplayManager:
                 turn_screen_off=main_cfg.get("turn_screen_off", True),
                 stay_awake=main_cfg.get("stay_awake", True),
                 rotation=rotation,
+                borderless=main_cfg.get("borderless", False),
+                background_color=main_cfg.get("background_color", None),
+                always_on_top=main_cfg.get("always_on_top", False),
+                corner_radius=main_cfg.get("corner_radius", None),
+                card_style=main_cfg.get("card_style", False),
                 scrcpy_path=self.scrcpy_path,
                 device_serial=self.device_serial,
             )
@@ -370,6 +375,7 @@ class DisplayManager:
                     base_port=mvd.base_port,
                     rotation=target_rotation,
                     user_rotation=target_user_rotation,
+                    display_manager=self,
                 )
 
                 mvd.displays.append(display)
@@ -823,6 +829,48 @@ class DisplayManager:
             "window_title": title,
             "message": "Window activated" if success else "Window activation failed",
         }
+
+    def set_edit_mode(self, app_package=None, editing=True):
+        """
+        Toggle edit mode (show/hide traffic lights and resize hotzones) for a window.
+
+        Args:
+            app_package: App package name. None or "main" means main display.
+            editing: True to enter edit mode, False to pin/fix.
+
+        Returns:
+            Dict with success status.
+        """
+        from .window_decorator import get_window_decorator
+
+        if app_package is None or app_package == "main":
+            cfg = self.load_config()
+            title = cfg.get("main_display", {}).get("window_title", "手机桌面")
+            display_obj = self._main_display
+        else:
+            title = self._get_window_title_for_app(app_package)
+            display_obj = self._app_display_map.get(app_package)
+
+        if not display_obj:
+            return {"success": False, "error": f"Display not found for: {app_package}"}
+
+        hwnd = getattr(display_obj, '_hwnd', None)
+        if not hwnd:
+            hwnd = self._find_window_by_title(title)
+        if not hwnd:
+            return {"success": False, "error": f"Window not found: {title}"}
+
+        try:
+            decorator = get_window_decorator()
+            decorator.set_edit_mode(hwnd, editing)
+            return {
+                "success": True,
+                "window_title": title,
+                "editing": editing,
+                "message": f"Edit mode {'ON' if editing else 'OFF (pinned)'}",
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def _monitor_screen_lock_loop(self):
         """Screen lock monitor thread main loop."""

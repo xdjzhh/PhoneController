@@ -17,6 +17,11 @@ import time
 import re
 import adbutils
 
+try:
+    from .window_decorator import get_window_decorator
+except ImportError:
+    from window_decorator import get_window_decorator
+
 
 class MainDisplay:
     """
@@ -29,6 +34,9 @@ class MainDisplay:
                  max_fps=60, bitrate='8M', video_codec='h264',
                  keep_active=True, turn_screen_off=True, stay_awake=True,
                  rotation=0,
+                 borderless=False, background_color=None,
+                 always_on_top=False, corner_radius=None,
+                 card_style=False,
                  scrcpy_path=None, device_serial=None):
         """
         Initialize main display.
@@ -45,6 +53,11 @@ class MainDisplay:
             keep_active: Prevent device auto sleep
             turn_screen_off: Turn off physical screen
             stay_awake: Keep device awake (prevent screen timeout)
+            borderless: Window without native title bar/borders
+            background_color: Background color hex (e.g. '#1a1a2e')
+            always_on_top: Keep window on top
+            corner_radius: Rounded corner radius in pixels
+            card_style: Mac-style card (borderless + always-on-top + rounded corners + shadow)
             scrcpy_path: Path to scrcpy executable
             device_serial: ADB device serial number
         """
@@ -61,12 +74,27 @@ class MainDisplay:
         self.stay_awake = stay_awake
         self.rotation = rotation  # 0, 1, 2, 3 (0=0°, 1=90°, 2=180°, 3=270°)
         self.device_serial = device_serial
+        self.card_style = card_style
+        self.borderless = borderless
+        self.background_color = background_color
+        self.always_on_top = always_on_top
+        self.corner_radius = corner_radius
+        # card_style快捷方式：开启borderless+always_on_top+圆角+阴影
+        if self.card_style:
+            self.borderless = True
+            self.always_on_top = True
+            if self.corner_radius is None:
+                self.corner_radius = 20
+            if self.background_color is None:
+                self.background_color = '#1a1a2e'
 
         self.scrcpy_path = scrcpy_path or self._find_scrcpy()
         self.process = None
         self.running = False
         self.output_thread = None
         self.stop_event = threading.Event()
+        self._hwnd = None
+        self._style_thread = None
 
     def _find_scrcpy(self):
         """Find scrcpy executable path."""
@@ -135,6 +163,18 @@ class MainDisplay:
         if self.stay_awake:
             cmd.append("--stay-awake")
 
+        # Borderless
+        if self.borderless:
+            cmd.append("--window-borderless")
+
+        # Always on top
+        if self.always_on_top:
+            cmd.append("--always-on-top")
+
+        # Background color
+        if self.background_color:
+            cmd.extend(["--background-color", self.background_color])
+
         # Port
         cmd.extend(["--port", str(port)])
 
@@ -184,6 +224,13 @@ class MainDisplay:
         )
         self.output_thread.start()
 
+        # 应用Mac风格卡片窗口样式（圆角、阴影、红绿灯）
+        if self.corner_radius is not None or self.card_style or self.borderless:
+            self._style_thread = threading.Thread(
+                target=self._apply_window_style_delayed, daemon=True
+            )
+            self._style_thread.start()
+
     def _read_output(self):
         """Read and print scrcpy output."""
         try:
@@ -206,6 +253,123 @@ class MainDisplay:
             if self.running and not self.stop_event.is_set():
                 print(f"[{self.window_title}] Output reader error: {e}")
 
+    def _find_window_by_title(self, title):
+        """Find window HWND by exact title match using Win32 API."""
+        if os.name != 'nt':
+            return None
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        result = [None]
+        def enum_windows_proc(hwnd, lparam):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if buf.value == title:
+                    if user32.IsWindowVisible(hwnd):
+                        result[0] = hwnd
+                        return 0
+            return 1
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
+        return result[0]
+
+    def _apply_window_style_delayed(self):
+        """Wait for scrcpy window to appear, then apply Mac-style card effects."""
+        try:
+            hwnd = None
+            for attempt in range(30):
+                time.sleep(0.3)
+                hwnd = self._find_window_by_title(self.window_title)
+                if hwnd:
+                    break
+            if not hwnd:
+                print(f"[{self.window_title}] Could not find window for styling")
+                return
+
+            print(f"[{self.window_title}] Applying Mac card style (corner_radius={self.corner_radius})...")
+
+            if os.name == 'nt':
+                self._apply_windows_card_style(hwnd)
+
+            if self.card_style or self.corner_radius is not None or self.borderless:
+                try:
+                    from .window_decorator import get_window_decorator
+                    decorator = get_window_decorator()
+                    _self_ref = self
+                    def _on_close_main():
+                        _self_ref.stop()
+                    decorator.register_window(hwnd, {
+                        'card_style': self.card_style,
+                        'borderless': self.borderless,
+                        'corner_radius': self.corner_radius,
+                        'auto_pin_timeout': 0,
+                        'on_close': _on_close_main,
+                    })
+                    self._hwnd = hwnd
+                    print(f"[{self.window_title}] Registered with window decorator (traffic lights + drag/resize)")
+                except Exception as de:
+                    print(f"[{self.window_title}] Window decorator registration failed: {de}")
+        except Exception as e:
+            print(f"[{self.window_title}] Window style error: {e}")
+
+    def _apply_windows_card_style(self, hwnd):
+        """Apply Mac-style card look on Windows: rounded corners + shadow."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWCP_ROUND = 2
+        try:
+            corner_pref = ctypes.c_int(DWMWCP_ROUND)
+            hr = dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd), ctypes.c_uint(DWMWA_WINDOW_CORNER_PREFERENCE),
+                ctypes.byref(corner_pref), ctypes.sizeof(corner_pref))
+            if hr == 0:
+                print(f"[{self.window_title}] DWM rounded corners applied (DWMWCP_ROUND)")
+            else:
+                self._apply_rounded_region(hwnd)
+        except Exception as e:
+            print(f"[{self.window_title}] DWM rounded corners not available: {e}")
+            self._apply_rounded_region(hwnd)
+
+        try:
+            class MARGINS(ctypes.Structure):
+                _fields_ = [("cxLeftWidth", ctypes.c_int), ("cxRightWidth", ctypes.c_int),
+                            ("cyTopHeight", ctypes.c_int), ("cyBottomHeight", ctypes.c_int)]
+            margins = MARGINS(1, 1, 1, 1)
+            dwmapi.DwmExtendFrameIntoClientArea(wintypes.HWND(hwnd), ctypes.byref(margins))
+            print(f"[{self.window_title}] Drop shadow enabled via DwmExtendFrameIntoClientArea")
+        except Exception as e:
+            print(f"[{self.window_title}] Shadow setup error: {e}")
+
+        try:
+            GCL_STYLE = -26
+            CS_DROPSHADOW = 0x00020000
+            class_style = user32.GetClassLongW(wintypes.HWND(hwnd), GCL_STYLE)
+            user32.SetClassLongW(wintypes.HWND(hwnd), GCL_STYLE, class_style | CS_DROPSHADOW)
+        except Exception:
+            pass
+
+    def _apply_rounded_region(self, hwnd):
+        """Fallback: apply rounded window region for older Windows versions."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        radius = self.corner_radius or 20
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        rgn = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2)
+        if rgn:
+            user32.SetWindowRgn(wintypes.HWND(hwnd), rgn, True)
+
     def stop(self):
         """Stop this main display."""
         if not self.running:
@@ -214,6 +378,16 @@ class MainDisplay:
         self.running = False
         self.stop_event.set()
         print(f"[{self.window_title}] Stopping main display...")
+
+        # Unregister from window decorator
+        try:
+            if hasattr(self, '_hwnd') and self._hwnd:
+                from .window_decorator import get_window_decorator
+                decorator = get_window_decorator()
+                decorator.unregister_window(self._hwnd)
+                self._hwnd = None
+        except Exception as e:
+            print(f"[{self.window_title}] Decorator unregister error: {e}")
 
         if self.process:
             try:
@@ -254,7 +428,8 @@ class AppVirtualDisplay:
                  card_style=False,
                  keep_active=True, turn_screen_off=True, stay_awake=True,
                  record=None, scrcpy_path=None, device_serial=None,
-                 base_port=8887, rotation=0, user_rotation=0):
+                 base_port=8887, rotation=0, user_rotation=0,
+                 display_manager=None):
         """
         Initialize a virtual display for an app.
 
@@ -329,6 +504,7 @@ class AppVirtualDisplay:
         self.base_port = base_port
         self.rotation = rotation  # scrcpy --display-orientation参数（编码级旋转），0=不旋转
         self.user_rotation = user_rotation  # Android wm user-rotation值（系统级旋转）
+        self._display_manager = display_manager  # reference to DisplayManager for stop cleanup
 
         self.scrcpy_path = scrcpy_path or self._find_scrcpy()
         self.process = None
@@ -556,6 +732,30 @@ class AppVirtualDisplay:
             else:
                 # Linux/macOS could use other approaches
                 pass
+
+            # Register with window decorator for traffic lights, drag, resize
+            if self.card_style or self.corner_radius is not None or self.borderless:
+                try:
+                    decorator = get_window_decorator()
+                    _self_ref = self
+                    _pkg = self.app_package
+                    _dm = self._display_manager
+                    def _on_close_app():
+                        if _dm:
+                            _dm.stop_app_display(_pkg)
+                        else:
+                            _self_ref.stop()
+                    decorator.register_window(hwnd, {
+                        'card_style': self.card_style,
+                        'borderless': self.borderless,
+                        'corner_radius': self.corner_radius,
+                        'auto_pin_timeout': 0,
+                        'on_close': _on_close_app,
+                    })
+                    self._hwnd = hwnd
+                    print(f"[{self.window_title}] Registered with window decorator (traffic lights + drag/resize)")
+                except Exception as de:
+                    print(f"[{self.window_title}] Window decorator registration failed: {de}")
 
         except Exception as e:
             print(f"[{self.window_title}] Window style error: {e}")
@@ -854,6 +1054,15 @@ class AppVirtualDisplay:
         self.running = False
         self.stop_monitoring = True
         print(f"[{self.window_title}] Stopping virtual display...")
+
+        # Unregister from window decorator
+        try:
+            if hasattr(self, '_hwnd') and self._hwnd:
+                decorator = get_window_decorator()
+                decorator.unregister_window(self._hwnd)
+                self._hwnd = None
+        except Exception as e:
+            print(f"[{self.window_title}] Decorator unregister error: {e}")
 
         if self.process:
             try:

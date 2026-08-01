@@ -18,7 +18,12 @@ import sys
 import threading
 import time
 
+# Frontend card window styling (traffic lights, drag, resize, DWM rounded corners + shadow)
+# and WindowConfig VO for clean separation of display configuration from style
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from .multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
+from front.window_config import WindowConfig
 
 
 class DisplayManager:
@@ -145,7 +150,7 @@ class DisplayManager:
             rotation = self._main_rotation
 
         if self._main_display_running and self._main_display and self._main_display.running:
-            if self._main_display.rotation == rotation:
+            if hasattr(self._main_display.config, 'rotation') and self._main_display.config.rotation == rotation:
                 return {
                     "success": True,
                     "message": "Main display already running",
@@ -159,31 +164,18 @@ class DisplayManager:
         cfg = self.load_config()
         main_cfg = cfg.get("main_display", {})
 
-        win_w = main_cfg.get("window_width", 540)
-        win_h = main_cfg.get("window_height", 960)
+        # Build WindowConfig VO from config dict
+        win_config = WindowConfig.from_dict(main_cfg, is_main=True)
+
+        # Apply rotation to window dimensions (landscape swaps w/h)
         if rotation in (90, 270):
-            win_w, win_h = win_h, win_w
-            print(f"[DisplayManager] Landscape mode: swapping window size to {win_w}x{win_h}")
+            win_config.swap_dimensions_for_orientation("landscape")
+            win_config.rotation = rotation
+            print(f"[DisplayManager] Landscape mode: window size {win_config.window_width}x{win_config.window_height}")
 
         try:
             self._main_display = MainDisplay(
-                window_title=main_cfg.get("window_title", "手机桌面"),
-                window_x=main_cfg.get("window_x", 100),
-                window_y=main_cfg.get("window_y", 100),
-                window_width=win_w,
-                window_height=win_h,
-                max_fps=main_cfg.get("max_fps", 60),
-                bitrate=main_cfg.get("bitrate", "8M"),
-                video_codec=main_cfg.get("video_codec", "h264"),
-                keep_active=main_cfg.get("keep_active", True),
-                turn_screen_off=main_cfg.get("turn_screen_off", True),
-                stay_awake=main_cfg.get("stay_awake", True),
-                rotation=rotation,
-                borderless=main_cfg.get("borderless", False),
-                background_color=main_cfg.get("background_color", None),
-                always_on_top=main_cfg.get("always_on_top", False),
-                corner_radius=main_cfg.get("corner_radius", None),
-                card_style=main_cfg.get("card_style", False),
+                config=win_config,
                 scrcpy_path=self.scrcpy_path,
                 device_serial=self.device_serial,
             )
@@ -201,7 +193,7 @@ class DisplayManager:
                     "success": True,
                     "message": "Main display started",
                     "display_type": "main",
-                    "window_title": main_cfg.get("window_title", "手机桌面"),
+                    "window_title": win_config.window_title,
                     "rotation": rotation,
                 }
             else:
@@ -299,82 +291,47 @@ class DisplayManager:
 
             win_w = app_cfg.get("window_width", 540)
             win_h = app_cfg.get("window_height", 960)
-            nd_w = app_cfg.get("new_display_width", 1260)
-            nd_h = app_cfg.get("new_display_height", 2844)
 
-            # ===== CarPlay式方案：根据横竖屏使用不同物理分辨率的VirtualDisplay =====
-            # 核心原理：Android VirtualDisplay的natural orientation由width/height比例决定：
-            #   - width < height → natural=竖屏(portrait)，rotation=0=竖屏
-            #   - width > height → natural=横屏(landscape)，rotation=0=横屏
-            # 之前用竖屏new_display + rotation=270只是视频编码旋转，app始终认为竖屏。
-            # CarPlay/HiCar的做法是直接创建横屏分辨率的VirtualDisplay，然后锁定user-rotation=0
-            # （natural方向），app启动时就看到横屏屏幕，渲染原生横屏UI。
-            #
-            # 竖屏模式：使用app配置中的竖屏分辨率（如1260x2844），wm lock 0
-            # 横屏模式：使用独立的横屏分辨率配置（默认1920x1080/320dpi），wm lock 0
-            # wm user-rotation=lock 0 锁定natural方向，防止FLAG_ROTATES_WITH_CONTENT
-            # 导致app强制竖屏时系统自动旋转display。
-            nd_dpi = app_cfg.get("new_display_dpi", None)
-            if orientation == "landscape":
-                # 横屏：窗口横屏，new_display使用横屏分辨率
-                if win_w < win_h:
-                    win_w, win_h = win_h, win_w
-                nd_w = app_cfg.get("landscape_new_display_width", 1920)
-                nd_h = app_cfg.get("landscape_new_display_height", 1080)
-                nd_dpi = app_cfg.get("landscape_new_display_dpi", 320)
-                target_rotation = 0
-                target_user_rotation = 0  # lock 0 = natural方向=横屏（因为w>h）
-                nd_orient_desc = f"{nd_w}x{nd_h}/{nd_dpi}dpi(横屏natural)"
-            else:
-                # 竖屏：窗口竖屏，new_display使用竖屏分辨率
-                if win_w > win_h:
-                    win_w, win_h = win_h, win_w
-                if nd_w > nd_h:
-                    nd_w, nd_h = nd_h, nd_w
-                target_rotation = 0
-                target_user_rotation = 0  # lock 0 = natural方向=竖屏（因为h>w）
-                nd_orient_desc = f"{nd_w}x{nd_h}/{nd_dpi or 'default'}dpi(竖屏natural)"
+            # ===== Build WindowConfig VO and resolve virtual display size =====
+            # Mac card style is always applied (hardcoded in AppVirtualDisplay).
+            # WindowConfig.resolve_virtual_display_size automatically matches
+            # VD resolution to window aspect ratio to avoid letterbox black bars.
+            win_config = WindowConfig.from_dict(app_cfg, is_main=False)
+            win_config.default_orientation = orientation
+
+            # Ensure window dimensions match the requested orientation
+            win_config.swap_dimensions_for_orientation(orientation)
+
+            # Resolve correct VD width/height/DPI based on window aspect ratio
+            nd_w, nd_h, nd_dpi = win_config.resolve_virtual_display_size(orientation)
+            win_config.new_display_width = nd_w
+            win_config.new_display_height = nd_h
+            win_config.new_display_dpi = nd_dpi
+            win_config.rotation = 0
+            win_config.user_rotation = 0
+
+            # Determine orientation description for debug output
+            is_landscape_vd = nd_w > nd_h
+            nd_orient_desc = f"{nd_w}x{nd_h}/{nd_dpi or 'default'}dpi({'横屏' if is_landscape_vd else '竖屏' if win_config.window_width < win_config.window_height else '正方形'}natural)"
 
             mvd = self._get_multi_display()
 
             try:
-                ur_desc = "lock 0 (natural方向)" if target_user_rotation == 0 else f"lock {target_user_rotation}"
                 print(f"[DisplayManager] ========== 创建{orientation}虚拟屏参数 ==========")
                 print(f"[DisplayManager] app_package           : {app_package}")
-                print(f"[DisplayManager] window 尺寸           : {win_w}x{win_h} ({'横屏✅' if win_w > win_h else '竖屏'})")
+                print(f"[DisplayManager] window 尺寸           : {win_config.window_width}x{win_config.window_height} ({'横屏✅' if win_config.window_width > win_config.window_height else '竖屏'})")
                 print(f"[DisplayManager] new_display (安卓)    : {nd_orient_desc}")
-                print(f"[DisplayManager] scrcpy rotation       : {target_rotation} (不做编码旋转)")
-                print(f"[DisplayManager] wm user-rotation      : {ur_desc} (锁定natural方向，防FLAG_ROTATES_WITH_CONTENT)")
+                print(f"[DisplayManager] scrcpy rotation       : 0 (不做编码旋转)")
+                print(f"[DisplayManager] wm user-rotation      : lock 0 (natural方向，防FLAG_ROTATES_WITH_CONTENT)")
                 print(f"[DisplayManager] =================================================")
 
                 display = AppVirtualDisplay(
                     app_package=app_package,
+                    config=win_config,
                     display_id=mvd._alloc_display_id(),
-                    window_title=app_cfg.get("window_title", app_package),
-                    window_x=app_cfg.get("window_x"),
-                    window_y=app_cfg.get("window_y"),
-                    window_width=win_w,
-                    window_height=win_h,
-                    new_display_width=nd_w,
-                    new_display_height=nd_h,
-                    new_display_dpi=nd_dpi,
-                    max_fps=app_cfg.get("max_fps", 60),
-                    bitrate=app_cfg.get("bitrate", "8M"),
-                    video_codec=app_cfg.get("video_codec", "h264"),
-                    no_vd_system_decorations=True,
-                    borderless=app_cfg.get("borderless", False),
-                    background_color=app_cfg.get("background_color", None),
-                    always_on_top=app_cfg.get("always_on_top", False),
-                    corner_radius=app_cfg.get("corner_radius", None),
-                    card_style=app_cfg.get("card_style", False),
-                    keep_active=app_cfg.get("keep_active", True),
-                    turn_screen_off=False,
-                    stay_awake=app_cfg.get("stay_awake", True),
                     scrcpy_path=self.scrcpy_path,
                     device_serial=self.device_serial,
                     base_port=mvd.base_port,
-                    rotation=target_rotation,
-                    user_rotation=target_user_rotation,
                     display_manager=self,
                 )
 
@@ -841,7 +798,7 @@ class DisplayManager:
         Returns:
             Dict with success status.
         """
-        from .window_decorator import get_window_decorator
+        from front.card_window import get_card_window_decorator
 
         if app_package is None or app_package == "main":
             cfg = self.load_config()
@@ -861,7 +818,7 @@ class DisplayManager:
             return {"success": False, "error": f"Window not found: {title}"}
 
         try:
-            decorator = get_window_decorator()
+            decorator = get_card_window_decorator()
             decorator.set_edit_mode(hwnd, editing)
             return {
                 "success": True,

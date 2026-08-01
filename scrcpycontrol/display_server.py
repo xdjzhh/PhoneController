@@ -20,10 +20,15 @@ import threading
 import time
 import atexit
 import re
+import sys
 import adbutils
 from flask import Flask, request, jsonify
+
+# Frontend card window styling + WindowConfig VO
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from front.card_window import get_card_window_decorator
+from front.window_config import WindowConfig
 from .multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
-from .window_decorator import get_window_decorator
 from .screen_control_keyhot import ScreenControlKeyHot
 
 app = Flask(__name__)
@@ -223,19 +228,12 @@ def start_main_display():
     except Exception as e:
         print(f"[Main] Failed to set stayon: {e}")
     
+    # Build WindowConfig VO from config dict
+    win_config = WindowConfig.from_dict(main_cfg, is_main=True)
+    
     # Create MainDisplay instance
     main_display = MainDisplay(
-        window_title=main_cfg.get('window_title', '手机桌面'),
-        window_x=main_cfg.get('window_x'),
-        window_y=main_cfg.get('window_y'),
-        window_width=main_cfg.get('window_width'),
-        window_height=main_cfg.get('window_height'),
-        max_fps=main_cfg.get('max_fps', 60),
-        bitrate=main_cfg.get('bitrate', '8M'),
-        video_codec=main_cfg.get('video_codec', 'h264'),
-        keep_active=main_cfg.get('keep_active', True),
-        turn_screen_off=main_cfg.get('turn_screen_off', True),
-        stay_awake=main_cfg.get('stay_awake', True),
+        config=win_config,
         scrcpy_path=scrcpy_path,
         device_serial=device_serial
     )
@@ -542,80 +540,24 @@ def start_display():
         title = display_config.get('window_title', app_package)
         
         # Create AppVirtualDisplay instance through MultiVirtualDisplay
+        # Build WindowConfig VO from config dict
+        win_config = WindowConfig.from_dict(display_config, is_main=False)
+        
+        # Resolve virtual display size matching window aspect ratio automatically
+        # (prevents letterbox black bars for landscape/portrait/square windows)
+        nd_w, nd_h, nd_dpi = win_config.resolve_virtual_display_size(win_config.default_orientation)
+        win_config.new_display_width = nd_w
+        win_config.new_display_height = nd_h
+        win_config.new_display_dpi = nd_dpi
+        win_config.rotation = 0
+        win_config.user_rotation = 0  # lock to natural direction on Android side
+
         display_id = len(multi_display.displays)
-        win_w = display_config.get('window_width', 540)
-        win_h = display_config.get('window_height', 960)
-        is_card = display_config.get('card_style', False)
-
-        # Determine orientation settings
-        default_orientation = display_config.get('default_orientation', 'portrait')
-        is_landscape = default_orientation == 'landscape'
-
-        # For card-style windows, pick virtual display resolution that matches
-        # the window aspect ratio to avoid letterbox black bars.
-        if is_card:
-            win_ratio = win_w / win_h if win_h else 1.0
-            if win_ratio >= 1.2:
-                # Landscape window → use landscape VD config
-                ndw = display_config.get('landscape_new_display_width', win_w * 2)
-                ndh = display_config.get('landscape_new_display_height', win_h * 2)
-                ndpi = display_config.get('landscape_new_display_dpi', None)
-                is_landscape = True
-            elif win_ratio <= 0.8:
-                # Portrait window → use portrait VD config
-                ndw = display_config.get('new_display_width', 1260)
-                ndh = display_config.get('new_display_height', 2844)
-                ndpi = display_config.get('new_display_dpi', None)
-                is_landscape = False
-            else:
-                # Square / near-square window → use landscape config if it's square,
-                # otherwise compute a square virtual display from window size.
-                ls_w = display_config.get('landscape_new_display_width')
-                ls_h = display_config.get('landscape_new_display_height')
-                if ls_w and ls_h and abs(ls_w / ls_h - 1.0) < 0.15:
-                    ndw, ndh = ls_w, ls_h
-                    ndpi = display_config.get('landscape_new_display_dpi', None)
-                else:
-                    # Compute square VD: use the larger dimension * 2 as side
-                    side = max(win_w, win_h) * 2
-                    ndw, ndh = side, side
-                    ndpi = display_config.get('new_display_dpi', 400)
-                is_landscape = (ndw > ndh)
-        else:
-            ndw = display_config.get('landscape_new_display_width' if is_landscape else 'new_display_width', 1260)
-            ndh = display_config.get('landscape_new_display_height' if is_landscape else 'new_display_height', 2844)
-            ndpi = display_config.get('landscape_new_display_dpi' if is_landscape else 'new_display_dpi', None)
-
-        # For landscape: set user_rotation=1 (system rotation lock to landscape)
-        # scrcpy --display-orientation=0 (no encoding rotation; rotation done at Android level)
-        user_rot = 1 if is_landscape else 0
 
         app_display = AppVirtualDisplay(
             app_package=app_package,
+            config=win_config,
             display_id=display_id,
-            window_title=title,
-            window_x=display_config.get('window_x'),
-            window_y=display_config.get('window_y'),
-            window_width=win_w,
-            window_height=win_h,
-            new_display_width=ndw,
-            new_display_height=ndh,
-            new_display_dpi=ndpi,
-            max_fps=display_config.get('max_fps', 60),
-            bitrate=display_config.get('bitrate', '8M'),
-            video_codec=display_config.get('video_codec', 'h264'),
-            no_vd_system_decorations=True,
-            flex_display=display_config.get('flex_display', False),
-            borderless=display_config.get('borderless', False),
-            background_color=display_config.get('background_color'),
-            always_on_top=display_config.get('always_on_top', False),
-            corner_radius=display_config.get('corner_radius'),
-            card_style=display_config.get('card_style', False),
-            keep_active=display_config.get('keep_active', True),
-            turn_screen_off=False,
-            stay_awake=display_config.get('stay_awake', True),
-            rotation=0,  # app displays: no encoding rotation; use user_rotation
-            user_rotation=user_rot,
             scrcpy_path=multi_display.scrcpy_path,
             device_serial=multi_display.device_serial,
             base_port=multi_display.base_port
@@ -751,7 +693,7 @@ def toggle_edit_mode(app_package):
         if not hwnd:
             return jsonify({'success': False, 'error': 'Window HWND not available (style may not have been applied)'}), 400
 
-        decorator = get_window_decorator()
+        decorator = get_card_window_decorator()
 
         if editing is None:
             # Toggle

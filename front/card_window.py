@@ -1,8 +1,10 @@
 """
-Window Decorator - Cross-platform window decoration for scrcpy card-style windows.
+Card Window - Mac-style card window decoration for scrcpy windows.
 
 Windows implementation uses a dedicated UI thread for overlay window creation/message pump,
 plus a global WH_MOUSE_LL hook thread for drag/resize/hotzone detection.
+
+Also provides apply_mac_card_style() for Windows DWM rounded corners + drop shadow.
 
 Key design:
 - UI thread: registers window class, creates/destroys overlays, runs GetMessage/DispatchMessage pump
@@ -14,7 +16,6 @@ import os
 import sys
 import threading
 import time
-import queue
 import ctypes
 from ctypes import wintypes
 
@@ -25,16 +26,21 @@ from ctypes import wintypes
 
 if os.name == 'nt':
     try:
-        # Try Per-Monitor V2 DPI awareness (Windows 10+)
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     except Exception:
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
             except Exception:
                 pass
+
+
+# ──────────────────────────── Mac Card Style Defaults ────────────────────────────
+
+CARD_CORNER_RADIUS = 20
+CARD_BACKGROUND_COLOR = '#1a1a2e'
 
 
 # ──────────────────────────── Windows Constants ────────────────────────────
@@ -104,7 +110,6 @@ if os.name == 'nt':
 
     GA_ROOT = 2
     GWL_EXSTYLE = -20
-    GWLP_WNDPROC = -4
 
     class POINT(ctypes.Structure):
         _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -162,11 +167,6 @@ if os.name == 'nt':
                                            wintypes.WPARAM,
                                            ctypes.POINTER(MSLLHOOKSTRUCT))
 
-    # Custom message-only window for UI thread dispatching
-    class CREATEOVERLAY_DATA(ctypes.Structure):
-        _fields_ = [("scrcpy_hwnd", wintypes.HWND),
-                    ("corner_radius", ctypes.c_int)]
-
 
 # ──────────────────────── Mac Traffic Light Colors ────────────────────────
 
@@ -197,11 +197,10 @@ class HitZone:
 
 
 class CardState:
-    def __init__(self, scrcpy_hwnd, config=None):
+    def __init__(self, scrcpy_hwnd, on_close=None):
         self.scrcpy_hwnd = scrcpy_hwnd
         self.overlay_hwnd = None
-        self.config = config or {}
-        self.on_close = self.config.get('on_close', None)  # callback for proper cleanup
+        self.on_close = on_close
 
         self.btn_size = 12
         self.btn_spacing = 8
@@ -260,15 +259,86 @@ class CardState:
         return HitZone.NONE
 
 
-# ──────────────────────── Windows Decorator ────────────────────────
+# ──────────────────────── DWM Card Style (rounded corners + shadow) ────────────────────────
 
-class WindowsWindowDecorator:
+def apply_mac_card_style(hwnd, window_title=""):
+    """Apply Mac-style card look on Windows: DWM rounded corners + drop shadow.
+    Uses Windows 11 DWM API natively with SetWindowRgn fallback for older versions.
+    """
+    if os.name != 'nt':
+        return
+
+    # --- 1. DWM rounded corners (Windows 11) ---
+    DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWCP_ROUND = 2
+    try:
+        corner_pref = ctypes.c_int(DWMWCP_ROUND)
+        hr = dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd),
+            ctypes.c_uint(DWMWA_WINDOW_CORNER_PREFERENCE),
+            ctypes.byref(corner_pref),
+            ctypes.sizeof(corner_pref)
+        )
+        if hr == 0:
+            print(f"[{window_title}] DWM rounded corners applied (DWMWCP_ROUND)", flush=True)
+        else:
+            _apply_rounded_region(hwnd, window_title)
+    except Exception as e:
+        print(f"[{window_title}] DWM rounded corners not available: {e}", flush=True)
+        _apply_rounded_region(hwnd, window_title)
+
+    # --- 2. Drop shadow via DwmExtendFrameIntoClientArea ---
+    try:
+        class MARGINS(ctypes.Structure):
+            _fields_ = [("cxLeftWidth", ctypes.c_int),
+                        ("cxRightWidth", ctypes.c_int),
+                        ("cyTopHeight", ctypes.c_int),
+                        ("cyBottomHeight", ctypes.c_int)]
+        margins = MARGINS(1, 1, 1, 1)
+        dwmapi.DwmExtendFrameIntoClientArea(wintypes.HWND(hwnd), ctypes.byref(margins))
+        print(f"[{window_title}] Drop shadow enabled via DwmExtendFrameIntoClientArea", flush=True)
+    except Exception as e:
+        print(f"[{window_title}] Shadow setup error: {e}", flush=True)
+
+    # --- 3. CS_DROPSHADOW class style for Win10 ---
+    try:
+        GCL_STYLE = -26
+        CS_DROPSHADOW = 0x00020000
+        class_style = user32.GetClassLongW(wintypes.HWND(hwnd), GCL_STYLE)
+        user32.SetClassLongW(wintypes.HWND(hwnd), GCL_STYLE, class_style | CS_DROPSHADOW)
+    except Exception:
+        pass
+
+    # --- 4. Force repaint ---
+    try:
+        user32.SetWindowPos(wintypes.HWND(hwnd), None, 0, 0, 0, 0,
+                            0x0001 | 0x0002 | 0x0004 | 0x0020)
+    except Exception:
+        pass
+
+
+def _apply_rounded_region(hwnd, window_title=""):
+    """Fallback: use SetWindowRgn to create rounded corners on older Windows."""
+    radius = CARD_CORNER_RADIUS
+    rect = RECT()
+    user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect))
+    w = rect.right - rect.left
+    h = rect.bottom - rect.top
+    rgn = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2)
+    if rgn:
+        user32.SetWindowRgn(wintypes.HWND(hwnd), rgn, True)
+        print(f"[{window_title}] Rounded region applied (radius={radius}) via SetWindowRgn", flush=True)
+
+
+# ──────────────────────── Windows Card Decorator ────────────────────────
+
+class WindowsCardDecorator:
     _instance = None
     _lock = threading.Lock()
 
     def __init__(self):
         self._cards = {}
-        self._card_ptrs = {}  # id(card) -> card object mapping for cross-thread dispatch
+        self._card_ptrs = {}
         self._ui_hwnd = None
         self._ui_thread = None
         self._ui_thread_id = None
@@ -282,29 +352,25 @@ class WindowsWindowDecorator:
         self._start_event = threading.Event()
         self._ui_ready = False
 
-        # Start UI thread and wait for it
         self._ui_thread = threading.Thread(target=self._ui_thread_main, daemon=True)
         self._ui_thread.start()
         self._start_event.wait(timeout=5)
 
-        # Start hook thread
         self._start_hook()
 
     @classmethod
     def get_instance(cls):
         with cls._lock:
             if cls._instance is None:
-                cls._instance = WindowsWindowDecorator()
+                cls._instance = WindowsCardDecorator()
             return cls._instance
 
     # ──────────── UI Thread ────────────
 
     def _ui_thread_main(self):
-        """Main function for UI thread - creates message-only window and runs message pump."""
         self._ui_thread_id = kernel32.GetCurrentThreadId()
         inst = kernel32.GetModuleHandleW(None)
 
-        # Register overlay window class
         wnd_proc = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
                                       wintypes.WPARAM, wintypes.LPARAM)(
             self._overlay_wnd_proc
@@ -324,10 +390,9 @@ class WindowsWindowDecorator:
         atom = user32.RegisterClassExW(ctypes.byref(wc))
         if not atom:
             err = ctypes.get_last_error()
-            if err != 1410:  # ERROR_CLASS_ALREADY_EXISTS
+            if err != 1410:
                 print(f"[UI] RegisterClassEx failed: {err}", flush=True)
 
-        # Create a message-only window for receiving thread messages
         wc_msg = WNDCLASSEXW()
         wc_msg.cbSize = ctypes.sizeof(WNDCLASSEXW)
         wc_msg.lpfnWndProc = wnd_proc
@@ -339,8 +404,7 @@ class WindowsWindowDecorator:
 
         self._msg_hwnd = user32.CreateWindowExW(
             0, "ScrcpyCardMsgWnd", None, 0, 0, 0, 0, 0,
-            wintypes.HWND(-3),  # HWND_MESSAGE
-            None, inst, None
+            wintypes.HWND(-3), None, inst, None
         )
 
         self._ui_ready = True
@@ -360,7 +424,6 @@ class WindowsWindowDecorator:
             else:
                 break
 
-        # Cleanup
         for hwnd in list(self._cards.keys()):
             self._destroy_overlay(self._cards[hwnd])
         if self._msg_hwnd:
@@ -368,20 +431,17 @@ class WindowsWindowDecorator:
         print("[UI] UI thread exited", flush=True)
 
     def _post_ui(self, msg, wparam=0, card=None):
-        """Post a message to the UI thread."""
         if self._msg_hwnd:
             lparam = id(card) if card is not None else 0
             user32.PostMessageW(wintypes.HWND(self._msg_hwnd), wintypes.UINT(msg),
                                 wintypes.WPARAM(wparam), wintypes.LPARAM(lparam))
 
     def _card_from_lparam(self, lparam):
-        """Look up a CardState from an LPARAM (which is id(card))."""
         return self._card_ptrs.get(int(lparam))
 
-    # ──────────── Overlay window creation (must be called on UI thread) ────────────
+    # ──────────── Overlay window creation ────────────
 
     def _create_overlay_for_card(self, card):
-        """Create layered overlay window. Called on UI thread."""
         inst = kernel32.GetModuleHandleW(None)
         sx, sy, sw, sh = self._window_rect(card.scrcpy_hwnd)
 
@@ -401,7 +461,6 @@ class WindowsWindowDecorator:
         card.overlay_hwnd = hwnd
         print(f"[UI] Overlay created: hwnd={hwnd} for scrcpy={card.scrcpy_hwnd}", flush=True)
 
-        # Draw initial state
         self._redraw_overlay_on_ui(card)
 
         if card.editing:
@@ -416,8 +475,6 @@ class WindowsWindowDecorator:
     def _show_overlay_on_ui(self, card):
         if not card.overlay_hwnd:
             return
-        # Keep WS_EX_TRANSPARENT so clicks pass through to scrcpy.
-        # All interactions (drag, resize, buttons) are handled by the global mouse hook.
         user32.ShowWindow(wintypes.HWND(card.overlay_hwnd), SW_SHOWNOACTIVATE)
 
     def _hide_overlay_on_ui(self, card):
@@ -553,14 +610,13 @@ class WindowsWindowDecorator:
                         idx = (py * w + px) * 4
                         buf[idx] = 0xFF; buf[idx + 1] = 0xFF; buf[idx + 2] = 0xFF; buf[idx + 3] = 255
 
-    # ──────────── WndProc (called on UI thread for overlay windows) ────────────
+    # ──────────── WndProc ────────────
 
     def _overlay_wnd_proc(self, hwnd, msg, wParam, lParam):
         hwnd_c = wintypes.HWND(hwnd)
         msg_val = int(msg)
 
-        # Message-only window handles
-        if int(hwnd) == int(self._msg_hwnd) if self._msg_hwnd else False:
+        if self._msg_hwnd and int(hwnd) == int(self._msg_hwnd):
             if msg_val == WM_TUI_CREATEOVERLAY:
                 card = self._card_from_lparam(lParam)
                 if card:
@@ -597,7 +653,6 @@ class WindowsWindowDecorator:
             return user32.DefWindowProcW(hwnd_c, wintypes.UINT(msg_val),
                                         wintypes.WPARAM(wParam), wintypes.LPARAM(lParam))
 
-        # Overlay windows - return 0 for destroy, otherwise let default handle
         if msg_val == WM_DESTROY:
             return 0
         return user32.DefWindowProcW(hwnd_c, wintypes.UINT(msg_val),
@@ -611,7 +666,6 @@ class WindowsWindowDecorator:
 
     def _hook_loop(self):
         self._hook_proc = LOWLEVELMOUSEPROC(self._mouse_hook_proc)
-        # For WH_MOUSE_LL (low-level hook), hMod must be NULL and dwThreadId=0
         self._hook_handle = user32.SetWindowsHookExW(
             WH_MOUSE_LL, self._hook_proc, wintypes.HINSTANCE(0), 0
         )
@@ -633,7 +687,7 @@ class WindowsWindowDecorator:
         if self._hook_handle:
             user32.UnhookWindowsHookEx(self._hook_handle)
             self._hook_handle = None
-            print(f"[Hook] Hook unhooked", flush=True)
+        print("[Hook] Hook unhooked", flush=True)
 
     def _mouse_hook_proc(self, nCode, wParam, lParam):
         try:
@@ -669,9 +723,7 @@ class WindowsWindowDecorator:
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     def _card_under_mouse(self, mx, my):
-        """Find which card's window rectangle contains the mouse point."""
         def _hwnd_int(h):
-            """Safely convert any HWND-like value to Python int."""
             if h is None:
                 return 0
             if isinstance(h, int):
@@ -691,11 +743,9 @@ class WindowsWindowDecorator:
                 except Exception:
                     return 0
 
-        # First try: direct HWND match via WindowFromPoint + GetAncestor
         hwnd = user32.WindowFromPoint(POINT(mx, my))
         if hwnd:
             probe_int = _hwnd_int(hwnd)
-            # Walk up the parent chain
             for _ in range(8):
                 for scrcpy_hwnd, card in self._cards.items():
                     scrcpy_int = int(scrcpy_hwnd)
@@ -709,7 +759,6 @@ class WindowsWindowDecorator:
                     break
                 probe_int = parent_int
 
-        # Second try: rect-based hit test
         for scrcpy_hwnd, card in reversed(list(self._cards.items())):
             try:
                 r = RECT()
@@ -796,7 +845,7 @@ class WindowsWindowDecorator:
                 card.hover_button = new_hover
                 self._post_ui(WM_TUI_REDRAW, card=card)
 
-        return None  # pass through to next hook
+        return None
 
     def _on_lbutton_down(self, card, mx, my):
         if not card or not card.editing:
@@ -851,50 +900,44 @@ class WindowsWindowDecorator:
     # ─────────── Traffic light actions ───────────
 
     def _on_close_clicked(self, card):
-        print(f"[WindowDecorator] Close clicked for hwnd={card.scrcpy_hwnd}", flush=True)
-        # Call registered cleanup callback. Must run in a thread because the hook
-        # callback is on the low-level mouse hook thread — blocking here freezes
-        # the entire system mouse input.
+        print(f"[CardWindow] Close clicked for hwnd={card.scrcpy_hwnd}", flush=True)
         def _do_close():
             if card.on_close:
                 try:
                     card.on_close()
                     return
                 except Exception as e:
-                    print(f"[WindowDecorator] on_close callback error: {e}", flush=True)
-            # Fallback: send WM_CLOSE
+                    print(f"[CardWindow] on_close callback error: {e}", flush=True)
             user32.PostMessageW(wintypes.HWND(card.scrcpy_hwnd), wintypes.UINT(0x0010), 0, 0)
         threading.Thread(target=_do_close, daemon=True).start()
 
     def _on_min_clicked(self, card):
-        print(f"[WindowDecorator] Minimize clicked for hwnd={card.scrcpy_hwnd}", flush=True)
+        print(f"[CardWindow] Minimize clicked for hwnd={card.scrcpy_hwnd}", flush=True)
         if card.overlay_hwnd:
             user32.ShowWindow(wintypes.HWND(card.overlay_hwnd), SW_HIDE)
         user32.ShowWindow(wintypes.HWND(card.scrcpy_hwnd), 6)
 
     def _on_pin_clicked(self, card):
-        print(f"[WindowDecorator] Pin clicked → exiting edit mode", flush=True)
+        print(f"[CardWindow] Pin clicked → exiting edit mode", flush=True)
         self.set_edit_mode(card.scrcpy_hwnd, False)
 
     def _on_rbutton_down(self, card, mx, my):
-        """Right-click: if card is pinned, re-enter edit mode; otherwise pass through."""
         if card and not card.editing:
-            print(f"[WindowDecorator] Right-click on pinned card → re-entering edit mode", flush=True)
+            print(f"[CardWindow] Right-click on pinned card → re-entering edit mode", flush=True)
             self.set_edit_mode(card.scrcpy_hwnd, True)
-            return 1  # swallow the right-click so it doesn't trigger app context menu
-        return None  # pass through to app
+            return 1
+        return None
 
     # ─────────── Public API ───────────
 
-    def register_window(self, scrcpy_hwnd, config=None):
+    def register_window(self, scrcpy_hwnd, on_close=None):
         scrcpy_hwnd = int(scrcpy_hwnd)
         if scrcpy_hwnd in self._cards:
             return
-        card = CardState(scrcpy_hwnd, config)
-        card.editing = True  # start in edit mode
+        card = CardState(scrcpy_hwnd, on_close=on_close)
+        card.editing = True
         self._cards[scrcpy_hwnd] = card
         self._card_ptrs[id(card)] = card
-        # Post create message to UI thread
         self._post_ui(WM_TUI_CREATEOVERLAY, card=card)
 
     def unregister_window(self, scrcpy_hwnd):
@@ -917,7 +960,7 @@ class WindowsWindowDecorator:
         self._post_ui(WM_TUI_SHOWHIDE, 1 if editing else 0, card=card)
         if not editing:
             user32.SetCursor(user32.LoadCursorW(None, IDC_ARROW))
-        print(f"[WindowDecorator] Edit mode {'ON' if editing else 'OFF (pinned)'} for hwnd={scrcpy_hwnd}", flush=True)
+        print(f"[CardWindow] Edit mode {'ON' if editing else 'OFF (pinned)'} for hwnd={scrcpy_hwnd}", flush=True)
 
     def toggle_edit_mode(self, scrcpy_hwnd):
         scrcpy_hwnd = int(scrcpy_hwnd)
@@ -935,7 +978,7 @@ class WindowsWindowDecorator:
 
 # ──────────────────────── X11 Decorator (stub) ────────────────────────
 
-class X11WindowDecorator:
+class X11CardDecorator:
     _instance = None
     _lock = threading.Lock()
 
@@ -946,11 +989,11 @@ class X11WindowDecorator:
     def get_instance(cls):
         with cls._lock:
             if cls._instance is None:
-                cls._instance = X11WindowDecorator()
+                cls._instance = X11CardDecorator()
             return cls._instance
 
-    def register_window(self, xid, config=None):
-        print(f"[WindowDecorator/X11] register_window stub for xid={xid}")
+    def register_window(self, xid, on_close=None):
+        pass
 
     def unregister_window(self, xid):
         pass
@@ -967,8 +1010,8 @@ class X11WindowDecorator:
 
 # ──────────────────────── Public API ────────────────────────
 
-def get_window_decorator():
+def get_card_window_decorator():
     if os.name == 'nt':
-        return WindowsWindowDecorator.get_instance()
+        return WindowsCardDecorator.get_instance()
     else:
-        return X11WindowDecorator.get_instance()
+        return X11CardDecorator.get_instance()

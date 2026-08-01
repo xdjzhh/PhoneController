@@ -11,8 +11,7 @@
     "video_codec": "h264",
     "keep_active": true,
     "turn_screen_off": true,
-    "stay_awake": true,
-    "card_style": true
+    "stay_awake": true
   },
   "app_displays": {
     "com.eg.android.AlipayGphone": {
@@ -34,15 +33,12 @@
     },
     "com.huawei.android.totemweather": {
       "window_title": "天气",
-      "window_x": 1760, 
+      "window_x": 1760,
       "window_y": 100,
       "window_width": 480,
-      "window_height": 520,
-      "card_style": true,
-      "corner_radius": 24,
-      "background_color": "#1a1a2e",
-      "new_display_width": 720,
-      "new_display_height": 900,
+      "window_height": 600,
+      "new_display_width": 800,
+      "new_display_height": 1080,
       "new_display_dpi": 400,
       "landscape_new_display_width": 720,
       "landscape_new_display_height": 720,

@@ -14,6 +14,7 @@ API 端点：
 import ctypes
 import os
 import sys
+import multiprocessing
 
 # Set DPI awareness BEFORE any imports/window creation to ensure
 # GetWindowRect and mouse hook coordinates use physical pixels.
@@ -38,6 +39,8 @@ from phone_agent.agent import AgentConfig
 
 from scrcpycontrol.display_interface import get_display_manager
 
+multiprocessing.freeze_support()
+
 app = Flask(__name__)
 
 # 全局配置
@@ -47,6 +50,7 @@ config_initialized = False
 display_manager = None
 agent = None
 agent_initialized = False
+backdrop_manager = None
 
 
 def initialize_config(base_url: str, model: str, api_key: str):
@@ -68,10 +72,36 @@ def initialize_config(base_url: str, model: str, api_key: str):
     print("✅ Configuration initialized successfully")
 
 
-def initialize_display_manager(start_main: bool = True, start_monitor: bool = True):
-    """初始化显示管理器并可选启动主屏和屏幕监控"""
+def start_backdrop_window():
+    """启动Qt深色背景窗口，模拟无桌面Linux环境"""
+    global backdrop_manager
+    try:
+        from front.qt_backdrop import get_backdrop_manager
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "scrcpycontrol", "display_config.json")
+        backdrop_manager = get_backdrop_manager(config_path=config_path)
+        if backdrop_manager.start():
+            print("✅ Qt backdrop window started (Linux desktop simulation)")
+            return True
+        else:
+            print("⚠️  Qt backdrop window failed to start (continuing without backdrop)")
+            backdrop_manager = None
+            return False
+    except Exception as e:
+        print(f"⚠️  Failed to start Qt backdrop: {e}")
+        backdrop_manager = None
+        return False
+
+
+def initialize_display_manager(start_main: bool = True, start_monitor: bool = True,
+                               start_backdrop: bool = True):
+    """初始化显示管理器并可选启动主屏、屏幕监控和背景窗口"""
     global display_manager
     try:
+        if start_backdrop:
+            print("🖥️  Starting Qt Linux desktop backdrop...")
+            start_backdrop_window()
+
         display_manager = get_display_manager()
         if start_main:
             print("📱 Starting main display...")
@@ -321,6 +351,46 @@ def set_edit_mode():
     return jsonify(result), status_code
 
 
+@app.route('/notification/show', methods=['POST'])
+def show_notification_panel():
+    """显示Qt原生macOS风格通知面板"""
+    global backdrop_manager
+    if not backdrop_manager or not backdrop_manager.is_running:
+        return jsonify({'success': False, 'error': 'Backdrop manager not running'}), 500
+    backdrop_manager.show_notification()
+    return jsonify({'success': True})
+
+
+@app.route('/notification/hide', methods=['POST'])
+def hide_notification_panel():
+    """隐藏通知面板"""
+    global backdrop_manager
+    if not backdrop_manager or not backdrop_manager.is_running:
+        return jsonify({'success': False, 'error': 'Backdrop manager not running'}), 500
+    backdrop_manager.hide_notification()
+    return jsonify({'success': True})
+
+
+@app.route('/notification/toggle', methods=['POST'])
+def toggle_notification_panel():
+    """切换通知面板显示/隐藏"""
+    global backdrop_manager
+    if not backdrop_manager or not backdrop_manager.is_running:
+        return jsonify({'success': False, 'error': 'Backdrop manager not running'}), 500
+    backdrop_manager.toggle_notification()
+    return jsonify({'success': True})
+
+
+@app.route('/notification/refresh', methods=['POST'])
+def refresh_notifications():
+    """立即刷新通知数据"""
+    global backdrop_manager
+    if not backdrop_manager or not backdrop_manager.is_running:
+        return jsonify({'success': False, 'error': 'Backdrop manager not running'}), 500
+    backdrop_manager.refresh_notifications()
+    return jsonify({'success': True})
+
+
 def main():
     parser = argparse.ArgumentParser(description='Phone Agent HTTP Server')
     parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
@@ -331,8 +401,9 @@ def main():
     parser.add_argument('--apikey', default='cae66fb0786343ee9e078a00ec683721.3HmwuIx9d5Vf22DD', help='API key')
     parser.add_argument('--no-main-display', action='store_true', help='Do not start main display on startup')
     parser.add_argument('--no-screen-monitor', action='store_true', help='Do not start screen lock monitor')
-    parser.add_argument('--auto-start', default='com.huawei.android.totemweather',
-                        help='Comma-separated app packages to auto-start on launch (default: weather)')
+    parser.add_argument('--no-backdrop', action='store_true', help='Do not start Qt Linux desktop backdrop')
+    parser.add_argument('--auto-start', default='com.huawei.android.totemweather,com.autonavi.minimap',
+                        help='Comma-separated app packages to auto-start on launch (default: weather + Amap)')
     args = parser.parse_args()
     
     # Initialize agent config
@@ -343,26 +414,31 @@ def main():
         api_key=args.apikey
     )
     
-    # Initialize display manager and start main display
+    # Initialize display manager (starts backdrop first, then main display)
     if not args.no_main_display:
         print("🖥️  Initializing display manager...")
         initialize_display_manager(
             start_main=True,
-            start_monitor=not args.no_screen_monitor
+            start_monitor=not args.no_screen_monitor,
+            start_backdrop=not args.no_backdrop,
         )
+    elif not args.no_backdrop:
+        start_backdrop_window()
 
-    # Auto-start configured app cards (e.g. weather)
+    # Auto-start configured app cards (e.g. weather, Amap navigation)
     if display_manager and args.auto_start:
         auto_apps = [p.strip() for p in args.auto_start.split(',') if p.strip()]
-        for app_pkg in auto_apps:
+        import time as _time
+        _time.sleep(3)  # wait for main display to settle
+        for idx, app_pkg in enumerate(auto_apps):
             print(f"📱 Auto-starting app card: {app_pkg}...")
-            import time as _time
-            _time.sleep(3)  # wait for main display to settle
             result = display_manager.start_app_display(app_pkg)
             if result.get('success'):
                 print(f"✅ {app_pkg} started: {result.get('message', '')}")
             else:
                 print(f"⚠️  Failed to start {app_pkg}: {result.get('error', '')}")
+            if idx < len(auto_apps) - 1:
+                _time.sleep(2)  # stagger launches to avoid conflicts
     
     # Start server
     print(f"\n🚀 Starting server on {args.host}:{args.port}")
@@ -382,14 +458,34 @@ def main():
     print(f"   POST http://{args.host}:{args.port}/display/opacity")
     print(f"   POST http://{args.host}:{args.port}/display/orientation")
     print(f"   POST http://{args.host}:{args.port}/display/edit_mode")
+    print(f"   POST http://{args.host}:{args.port}/notification/show")
+    print(f"   POST http://{args.host}:{args.port}/notification/hide")
+    print(f"   POST http://{args.host}:{args.port}/notification/toggle")
+    print(f"   POST http://{args.host}:{args.port}/notification/refresh")
+    print(f"\n🖥️  Desktop mode:")
+    if backdrop_manager and backdrop_manager.is_running:
+        print(f"   ✅ Qt Linux dark backdrop active — virtual cards float above")
+        if backdrop_manager.notification_hwnd:
+            print(f"   ✅ macOS-style notification panel active (auto-refreshes via ADB)")
+    else:
+        print(f"   ⚠️  Backdrop disabled — cards float over regular desktop")
     print(f"\n🖱️  Window controls:")
     print(f"   🟥 Red button    → Close window")
     print(f"   🟨 Yellow button → Minimize")
     print(f"   🟩 Green button  → Pin/fix window (hide controls)")
     print(f"   🖱️  Right-click (on pinned card) → Re-enter edit mode")
     print(f"\nPress Ctrl+C to stop")
-    
-    app.run(host=args.host, port=args.port, debug=False, threaded=True)
+
+    try:
+        app.run(host=args.host, port=args.port, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down...")
+    finally:
+        if backdrop_manager:
+            try:
+                backdrop_manager.stop()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

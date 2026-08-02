@@ -71,6 +71,9 @@ class WindowConfig:
     rotation: int = 0
     user_rotation: int = 0
 
+    # Special mode: e.g. "notification_panel" for system notification shade
+    special_mode: Optional[str] = None
+
     @classmethod
     def from_dict(cls, cfg: dict, is_main: bool = False) -> "WindowConfig":
         """
@@ -106,6 +109,7 @@ class WindowConfig:
             flex_display=cfg.get("flex_display", False),
             rotation=cfg.get("rotation", 0),
             user_rotation=cfg.get("user_rotation", 0),
+            special_mode=cfg.get("special_mode"),
         )
 
     def resolve_virtual_display_size(self, orientation: str) -> Tuple[int, int, Optional[int]]:

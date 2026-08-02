@@ -23,6 +23,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from .multi_virtualdisplay import MainDisplay, MultiVirtualDisplay, AppVirtualDisplay
+from .navigation_monitor import get_navigation_monitor, MAP_APPS
 from front.window_config import WindowConfig
 
 
@@ -64,6 +65,11 @@ class DisplayManager:
         self._screen_monitor_thread = None
         self._screen_monitor_stop = False
         self._screen_monitor_running = False
+
+        # Navigation monitor for map auto-zoom
+        self._nav_monitor = None
+        self._navigating_app = None  # 当前正在导航的地图app包名
+        self._app_saved_geometry = {}  # 保存导航前的窗口几何，用于恢复
 
         atexit.register(self.stop_all)
 
@@ -178,6 +184,7 @@ class DisplayManager:
                 config=win_config,
                 scrcpy_path=self.scrcpy_path,
                 device_serial=self.device_serial,
+                display_manager=self,
             )
 
             print(f"[DisplayManager] Starting main display (rotation={rotation})...")
@@ -189,6 +196,8 @@ class DisplayManager:
                 self._main_rotation = rotation
                 self._initialized = True
                 print("[DisplayManager] Main display started successfully")
+                # Start navigation monitor after main display is up
+                self._start_navigation_monitor()
                 return {
                     "success": True,
                     "message": "Main display started",
@@ -345,6 +354,16 @@ class DisplayManager:
 
                 if display.running:
                     self.activate_app_window(app_package)
+                    # 如果该app是地图app且当前正在导航中，自动切换到导航模式
+                    if self._nav_monitor and app_package in MAP_APPS:
+                        nav_state = self._nav_monitor.get_state()
+                        if nav_state.is_navigating and nav_state.app_package == app_package:
+                            # 延迟一点时间等待窗口完全创建
+                            def _delayed_switch():
+                                time.sleep(1.5)
+                                self._switch_app_to_nav_mode(app_package)
+                                self._navigating_app = app_package
+                            threading.Thread(target=_delayed_switch, daemon=True).start()
                     return {
                         "success": True,
                         "message": f"App virtual display started ({orientation})",
@@ -598,18 +617,36 @@ class DisplayManager:
         return False
 
     def _get_window_title_for_app(self, app_package):
-        """Get window title for an app virtual display."""
-        cfg = self.load_config()
-        app_cfg = cfg.get("app_displays", {}).get(app_package, {})
-        return app_cfg.get("window_title", app_package)
+        """Get window title for an app virtual display (alias for _get_window_title)."""
+        return self._get_window_title(app_package)
 
     def _find_window_by_title(self, title):
-        """Find window handle by title using ctypes."""
+        """Find window handle by title using ctypes. Uses EnumWindows for fuzzy match."""
         try:
             import ctypes
+            from ctypes import wintypes
             user32 = ctypes.windll.user32
-            hwnd = user32.FindWindowW(None, title)
-            return hwnd if hwnd else None
+            result = [None]
+
+            def enum_windows_proc(hwnd, lparam):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buf, length + 1)
+                    win_title = buf.value
+                    # Exact match first
+                    if win_title == title:
+                        if user32.IsWindowVisible(hwnd):
+                            result[0] = hwnd
+                            return 0
+                    # Fuzzy match: window title contains the target title (handles prefixes like [scrcpy])
+                    if title in win_title and user32.IsWindowVisible(hwnd):
+                        result[0] = hwnd
+                return 1
+
+            WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
+            return result[0]
         except Exception:
             return None
 
@@ -720,45 +757,316 @@ class DisplayManager:
         if not (0.0 <= opacity <= 1.0):
             return {"success": False, "error": "Opacity must be between 0.0 and 1.0"}
 
-        if app_package is None:
-            cfg = self.load_config()
-            title = cfg.get("main_display", {}).get("window_title", "手机桌面")
-        else:
-            title = self._get_window_title_for_app(app_package)
-
+        title = self._get_window_title(app_package)
         hwnd = self._find_window_by_title(title)
         if not hwnd:
             return {"success": False, "error": f"Window not found: {title}"}
 
         try:
-            import ctypes
-            user32 = ctypes.windll.user32
-
-            GWL_EXSTYLE = -20
-            WS_EX_LAYERED = 0x00080000
-            LWA_ALPHA = 0x00000002
-
-            ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            if not (ex_style & WS_EX_LAYERED):
-                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED)
-
-            alpha = int(opacity * 255)
-            result = user32.SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA)
-
-            if result:
-                print(f"[DisplayManager] Window '{title}' opacity set to {opacity:.2f}")
-                return {
-                    "success": True,
-                    "window_title": title,
-                    "opacity": opacity,
-                    "message": f"Opacity set to {opacity:.2f}",
-                }
-            else:
-                return {"success": False, "error": "SetLayeredWindowAttributes failed"}
-
+            self._apply_opacity_to_hwnd(hwnd, opacity)
+            print(f"[DisplayManager] Window '{title}' opacity set to {opacity:.2f}")
+            return {
+                "success": True,
+                "window_title": title,
+                "opacity": opacity,
+                "message": f"Opacity set to {opacity:.2f}",
+            }
         except Exception as e:
             print(f"[DisplayManager] Failed to set window opacity: {e}")
             return {"success": False, "error": str(e)}
+
+    def _apply_opacity_to_hwnd(self, hwnd, opacity):
+        """Apply opacity to a specific HWND using SetLayeredWindowAttributes."""
+        import ctypes
+        user32 = ctypes.windll.user32
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        LWA_ALPHA = 0x00000002
+
+        ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        if not (ex_style & WS_EX_LAYERED):
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED)
+
+        alpha = int(opacity * 255)
+        result = user32.SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA)
+        if not result:
+            raise ctypes.WinError()
+
+    def _move_and_resize_hwnd(self, hwnd, x, y, w, h):
+        """Move and resize a window using MoveWindow Win32 API."""
+        import ctypes
+        user32 = ctypes.windll.user32
+        result = user32.MoveWindow(ctypes.wintypes.HWND(hwnd), int(x), int(y), int(w), int(h), True)
+        if not result:
+            raise ctypes.WinError()
+        # 同步更新overlay窗口位置（card decorator）
+        try:
+            from front.card_window import get_card_window_decorator
+            decorator = get_card_window_decorator()
+            decorator.refresh_card_overlay(int(hwnd))
+        except Exception:
+            pass
+
+    def _get_app_hwnd(self, app_package):
+        """Get the HWND of a running app display window."""
+        if app_package is None:
+            if self._main_display and self._main_display._hwnd:
+                return self._main_display._hwnd
+        elif app_package in self._app_display_map:
+            display = self._app_display_map[app_package]
+            if hasattr(display, '_hwnd') and display._hwnd:
+                return display._hwnd
+        # Fallback: find by window title
+        title = self._get_window_title(app_package)
+        return self._find_window_by_title(title)
+
+    def _get_window_title(self, app_package=None):
+        """Get window title for a display (main or app)."""
+        cfg = self.load_config()
+        if app_package is None:
+            return cfg.get("main_display", {}).get("window_title", "手机桌面")
+        return cfg.get("app_displays", {}).get(app_package, {}).get("window_title", app_package)
+
+    def _get_config_section(self, app_package=None):
+        """Get the config dict section for a display."""
+        cfg = self.load_config()
+        if app_package is None:
+            return cfg, "main_display", cfg.get("main_display", {})
+        return cfg, ("app_displays", app_package), cfg.get("app_displays", {}).get(app_package, {})
+
+    def _save_window_geometry(self, app_package, x, y, w, h):
+        """Persist window geometry to display_config.json after drag/resize."""
+        try:
+            cfg = self.load_config()
+            if app_package is None:
+                if "main_display" not in cfg:
+                    cfg["main_display"] = {}
+                section = cfg["main_display"]
+                title = section.get("window_title", "手机桌面")
+            elif app_package == "notification_panel":
+                if "notification_panel" not in cfg:
+                    cfg["notification_panel"] = {}
+                section = cfg["notification_panel"]
+                title = section.get("window_title", "通知")
+            else:
+                if "app_displays" not in cfg:
+                    cfg["app_displays"] = {}
+                if app_package not in cfg["app_displays"]:
+                    cfg["app_displays"][app_package] = {}
+                section = cfg["app_displays"][app_package]
+                title = section.get("window_title", app_package)
+
+            section["window_x"] = x
+            section["window_y"] = y
+            section["window_width"] = w
+            section["window_height"] = h
+            self.save_config()
+            print(f"[DisplayManager] Saved geometry for '{title}': {x},{y} {w}x{h}")
+        except Exception as e:
+            print(f"[DisplayManager] Failed to save geometry: {e}")
+
+    def _apply_default_opacity_delayed(self, app_package=None, delay=3.5):
+        """Apply configured default_opacity after a short delay (waiting for window to appear)."""
+        def _apply():
+            time.sleep(delay)
+            try:
+                cfg = self.load_config()
+                if app_package is None:
+                    opacity = cfg.get("main_display", {}).get("default_opacity", 1.0)
+                    title = cfg.get("main_display", {}).get("window_title", "手机桌面")
+                elif app_package == "notification_panel":
+                    opacity = cfg.get("notification_panel", {}).get("default_opacity", 1.0)
+                    title = cfg.get("notification_panel", {}).get("window_title", "通知")
+                else:
+                    opacity = cfg.get("app_displays", {}).get(app_package, {}).get("default_opacity", 1.0)
+                    title = self._get_window_title(app_package)
+
+                if opacity < 1.0:
+                    hwnd = self._find_window_by_title(title)
+                    if hwnd:
+                        self._apply_opacity_to_hwnd(hwnd, opacity)
+                        print(f"[DisplayManager] Default opacity applied to '{title}': {opacity}")
+                    else:
+                        print(f"[DisplayManager] Window not found for default opacity: {title}")
+            except Exception as e:
+                print(f"[DisplayManager] Failed to apply default opacity: {e}")
+
+        t = threading.Thread(target=_apply, daemon=True)
+        t.start()
+
+    def _make_geometry_callback(self, app_package):
+        """Create an on_geometry_changed callback bound to a specific app package."""
+        manager = self
+        def _cb(x, y, w, h):
+            # 如果当前正在导航中，不保存普通几何（避免覆盖nav_geometry）
+            if manager._navigating_app == app_package:
+                return
+            manager._save_window_geometry(app_package, x, y, w, h)
+        return _cb
+
+    def _start_navigation_monitor(self):
+        """Start the navigation state monitor."""
+        if self._nav_monitor is not None:
+            return
+        try:
+            self._nav_monitor = get_navigation_monitor(
+                device_serial=self.device_serial,
+                poll_interval=3.0
+            )
+            self._nav_monitor.on_navigation_start(self._on_navigation_start)
+            self._nav_monitor.on_navigation_end(self._on_navigation_end)
+            self._nav_monitor.start()
+        except Exception as e:
+            print(f"[DisplayManager] Failed to start navigation monitor: {e}")
+            self._nav_monitor = None
+
+    def _stop_navigation_monitor(self):
+        """Stop the navigation state monitor."""
+        if self._nav_monitor:
+            try:
+                self._nav_monitor.stop()
+            except Exception:
+                pass
+            self._nav_monitor = None
+        # 如果正在导航，恢复窗口
+        if self._navigating_app:
+            try:
+                self._restore_app_from_nav_mode(self._navigating_app)
+            except Exception:
+                pass
+            self._navigating_app = None
+
+    def _on_navigation_start(self, state):
+        """Handle navigation start event - zoom map window to nav mode."""
+        pkg = state.app_package
+        if not pkg or pkg not in MAP_APPS:
+            return
+
+        # 如果已经在导航同一个app，忽略
+        if self._navigating_app == pkg:
+            return
+
+        # 如果正在导航另一个app，先恢复它
+        if self._navigating_app and self._navigating_app != pkg:
+            try:
+                self._restore_app_from_nav_mode(self._navigating_app)
+            except Exception:
+                pass
+
+        print(f"[Navigation] {state.app_name} navigation started, switching map to full screen...")
+        self._switch_app_to_nav_mode(pkg)
+        self._navigating_app = pkg
+
+    def _on_navigation_end(self, state):
+        """Handle navigation end event - restore map window to normal size."""
+        pkg = state.app_package
+        if not pkg:
+            return
+        print(f"[Navigation] {state.app_name} navigation ended, restoring map window...")
+        try:
+            self._restore_app_from_nav_mode(pkg)
+        except Exception as e:
+            print(f"[Navigation] Failed to restore window: {e}")
+        if self._navigating_app == pkg:
+            self._navigating_app = None
+
+    def _switch_app_to_nav_mode(self, app_package, retry_count=0):
+        """Switch an app window to navigation mode (large centered)."""
+        cfg = self.load_config()
+        app_cfg = cfg.get("app_displays", {}).get(app_package, {})
+        nav_geom = app_cfg.get("nav_geometry")
+        if not nav_geom:
+            print(f"[Navigation] No nav_geometry config for {app_package}, skipping")
+            return
+
+        hwnd = self._get_app_hwnd(app_package)
+        if not hwnd:
+            if retry_count < 10:
+                # 延迟重试，等待窗口创建完成
+                def _retry():
+                    time.sleep(1.0)
+                    self._switch_app_to_nav_mode(app_package, retry_count + 1)
+                threading.Thread(target=_retry, daemon=True).start()
+                print(f"[Navigation] Window not found for {app_package}, retry {retry_count+1}/10 in 1s...")
+                return
+            else:
+                print(f"[Navigation] Window for {app_package} not found after retries, switching to nav mode later when window starts")
+                return
+
+        print(f"[Navigation] Found HWND {hwnd} for {app_package}, switching to nav mode...")
+
+        # 保存当前几何信息用于恢复
+        cur_rect = self._window_rect(hwnd)
+        if cur_rect:
+            cx, cy, cw, ch = cur_rect
+            self._app_saved_geometry[app_package] = {
+                "window_x": cx, "window_y": cy,
+                "window_width": cw, "window_height": ch
+            }
+            print(f"[Navigation] Saved current geometry: {cx},{cy} {cw}x{ch}")
+
+        # 切换到导航几何
+        nx = nav_geom.get("window_x", 1027)
+        ny = nav_geom.get("window_y", 543)
+        nw = nav_geom.get("window_width", 2076)
+        nh = nav_geom.get("window_height", 1193)
+        nav_opacity = nav_geom.get("default_opacity", 1.0)
+
+        try:
+            self._move_and_resize_hwnd(hwnd, nx, ny, nw, nh)
+            if nav_opacity < 1.0:
+                self._apply_opacity_to_hwnd(hwnd, nav_opacity)
+            else:
+                # 导航时完全不透明
+                self._apply_opacity_to_hwnd(hwnd, 1.0)
+            # 激活窗口到最前
+            self._force_activate_window(hwnd)
+            print(f"[Navigation] Switched {app_package} to nav mode: {nx},{ny} {nw}x{nh}")
+        except Exception as e:
+            print(f"[Navigation] Failed to switch to nav mode: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _restore_app_from_nav_mode(self, app_package):
+        """Restore an app window from navigation mode to normal size."""
+        hwnd = self._get_app_hwnd(app_package)
+        if not hwnd:
+            print(f"[Navigation] Window not found for {app_package} during restore")
+            # 清除保存的几何
+            self._app_saved_geometry.pop(app_package, None)
+            return
+
+        # 恢复到保存的几何或配置中的默认几何
+        saved = self._app_saved_geometry.pop(app_package, None)
+        cfg = self.load_config()
+        app_cfg = cfg.get("app_displays", {}).get(app_package, {})
+
+        if saved:
+            rx, ry, rw, rh = saved["window_x"], saved["window_y"], saved["window_width"], saved["window_height"]
+        else:
+            rx = app_cfg.get("window_x", 60)
+            ry = app_cfg.get("window_y", 60)
+            rw = app_cfg.get("window_width", 960)
+            rh = app_cfg.get("window_height", 540)
+
+        normal_opacity = app_cfg.get("default_opacity", 1.0)
+
+        try:
+            self._move_and_resize_hwnd(hwnd, rx, ry, rw, rh)
+            self._apply_opacity_to_hwnd(hwnd, normal_opacity)
+            print(f"[Navigation] Restored {app_package} to normal mode: {rx},{ry} {rw}x{rh}")
+        except Exception as e:
+            print(f"[Navigation] Failed to restore window: {e}")
+
+    def _window_rect(self, hwnd):
+        """Get window rect (x, y, width, height) for a HWND."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if user32.GetWindowRect(ctypes.wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+        return None
 
     def activate_app_window(self, app_package=None):
         """
@@ -1018,6 +1326,7 @@ class DisplayManager:
         print("[DisplayManager] Stopping all displays and services...")
 
         self.stop_screen_monitor()
+        self._stop_navigation_monitor()
 
         for pkg in list(self._app_display_map.keys()):
             try:

@@ -47,7 +47,8 @@ class MainDisplay:
     - Drag from title bar, resize from edges/corners
     """
 
-    def __init__(self, config: WindowConfig, scrcpy_path=None, device_serial=None):
+    def __init__(self, config: WindowConfig, scrcpy_path=None, device_serial=None,
+                 display_manager=None):
         """
         Initialize MainDisplay.
 
@@ -55,10 +56,12 @@ class MainDisplay:
             config: WindowConfig VO with all display parameters.
             scrcpy_path: Path to scrcpy executable. Auto-detected if None.
             device_serial: ADB device serial. Auto-detected if None.
+            display_manager: Reference to DisplayManager for callbacks (optional).
         """
         self.config = config
         self.window_title = config.window_title
         self.device_serial = device_serial
+        self.display_manager = display_manager
 
         self.scrcpy_path = scrcpy_path or self._find_scrcpy()
         self.process = None
@@ -256,6 +259,17 @@ class MainDisplay:
             if os.name == 'nt':
                 apply_mac_card_style(hwnd, self.window_title)
 
+            # Apply default opacity from config
+            try:
+                if self.display_manager:
+                    cfg = self.display_manager.load_config()
+                    opacity = cfg.get("main_display", {}).get("default_opacity", 1.0)
+                    if opacity < 1.0:
+                        self.display_manager._apply_opacity_to_hwnd(hwnd, opacity)
+                        print(f"[{self.window_title}] Applied default opacity: {opacity}")
+            except Exception as oe:
+                print(f"[{self.window_title}] Failed to apply opacity: {oe}")
+
             # Register with the global card decorator for traffic lights + drag/resize
             try:
                 decorator = get_card_window_decorator()
@@ -265,7 +279,13 @@ class MainDisplay:
                     """Callback for red close button: stop this display."""
                     _self_ref.stop()
 
-                decorator.register_window(hwnd, on_close=_on_close_main)
+                def _on_geom(x, y, w, h):
+                    """Callback when drag/resize ends: persist geometry."""
+                    if _self_ref.display_manager:
+                        _self_ref.display_manager._save_window_geometry(None, x, y, w, h)
+
+                decorator.register_window(hwnd, on_close=_on_close_main,
+                                          on_geometry_changed=_on_geom)
                 self._hwnd = hwnd
                 print(f"[{self.window_title}] Registered with card window decorator (traffic lights + drag/resize)")
             except Exception as de:
@@ -502,15 +522,21 @@ class AppVirtualDisplay:
         )
         self._style_thread.start()
 
-        # Launch the app on the virtual display
+        # Launch the app on the virtual display (or show special UI)
         if self.app_package:
-            self.app_thread = threading.Thread(
-                target=self._launch_app, daemon=True
-            )
+            special_mode = getattr(self.config, 'special_mode', None)
+            if special_mode == "notification_panel":
+                self.app_thread = threading.Thread(
+                    target=self._show_notification_panel, daemon=True
+                )
+            else:
+                self.app_thread = threading.Thread(
+                    target=self._launch_app, daemon=True
+                )
             self.app_thread.start()
 
-        # Monitor if the app closes, auto-stop the display
-        if self.app_package:
+        # Monitor if the app closes, auto-stop the display (skip for special modes)
+        if self.app_package and getattr(self.config, 'special_mode', None) is None:
             self._start_app_monitor()
 
     def _read_output(self):
@@ -564,6 +590,18 @@ class AppVirtualDisplay:
             if os.name == 'nt':
                 apply_mac_card_style(hwnd, self.window_title)
 
+            # Apply default opacity from config
+            try:
+                _dm = self._display_manager
+                if _dm:
+                    cfg = _dm.load_config()
+                    opacity = cfg.get("app_displays", {}).get(self.app_package, {}).get("default_opacity", 1.0)
+                    if opacity < 1.0:
+                        _dm._apply_opacity_to_hwnd(hwnd, opacity)
+                        print(f"[{self.window_title}] Applied default opacity: {opacity}")
+            except Exception as oe:
+                print(f"[{self.window_title}] Failed to apply opacity: {oe}")
+
             # Register with card decorator (traffic lights, drag, resize)
             try:
                 decorator = get_card_window_decorator()
@@ -583,7 +621,13 @@ class AppVirtualDisplay:
                     else:
                         _self_ref.stop()
 
-                decorator.register_window(hwnd, on_close=_on_close_app)
+                def _on_geom(x, y, w, h):
+                    """Callback when drag/resize ends: persist geometry."""
+                    if _dm:
+                        _dm._save_window_geometry(_pkg, x, y, w, h)
+
+                decorator.register_window(hwnd, on_close=_on_close_app,
+                                          on_geometry_changed=_on_geom)
                 self._hwnd = hwnd
                 print(f"[{self.window_title}] Registered with card window decorator (traffic lights + drag/resize)")
             except Exception as de:
@@ -616,6 +660,141 @@ class AppVirtualDisplay:
         WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
         return result[0]
+
+    def _show_notification_panel(self):
+        """
+        Show the Android notification shade on this virtual display.
+        Special mode for notification_panel cards:
+        1. Launch the default home/launcher on the VD (so it's not black)
+        2. Wait for the home screen to render with system decorations (status/nav bars)
+        3. Swipe down from the top to expand the notification shade
+        """
+        try:
+            if self.device_serial:
+                device = adbutils.adb.device(self.device_serial)
+            else:
+                devices = adbutils.adb.device_list()
+                if not devices:
+                    return
+                device = devices[0]
+
+            print(f"[{self.window_title}] Waiting for display initialization...")
+            max_wait = 15
+            waited = 0
+            while waited < max_wait and self.android_display_id is None:
+                time.sleep(1)
+                waited += 1
+
+            if self.android_display_id is None:
+                dumpsys_result = device.shell("dumpsys display")
+                match = re.search(r'Display Id=(\d+).*VirtualDisplay', dumpsys_result, re.DOTALL)
+                if match:
+                    self.android_display_id = int(match.group(1))
+                    print(f"[{self.window_title}] Fallback: Found display ID {self.android_display_id}")
+                else:
+                    print(f"[{self.window_title}] Error: Could not determine display ID")
+                    return
+
+            display_id = self.android_display_id
+
+            # Lock user-rotation to natural direction (same as normal app launch)
+            if hasattr(self.config, 'user_rotation'):
+                try:
+                    wm_cmd = f"wm user-rotation -d {display_id} lock {self.config.user_rotation}"
+                    wm_result = device.shell(wm_cmd)
+                    if wm_result and ("Error" not in wm_result and "Unknown" not in wm_result and "Exception" not in wm_result):
+                        print(f"[{self.window_title}] Set wm user-rotation lock {self.config.user_rotation} on display {display_id}")
+                        time.sleep(0.5)
+                except Exception as wm_err:
+                    print(f"[{self.window_title}] wm user-rotation error (non-critical): {wm_err}")
+
+            # Step 1: Launch home/launcher on the virtual display so it's not black
+            # Use NEW_TASK | MULTIPLE_TASK flags to create a separate instance on the VD
+            # without moving the home task away from the main display.
+            print(f"[{self.window_title}] Starting home screen on display {display_id}...")
+            home_launched = False
+            home_cmds = [
+                f"am start -a android.intent.action.MAIN -c android.intent.category.HOME -f 0x18000000 --display {display_id}",
+                f"am start -a android.intent.action.MAIN -c android.intent.category.HOME --display {display_id}",
+            ]
+            for hcmd in home_cmds:
+                try:
+                    result = device.shell(hcmd)
+                    if result and "Error" not in result and "Exception" not in result:
+                        print(f"[{self.window_title}] Home launched via: {hcmd}")
+                        home_launched = True
+                        break
+                except Exception:
+                    continue
+
+            if not home_launched:
+                print(f"[{self.window_title}] Trying monkey for home...")
+                try:
+                    device.shell(f"monkey -p com.android.launcher3 --display {display_id} -c android.intent.category.HOME 1")
+                    home_launched = True
+                except Exception:
+                    pass
+
+            # Safety: ensure home is still on main display (display 0) in case it moved
+            try:
+                time.sleep(0.5)
+                device.shell("am start -a android.intent.action.MAIN -c android.intent.category.HOME --display 0")
+            except Exception:
+                pass
+
+            # Wait for home screen to render
+            print(f"[{self.window_title}] Waiting for home screen to settle...")
+            time.sleep(3)
+
+            # Step 2: Expand notification panel on this display
+            print(f"[{self.window_title}] Expanding notification panel on display {display_id}...")
+
+            # Try cmd statusbar first (with display targeting)
+            expand_cmds = [
+                f"cmd statusbar expand-notifications --display {display_id}",
+                f"cmd statusbar expand-notifications -d {display_id}",
+                "cmd statusbar expand-notifications",
+            ]
+            expanded = False
+            for cmd in expand_cmds:
+                try:
+                    result = device.shell(cmd)
+                    if result and ("Error" not in result and "Exception" not in result and "Unknown" not in result and "Usage" not in result):
+                        print(f"[{self.window_title}] Notification panel expanded via: {cmd}")
+                        expanded = True
+                        break
+                except Exception:
+                    continue
+
+            # Step 3: Swipe down from top as reliable fallback
+            # Use display-specific input injection to target the virtual display
+            print(f"[{self.window_title}] Sending swipe-down gesture on display {display_id}...")
+            nd_w, nd_h, _ = self.config.resolve_virtual_display_size(self.config.default_orientation)
+            sx = nd_w // 2
+            sy = 5
+            ex = nd_w // 2
+            ey = nd_h // 2
+            swipe_cmds = [
+                f"input -d {display_id} swipe {sx} {sy} {ex} {ey} 400",
+                f"input swipe {sx} {sy} {ex} {ey} 400",
+            ]
+            for scmd in swipe_cmds:
+                try:
+                    device.shell(scmd)
+                    print(f"[{self.window_title}] Swipe sent via: {scmd}")
+                    time.sleep(0.5)
+                except Exception:
+                    continue
+
+            if expanded:
+                print(f"[{self.window_title}] Notification panel ready")
+            else:
+                print(f"[{self.window_title}] Notification swipe sent (home screen with status bar visible)")
+
+        except Exception as e:
+            print(f"[{self.window_title}] Notification panel error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _launch_app(self):
         """

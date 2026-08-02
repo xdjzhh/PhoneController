@@ -197,10 +197,12 @@ class HitZone:
 
 
 class CardState:
-    def __init__(self, scrcpy_hwnd, on_close=None):
+    def __init__(self, scrcpy_hwnd, on_close=None, on_geometry_changed=None, on_minimize=None):
         self.scrcpy_hwnd = scrcpy_hwnd
         self.overlay_hwnd = None
         self.on_close = on_close
+        self.on_geometry_changed = on_geometry_changed
+        self.on_minimize = on_minimize
 
         self.btn_size = 12
         self.btn_spacing = 8
@@ -891,9 +893,18 @@ class WindowsCardDecorator:
     def _on_lbutton_up(self, card, mx, my):
         active = self._active_card
         if active and (active.dragging or active.resizing):
+            was_dragging = active.dragging
+            was_resizing = active.resizing
             active.dragging = False
             active.resizing = False
             self._active_card = None
+            if was_dragging or was_resizing:
+                try:
+                    sx, sy, sw, sh = self._window_rect(active.scrcpy_hwnd)
+                    if active.on_geometry_changed:
+                        active.on_geometry_changed(sx, sy, sw, sh)
+                except Exception:
+                    pass
             return 1
         return None
 
@@ -930,11 +941,13 @@ class WindowsCardDecorator:
 
     # ─────────── Public API ───────────
 
-    def register_window(self, scrcpy_hwnd, on_close=None):
+    def register_window(self, scrcpy_hwnd, on_close=None, on_geometry_changed=None, on_minimize=None):
         scrcpy_hwnd = int(scrcpy_hwnd)
         if scrcpy_hwnd in self._cards:
             return
-        card = CardState(scrcpy_hwnd, on_close=on_close)
+        card = CardState(scrcpy_hwnd, on_close=on_close,
+                        on_geometry_changed=on_geometry_changed,
+                        on_minimize=on_minimize)
         card.editing = True
         self._cards[scrcpy_hwnd] = card
         self._card_ptrs[id(card)] = card
@@ -967,6 +980,12 @@ class WindowsCardDecorator:
         if scrcpy_hwnd in self._cards:
             card = self._cards[scrcpy_hwnd]
             self.set_edit_mode(scrcpy_hwnd, not card.editing)
+
+    def refresh_card_overlay(self, scrcpy_hwnd):
+        """Re-sync the overlay window position/size after programmatic window move/resize."""
+        scrcpy_hwnd = int(scrcpy_hwnd)
+        if scrcpy_hwnd in self._cards:
+            self._post_ui(WM_TUI_MOVEOVERLAY, card=self._cards[scrcpy_hwnd])
 
     def shutdown(self):
         self._running = False
@@ -1002,6 +1021,9 @@ class X11CardDecorator:
         pass
 
     def toggle_edit_mode(self, xid):
+        pass
+
+    def refresh_card_overlay(self, xid):
         pass
 
     def shutdown(self):

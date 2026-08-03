@@ -32,6 +32,7 @@ if os.name == 'nt':
 
 import argparse
 import json
+import threading
 from flask import Flask, request, jsonify
 from phone_agent import PhoneAgent
 from phone_agent.model import ModelConfig
@@ -90,39 +91,6 @@ def start_backdrop_window():
     except Exception as e:
         print(f"⚠️  Failed to start Qt backdrop: {e}")
         backdrop_manager = None
-        return False
-
-
-def initialize_display_manager(start_main: bool = True, start_monitor: bool = True,
-                               start_backdrop: bool = True):
-    """初始化显示管理器并可选启动主屏、屏幕监控和背景窗口"""
-    global display_manager
-    try:
-        if start_backdrop:
-            print("🖥️  Starting Qt Linux desktop backdrop...")
-            start_backdrop_window()
-
-        display_manager = get_display_manager()
-        if start_main:
-            print("📱 Starting main display...")
-            result = display_manager.start_main_display()
-            if result.get("success"):
-                print("✅ Main display started successfully")
-            else:
-                print(f"⚠️  Main display failed to start: {result.get('error')}")
-                return False
-        if start_monitor:
-            print("👁️  Starting screen lock monitor...")
-            monitor_result = display_manager.start_screen_monitor()
-            if monitor_result.get("success"):
-                print("✅ Screen lock monitor started")
-            else:
-                print(f"⚠️  Screen monitor failed: {monitor_result.get('error')}")
-        return True
-    except Exception as e:
-        print(f"⚠️  Display manager initialization failed: {e}")
-        import traceback
-        traceback.print_exc()
         return False
 
 
@@ -414,33 +382,70 @@ def main():
         api_key=args.apikey
     )
     
-    # Initialize display manager (starts backdrop first, then main display)
-    if not args.no_main_display:
-        print("🖥️  Initializing display manager...")
-        initialize_display_manager(
-            start_main=True,
-            start_monitor=not args.no_screen_monitor,
-            start_backdrop=not args.no_backdrop,
-        )
-    elif not args.no_backdrop:
-        start_backdrop_window()
+    # Initialize display manager
+    global display_manager
+    print("🖥️  Initializing display manager...")
+    display_manager = get_display_manager()
 
-    # Auto-start configured app cards (e.g. weather, Amap navigation)
-    if display_manager and args.auto_start:
+    # Helper: launch a task in a daemon thread (fire-and-forget, truly parallel)
+    def _bg(name, fn):
+        def _runner():
+            try:
+                fn()
+            except Exception as e:
+                import traceback
+                print(f"⚠️  {name} start exception: {e}")
+                traceback.print_exc()
+        t = threading.Thread(target=_runner, name=f"startup:{name}", daemon=True)
+        t.start()
+
+    # Count total tasks for logging
+    auto_apps = []
+    if args.auto_start:
         auto_apps = [p.strip() for p in args.auto_start.split(',') if p.strip()]
-        import time as _time
-        _time.sleep(3)  # wait for main display to settle
-        for idx, app_pkg in enumerate(auto_apps):
-            print(f"📱 Auto-starting app card: {app_pkg}...")
-            result = display_manager.start_app_display(app_pkg)
-            if result.get('success'):
-                print(f"✅ {app_pkg} started: {result.get('message', '')}")
+    total = (0 if args.no_backdrop else 1) + (0 if args.no_main_display else 1) + (0 if args.no_screen_monitor else 1) + len(auto_apps)
+    print(f"🚀 同时启动 {total} 个组件...")
+
+    # 1. Backdrop (Qt subprocess)
+    if not args.no_backdrop:
+        _bg("backdrop", start_backdrop_window)
+
+    # 2. Main display (scrcpy main mirror)
+    if not args.no_main_display:
+        def _start_main():
+            print("📱 Starting main display...")
+            result = display_manager.start_main_display()
+            if result.get("success"):
+                print("✅ Main display started successfully")
             else:
-                print(f"⚠️  Failed to start {app_pkg}: {result.get('error', '')}")
-            if idx < len(auto_apps) - 1:
-                _time.sleep(2)  # stagger launches to avoid conflicts
+                print(f"⚠️  Main display failed to start: {result.get('error')}")
+        _bg("main_display", _start_main)
+
+    # 3. Screen lock monitor
+    if not args.no_screen_monitor:
+        def _start_monitor():
+            print("👁️  Starting screen lock monitor...")
+            result = display_manager.start_screen_monitor()
+            if result.get("success"):
+                print("✅ Screen lock monitor started")
+            else:
+                print(f"⚠️  Screen monitor failed: {result.get('error')}")
+        _bg("screen_monitor", _start_monitor)
+
+    # 4. Auto-start app cards (weather, map, etc.)
+    for app_pkg in auto_apps:
+        def _make_start(pkg):
+            def _start_app():
+                print(f"📱 Auto-starting app card: {pkg}...")
+                result = display_manager.start_app_display(pkg)
+                if result.get('success'):
+                    print(f"✅ {pkg} started: {result.get('message', '')}")
+                else:
+                    print(f"⚠️  Failed to start {pkg}: {result.get('error', '')}")
+            return _start_app
+        _bg(f"app:{app_pkg}", _make_start(app_pkg))
     
-    # Start server
+    # Start server immediately (do NOT wait for windows to finish loading)
     print(f"\n🚀 Starting server on {args.host}:{args.port}")
     print(f"📡 API endpoints:")
     print(f"   POST http://{args.host}:{args.port}/run")
@@ -463,12 +468,7 @@ def main():
     print(f"   POST http://{args.host}:{args.port}/notification/toggle")
     print(f"   POST http://{args.host}:{args.port}/notification/refresh")
     print(f"\n🖥️  Desktop mode:")
-    if backdrop_manager and backdrop_manager.is_running:
-        print(f"   ✅ Qt Linux dark backdrop active — virtual cards float above")
-        if backdrop_manager.notification_hwnd:
-            print(f"   ✅ macOS-style notification panel active (auto-refreshes via ADB)")
-    else:
-        print(f"   ⚠️  Backdrop disabled — cards float over regular desktop")
+    print(f"   ✅ Qt Linux dark backdrop — virtual cards float above (loading in background)")
     print(f"\n🖱️  Window controls:")
     print(f"   🟥 Red button    → Close window")
     print(f"   🟨 Yellow button → Minimize")

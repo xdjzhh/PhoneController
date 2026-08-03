@@ -898,11 +898,31 @@ class DisplayManager:
         """Create an on_geometry_changed callback bound to a specific app package."""
         manager = self
         def _cb(x, y, w, h):
-            # 如果当前正在导航中，不保存普通几何（避免覆盖nav_geometry）
             if manager._navigating_app == app_package:
-                return
-            manager._save_window_geometry(app_package, x, y, w, h)
+                manager._save_nav_geometry(app_package, x, y, w, h)
+            else:
+                manager._save_window_geometry(app_package, x, y, w, h)
         return _cb
+
+    def _save_nav_geometry(self, app_package, x, y, w, h):
+        """Persist navigation-mode window geometry to nav_geometry in config."""
+        try:
+            cfg = self.load_config()
+            app_cfg = cfg.get("app_displays", {}).get(app_package, {})
+            if "nav_geometry" not in app_cfg:
+                app_cfg["nav_geometry"] = {}
+            nav = app_cfg["nav_geometry"]
+            nav["window_x"] = x
+            nav["window_y"] = y
+            nav["window_width"] = w
+            nav["window_height"] = h
+            opacity = nav.get("default_opacity", app_cfg.get("default_opacity", 1.0))
+            nav["default_opacity"] = opacity
+            self.save_config()
+            title = app_cfg.get("window_title", app_package)
+            print(f"[DisplayManager] Saved nav geometry for '{title}': {x},{y} {w}x{h}")
+        except Exception as e:
+            print(f"[DisplayManager] Failed to save nav geometry: {e}")
 
     def _start_navigation_monitor(self):
         """Start the navigation state monitor."""

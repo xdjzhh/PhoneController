@@ -624,7 +624,10 @@ class AppVirtualDisplay:
                 def _on_geom(x, y, w, h):
                     """Callback when drag/resize ends: persist geometry."""
                     if _dm:
-                        _dm._save_window_geometry(_pkg, x, y, w, h)
+                        if _dm._navigating_app == _pkg:
+                            _dm._save_nav_geometry(_pkg, x, y, w, h)
+                        else:
+                            _dm._save_window_geometry(_pkg, x, y, w, h)
 
                 decorator.register_window(hwnd, on_close=_on_close_app,
                                           on_geometry_changed=_on_geom)

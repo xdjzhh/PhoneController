@@ -519,7 +519,7 @@ def create_notification_window(config=None, config_path=None):
             self._config_path = cfg_path
             self._default_opacity = def_opacity
             self._win_title = win_title
-            self._editing = True
+            self._editing = False
             self._hover_btn = -1
             self._drag_mode = self.NONE
             self._drag_start = None
@@ -608,13 +608,15 @@ def create_notification_window(config=None, config_path=None):
             self._empty_label.hide()
 
         def _on_context_menu(self, pos):
-            if not self._editing:
-                self._set_edit_mode(True)
+            pass
 
         def _set_edit_mode(self, editing):
             self._editing = editing
             self._hover_btn = -1
             self._drag_mode = self.NONE
+            self._geometry_save_timer.stop()
+            if not editing:
+                self._save_geometry()
             self.update()
 
         def _on_scroll(self, *args):
@@ -783,8 +785,8 @@ def create_notification_window(config=None, config_path=None):
         def _in_chrome_area(self, pos):
             return self._editing and pos.y() < CHROME_H
 
-        def _edge_at(self, pos):
-            if not self._editing:
+        def _edge_at(self, pos, include_editing_check=True):
+            if include_editing_check and not self._editing:
                 return self.NONE
             x, y = pos.x(), pos.y()
             w, h = self.width(), self.height()
@@ -817,6 +819,10 @@ def create_notification_window(config=None, config_path=None):
                 return
             pos = event.position().toPoint()
             gpos = event.globalPosition().toPoint()
+
+            if not self._editing:
+                super().mousePressEvent(event)
+                return
 
             btn = self._traffic_light_at(pos)
             if btn >= 0:
@@ -880,12 +886,9 @@ def create_notification_window(config=None, config_path=None):
             super().mouseMoveEvent(event)
 
         def mouseReleaseEvent(self, event):
-            was_dragging = (self._drag_mode != self.NONE)
             self._drag_mode = self.NONE
             self._drag_start = None
             self._drag_start_geom = None
-            if was_dragging:
-                self._geometry_save_timer.start(300)
             super().mouseReleaseEvent(event)
 
         def _do_resize(self, gpos):

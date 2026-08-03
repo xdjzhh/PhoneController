@@ -477,6 +477,9 @@ class WindowsCardDecorator:
     def _show_overlay_on_ui(self, card):
         if not card.overlay_hwnd:
             return
+        ex = user32.GetWindowLongW(wintypes.HWND(card.overlay_hwnd), GWL_EXSTYLE)
+        ex &= ~WS_EX_TRANSPARENT
+        user32.SetWindowLongW(wintypes.HWND(card.overlay_hwnd), GWL_EXSTYLE, ex)
         user32.ShowWindow(wintypes.HWND(card.overlay_hwnd), SW_SHOWNOACTIVATE)
 
     def _hide_overlay_on_ui(self, card):
@@ -893,18 +896,9 @@ class WindowsCardDecorator:
     def _on_lbutton_up(self, card, mx, my):
         active = self._active_card
         if active and (active.dragging or active.resizing):
-            was_dragging = active.dragging
-            was_resizing = active.resizing
             active.dragging = False
             active.resizing = False
             self._active_card = None
-            if was_dragging or was_resizing:
-                try:
-                    sx, sy, sw, sh = self._window_rect(active.scrcpy_hwnd)
-                    if active.on_geometry_changed:
-                        active.on_geometry_changed(sx, sy, sw, sh)
-                except Exception:
-                    pass
             return 1
         return None
 
@@ -933,10 +927,6 @@ class WindowsCardDecorator:
         self.set_edit_mode(card.scrcpy_hwnd, False)
 
     def _on_rbutton_down(self, card, mx, my):
-        if card and not card.editing:
-            print(f"[CardWindow] Right-click on pinned card → re-entering edit mode", flush=True)
-            self.set_edit_mode(card.scrcpy_hwnd, True)
-            return 1
         return None
 
     # ─────────── Public API ───────────
@@ -948,7 +938,7 @@ class WindowsCardDecorator:
         card = CardState(scrcpy_hwnd, on_close=on_close,
                         on_geometry_changed=on_geometry_changed,
                         on_minimize=on_minimize)
-        card.editing = True
+        card.editing = False
         self._cards[scrcpy_hwnd] = card
         self._card_ptrs[id(card)] = card
         self._post_ui(WM_TUI_CREATEOVERLAY, card=card)
@@ -973,13 +963,26 @@ class WindowsCardDecorator:
         self._post_ui(WM_TUI_SHOWHIDE, 1 if editing else 0, card=card)
         if not editing:
             user32.SetCursor(user32.LoadCursorW(None, IDC_ARROW))
-        print(f"[CardWindow] Edit mode {'ON' if editing else 'OFF (pinned)'} for hwnd={scrcpy_hwnd}", flush=True)
+            try:
+                sx, sy, sw, sh = self._window_rect(card.scrcpy_hwnd)
+                if card.on_geometry_changed:
+                    card.on_geometry_changed(sx, sy, sw, sh)
+            except Exception:
+                pass
+            print(f"[CardWindow] Edit mode OFF (pinned), geometry saved for hwnd={scrcpy_hwnd}", flush=True)
+        else:
+            print(f"[CardWindow] Edit mode ON for hwnd={scrcpy_hwnd}", flush=True)
 
     def toggle_edit_mode(self, scrcpy_hwnd):
         scrcpy_hwnd = int(scrcpy_hwnd)
         if scrcpy_hwnd in self._cards:
             card = self._cards[scrcpy_hwnd]
             self.set_edit_mode(scrcpy_hwnd, not card.editing)
+
+    def set_all_edit_mode(self, editing):
+        for scrcpy_hwnd in list(self._cards.keys()):
+            self.set_edit_mode(scrcpy_hwnd, editing)
+        print(f"[CardWindow] All cards edit mode: {'ON' if editing else 'OFF (pinned)'}", flush=True)
 
     def refresh_card_overlay(self, scrcpy_hwnd):
         """Re-sync the overlay window position/size after programmatic window move/resize."""

@@ -1,6 +1,7 @@
 """Main PhoneAgent class for orchestrating phone automation."""
 
 import json
+import threading
 import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -81,6 +82,15 @@ class PhoneAgent:
 
         self._context: list[dict[str, Any]] = []
         self._step_count = 0
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        """Request the agent to stop running the current task."""
+        self._stop_event.set()
+
+    @property
+    def is_running(self):
+        return not self._stop_event.is_set() and self._step_count > 0
 
     def run(self, task: str) -> str:
         """
@@ -92,6 +102,7 @@ class PhoneAgent:
         Returns:
             Final message from the agent.
         """
+        self._stop_event.clear()
         self._context = []
         self._step_count = 0
 
@@ -100,12 +111,20 @@ class PhoneAgent:
         # First step with user prompt
         result = self._execute_step(task, is_first=True)
 
+        if self._stop_event.is_set():
+            return "Task stopped by user"
+
         if result.finished:
             return result.message or "Task completed"
 
-        # Continue until finished or max steps reached
+        # Continue until finished, max steps reached, or stopped
         while self._step_count < self.agent_config.max_steps:
+            if self._stop_event.is_set():
+                return "Task stopped by user"
             result = self._execute_step(is_first=False)
+
+            if self._stop_event.is_set():
+                return "Task stopped by user"
 
             if result.finished:
                 return result.message or "Task completed"
@@ -133,6 +152,7 @@ class PhoneAgent:
 
     def reset(self) -> None:
         """Reset the agent state for a new task."""
+        self._stop_event.clear()
         self._context = []
         self._step_count = 0
         device_factory = get_device_factory()

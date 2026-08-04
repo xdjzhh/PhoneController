@@ -33,6 +33,7 @@ if os.name == 'nt':
 import argparse
 import json
 import threading
+import re
 from flask import Flask, request, jsonify
 from phone_agent import PhoneAgent
 from phone_agent.model import ModelConfig
@@ -52,6 +53,32 @@ display_manager = None
 agent = None
 agent_initialized = False
 backdrop_manager = None
+
+_task_lock = threading.Lock()
+_task_running = False
+_current_agent = None
+_current_task = None
+
+STOP_KEYWORDS = re.compile(
+    r'(停止任务|快停下|跑飞了|终止任务|立即停止|紧急停止|立刻停下|中止任务|取消任务)',
+    re.IGNORECASE
+)
+
+
+def _is_stop_command(task: str) -> bool:
+    """检测任务文本是否为停止指令。"""
+    if not task:
+        return False
+    text = task.strip().lower()
+    # 直接匹配停止关键词（整个文本很短且包含停止词，或包含紧急短语）
+    if len(text) <= 20 and STOP_KEYWORDS.search(text):
+        return True
+    # 包含紧急短语
+    emergency_phrases = ['快停下', '跑飞了', '紧急停止', '立即停止', 'emergency stop', 'abort']
+    for phrase in emergency_phrases:
+        if phrase in text:
+            return True
+    return False
 
 
 def initialize_config(base_url: str, model: str, api_key: str):
@@ -94,10 +121,44 @@ def start_backdrop_window():
         return False
 
 
+def initialize_display_manager(start_main: bool = True, start_monitor: bool = True,
+                               start_backdrop: bool = True):
+    """初始化显示管理器并可选启动主屏、屏幕监控和背景窗口"""
+    global display_manager
+    try:
+        if start_backdrop:
+            print("🖥️  Starting Qt Linux desktop backdrop...")
+            start_backdrop_window()
+
+        display_manager = get_display_manager()
+        if start_main:
+            print("📱 Starting main display...")
+            result = display_manager.start_main_display()
+            if result.get("success"):
+                print("✅ Main display started successfully")
+            else:
+                print(f"⚠️  Main display failed to start: {result.get('error')}")
+                return False
+        if start_monitor:
+            print("👁️  Starting screen lock monitor...")
+            monitor_result = display_manager.start_screen_monitor()
+            if monitor_result.get("success"):
+                print("✅ Screen lock monitor started")
+            else:
+                print(f"⚠️  Screen monitor failed: {monitor_result.get('error')}")
+        return True
+    except Exception as e:
+        print(f"⚠️  Display manager initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 @app.route('/run', methods=['POST'])
 def run_task():
     """执行任务"""
-    global agent, agent_initialized
+    global agent, agent_initialized, _task_running, _current_agent, _current_task
+
     if not config_initialized:
         return jsonify({
             'success': False,
@@ -113,13 +174,52 @@ def run_task():
             'success': False,
             'error': 'Task is required'
         }), 400
+
+    is_stop = _is_stop_command(task)
+
+    with _task_lock:
+        if _task_running:
+            if is_stop:
+                # 停止指令：终止正在运行的任务
+                running_task = _current_task or "unknown"
+                print(f"\n🛑 Stop command received: '{task}' → stopping running task: '{running_task}'")
+                if _current_agent:
+                    _current_agent.stop()
+                return jsonify({
+                    'success': True,
+                    'stopped': True,
+                    'message': f'Stopped running task: {running_task}'
+                })
+            else:
+                # 非停止指令：抛弃新任务
+                print(f"\n⚠️  Task running, discarding new task: '{task}'")
+                return jsonify({
+                    'success': False,
+                    'error': 'A task is already running',
+                    'running_task': _current_task
+                }), 409
+
+        # 没有任务在运行
+        if is_stop:
+            # 停止指令但没有运行中的任务
+            return jsonify({
+                'success': True,
+                'stopped': False,
+                'message': 'No task is running'
+            })
+
+        # 启动新任务
+        _task_running = True
+        _current_task = task
+        print(f"\n📱 Running task: {task}")
     
     try:
-        print(f"\n📱 Running task: {task}")
         agent = PhoneAgent(
             model_config=model_config,
             agent_config=agent_config,
         )
+        with _task_lock:
+            _current_agent = agent
         agent_initialized = True
         result = agent.run(task)
         
@@ -135,6 +235,11 @@ def run_task():
             'success': False,
             'error': str(e)
         }), 500
+    finally:
+        with _task_lock:
+            _task_running = False
+            _current_agent = None
+            _current_task = None
 
 
 @app.route('/status', methods=['GET'])
@@ -144,6 +249,8 @@ def get_status():
     status_info = {
         'status': 'running' if agent_initialized else 'not_initialized',
         'agent_initialized': agent_initialized,
+        'task_running': _task_running,
+        'current_task': _current_task,
         'step_count': agent._step_count if agent else 0,
         'config_initialized': config_initialized,
     }
@@ -382,70 +489,33 @@ def main():
         api_key=args.apikey
     )
     
-    # Initialize display manager
-    global display_manager
-    print("🖥️  Initializing display manager...")
-    display_manager = get_display_manager()
-
-    # Helper: launch a task in a daemon thread (fire-and-forget, truly parallel)
-    def _bg(name, fn):
-        def _runner():
-            try:
-                fn()
-            except Exception as e:
-                import traceback
-                print(f"⚠️  {name} start exception: {e}")
-                traceback.print_exc()
-        t = threading.Thread(target=_runner, name=f"startup:{name}", daemon=True)
-        t.start()
-
-    # Count total tasks for logging
-    auto_apps = []
-    if args.auto_start:
-        auto_apps = [p.strip() for p in args.auto_start.split(',') if p.strip()]
-    total = (0 if args.no_backdrop else 1) + (0 if args.no_main_display else 1) + (0 if args.no_screen_monitor else 1) + len(auto_apps)
-    print(f"🚀 同时启动 {total} 个组件...")
-
-    # 1. Backdrop (Qt subprocess)
-    if not args.no_backdrop:
-        _bg("backdrop", start_backdrop_window)
-
-    # 2. Main display (scrcpy main mirror)
+    # Initialize display manager (starts backdrop first, then main display)
     if not args.no_main_display:
-        def _start_main():
-            print("📱 Starting main display...")
-            result = display_manager.start_main_display()
-            if result.get("success"):
-                print("✅ Main display started successfully")
-            else:
-                print(f"⚠️  Main display failed to start: {result.get('error')}")
-        _bg("main_display", _start_main)
+        print("🖥️  Initializing display manager...")
+        initialize_display_manager(
+            start_main=True,
+            start_monitor=not args.no_screen_monitor,
+            start_backdrop=not args.no_backdrop,
+        )
+    elif not args.no_backdrop:
+        start_backdrop_window()
 
-    # 3. Screen lock monitor
-    if not args.no_screen_monitor:
-        def _start_monitor():
-            print("👁️  Starting screen lock monitor...")
-            result = display_manager.start_screen_monitor()
-            if result.get("success"):
-                print("✅ Screen lock monitor started")
+    # Auto-start configured app cards (e.g. weather, Amap navigation)
+    if display_manager and args.auto_start:
+        auto_apps = [p.strip() for p in args.auto_start.split(',') if p.strip()]
+        import time as _time
+        _time.sleep(3)  # wait for main display to settle
+        for idx, app_pkg in enumerate(auto_apps):
+            print(f"📱 Auto-starting app card: {app_pkg}...")
+            result = display_manager.start_app_display(app_pkg)
+            if result.get('success'):
+                print(f"✅ {app_pkg} started: {result.get('message', '')}")
             else:
-                print(f"⚠️  Screen monitor failed: {result.get('error')}")
-        _bg("screen_monitor", _start_monitor)
-
-    # 4. Auto-start app cards (weather, map, etc.)
-    for app_pkg in auto_apps:
-        def _make_start(pkg):
-            def _start_app():
-                print(f"📱 Auto-starting app card: {pkg}...")
-                result = display_manager.start_app_display(pkg)
-                if result.get('success'):
-                    print(f"✅ {pkg} started: {result.get('message', '')}")
-                else:
-                    print(f"⚠️  Failed to start {pkg}: {result.get('error', '')}")
-            return _start_app
-        _bg(f"app:{app_pkg}", _make_start(app_pkg))
+                print(f"⚠️  Failed to start {app_pkg}: {result.get('error', '')}")
+            if idx < len(auto_apps) - 1:
+                _time.sleep(2)  # stagger launches to avoid conflicts
     
-    # Start server immediately (do NOT wait for windows to finish loading)
+    # Start server
     print(f"\n🚀 Starting server on {args.host}:{args.port}")
     print(f"📡 API endpoints:")
     print(f"   POST http://{args.host}:{args.port}/run")
@@ -468,7 +538,12 @@ def main():
     print(f"   POST http://{args.host}:{args.port}/notification/toggle")
     print(f"   POST http://{args.host}:{args.port}/notification/refresh")
     print(f"\n🖥️  Desktop mode:")
-    print(f"   ✅ Qt Linux dark backdrop — virtual cards float above (loading in background)")
+    if backdrop_manager and backdrop_manager.is_running:
+        print(f"   ✅ Qt Linux dark backdrop active — virtual cards float above")
+        if backdrop_manager.notification_hwnd:
+            print(f"   ✅ macOS-style notification panel active (auto-refreshes via ADB)")
+    else:
+        print(f"   ⚠️  Backdrop disabled — cards float over regular desktop")
     print(f"\n🖱️  Window controls:")
     print(f"   🟥 Red button    → Close window")
     print(f"   🟨 Yellow button → Minimize")

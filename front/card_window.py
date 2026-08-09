@@ -20,20 +20,6 @@ import ctypes
 from ctypes import wintypes
 
 
-# ═══════════════════ DEBUG 开关 ═══════════════════
-# 设为 True 开启拖拽调试日志，问题定位后改回 False
-DEBUG_CARD = True
-
-
-def _dlog(*args, **kwargs):
-    """带时间戳和线程ID的调试日志"""
-    if not DEBUG_CARD:
-        return
-    tid = threading.current_thread().name or str(threading.get_ident())
-    ts = time.strftime("%H:%M:%S") + f".{int(time.time()*1000)%1000:03d}"
-    print(f"[CARD {ts} {tid}]", *args, flush=True, **kwargs)
-
-
 # ──────────────────────────── DPI Awareness ────────────────────────────
 # Must be set BEFORE any window creation to ensure GetWindowRect and mouse
 # hook coordinates use the same (physical pixel) coordinate system.
@@ -499,11 +485,8 @@ class WindowsCardDecorator:
                 WM_TUI_MOVEWIN: "MOVEWIN",
                 WM_TUI_QUIT: "QUIT",
             }
-            _mn = _msg_names.get(int(msg), f"0x{int(msg):04X}")
-            ret = user32.PostMessageW(wintypes.HWND(self._msg_hwnd), wintypes.UINT(msg),
+            user32.PostMessageW(wintypes.HWND(self._msg_hwnd), wintypes.UINT(msg),
                                 wintypes.WPARAM(wparam), wintypes.LPARAM(lparam))
-            if msg in (WM_TUI_MOVEWIN, WM_TUI_MOVEOVERLAY):
-                _dlog(f"PostMessage {_mn} hwnd={self._msg_hwnd} ret={ret} err={ctypes.get_last_error() if not ret else 0} lparam_card={card is not None}")
 
     def _card_from_lparam(self, lparam):
         return self._card_ptrs.get(int(lparam))
@@ -802,11 +785,9 @@ class WindowsCardDecorator:
     def _start_nc_drag(self, card):
         """UI 线程调用：通过模拟 WM_NCLBUTTONDOWN 触发 Windows 原生标题栏拖拽/边缘缩放模态循环"""
         if not card.scrcpy_hwnd:
-            _dlog(f"[_start_nc_drag] ABORT scrcpy_hwnd is None")
             return
         ht = self._hit_zone_to_htcode(card._nc_drag_zone)
         if ht == 0:
-            _dlog(f"[_start_nc_drag] ABORT zone={card._nc_drag_zone} maps to HTNOWHERE")
             return
         # 当前鼠标屏幕坐标 -> scrcpy 客户区坐标
         pt = wintypes.POINT()
@@ -823,9 +804,6 @@ class WindowsCardDecorator:
         user32.SetWindowPos(wintypes.HWND(card.scrcpy_hwnd), wintypes.HWND(HWND_TOPMOST),
                             0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         # ══════ 关键：给 scrcpy 窗口发送非客户区左键按下 ══════
-        # 用 PostMessage 不阻塞当前 UI 线程；系统收到后进入原生模态拖拽循环，
-        # 内部自动处理所有 WM_MOUSEMOVE + WM_LBUTTONUP，光标正常更新，无任何震颤
-        _dlog(f"[_start_nc_drag] Send WM_NCLBUTTONDOWN scrcpy={card.scrcpy_hwnd} ht={ht} pt_client=({cx},{cy}) screen=({mx},{my})")
         user32.PostMessageW(wintypes.HWND(card.scrcpy_hwnd),
                             wintypes.UINT(WM_NCLBUTTONDOWN),
                             wintypes.WPARAM(ht),
@@ -849,8 +827,15 @@ class WindowsCardDecorator:
             pt_dst = POINT(sxx, syy)
             size = POINT(w, h)
             pt_src = POINT(0, 0)
-            alpha = 255 if card.editing else 0
-            blend = BLENDFUNCTION(AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA)
+            # ══════════════════════════════════════════════════════════════
+            # 修复：SourceConstantAlpha 永远 = 255（不要在这里乘 0！）
+            # 命中测试 + 视觉完全交给 _draw_traffic_bitmap 里写的 per-pixel alpha：
+            #   · 编辑模式：非按钮区 alpha=1（命中 overlay 拦截拖拽）
+            #                按钮区 alpha=255（红绿灯）
+            #   · 非编辑模式：非按钮区 alpha=0（命中测试穿透到 scrcpy 操作手机）
+            #                  按钮区 alpha=255（红绿灯仍显示+可点击）
+            # ══════════════════════════════════════════════════════════════
+            blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
 
             user32.UpdateLayeredWindow(
                 wintypes.HWND(card.overlay_hwnd), hdc_screen,
@@ -885,20 +870,21 @@ class WindowsCardDecorator:
         ptr = (ctypes.c_ubyte * buf_size).from_address(ppv_bits.value)
 
         # ═══════════════════════════════════════════════════════════════════
-        # 核心修复：WS_EX_LAYERED + ULW_ALPHA 分层窗口命中测试规则
-        #   每个像素 alpha=0 → 完全透明 → WindowFromPoint 自动跳过此窗口穿透命中下层
-        #   每个像素 alpha≥1 → 视觉几乎全透 → WindowFromPoint 仍会命中此窗口
-        # 之前 memset(0) 让整张图 alpha=0 → 99% 区域永远命中 scrcpy，这是
-        # 物理鼠标点击永远打到 scrcpy 上的真正根源（软件注入事件跳过真实命中测试链路，所以UU远程没事）。
-        # 现在改为整张背景 alpha=1（BGR 全 0 + alpha=1 → 肉眼几乎看不见的全透黑色），
-        # 命中测试 100% 会返回 overlay 窗口而不是穿透。
+        # 分层窗口命中测试的正确 per-pixel alpha 策略（配 SourceConstantAlpha=255）
+        #
+        #   编辑模式 card.editing=True
+        #     背景 alpha=1 → 非按钮区也命中 overlay → 我们自己处理拖拽/缩放
+        #     红绿灯按钮 alpha=255 → 命中 overlay → 自己处理按钮点击
+        #
+        #   非编辑模式 card.editing=False（用户要操作 scrcpy 里的手机内容）
+        #     背景 alpha=0 → WindowFromPoint 自动穿透命中 scrcpy → 正常点击/滑动手机
+        #     红绿灯按钮 alpha=255 → 按钮区像素仍命中 overlay → 红绿灯仍可点
         # ═══════════════════════════════════════════════════════════════════
-        ctypes.memset(ppv_bits, 0, buf_size)
-        # 每隔 4 字节（alpha 通道位置）填 1：字节索引 3, 7, 11, 15, ...
-        # 使用切片赋值（C 级循环）比 Python for 循环快 10~100 倍
-        ptr[3::4] = b'\x01' * (w * h)
+        ctypes.memset(ppv_bits, 0, buf_size)  # BGR=0 + alpha=0 先全清零
+        if card.editing:
+            # 编辑模式：背景全部 alpha=1（几乎全透视觉，命中测试 100% 命中 overlay）
+            ptr[3::4] = b'\x01' * (w * h)
 
-        alpha = 255 if card.editing else 0
         for i in range(3):
             bx, by, bw, bh = card.get_traffic_button_rect(i)
             cx = bx + bw // 2
@@ -915,7 +901,8 @@ class WindowsCardDecorator:
                 hover_c = TrafficLightColors.PIN_HOVER
             is_hover = (card.hover_button == i and card.editing)
             color = hover_c if is_hover else base
-            self._draw_circle(ptr, w, h, cx, cy, r, color, alpha if card.editing else 0)
+            # 按钮永远用 alpha=255（不透明），保证命中测试停在 overlay + 视觉清晰可见
+            self._draw_circle(ptr, w, h, cx, cy, r, color, 255)
             if is_hover and card.editing:
                 if i == 0:
                     self._draw_x(ptr, w, h, cx, cy, int(bw * 0.4))
@@ -997,19 +984,16 @@ class WindowsCardDecorator:
                 return 0
             elif msg_val == WM_TUI_MOVEOVERLAY:
                 card = self._card_from_lparam(lParam)
-                _dlog(f"[UI WndProc] GOT WM_TUI_MOVEOVERLAY, card found={card is not None}")
                 if card:
                     self._sync_overlay_on_ui(card)
                 return 0
             elif msg_val == WM_TUI_MOVEWIN:
                 card = self._card_from_lparam(lParam)
-                _dlog(f"[UI WndProc] GOT WM_TUI_MOVEWIN, card found={card is not None}, pending={card._move_pending if card else 'N/A'}")
                 if card:
                     self._move_window_on_ui(card)
                 return 0
             elif msg_val == WM_TUI_NCDRAG:
                 card = self._card_from_lparam(lParam)
-                _dlog(f"[UI WndProc] GOT WM_TUI_NCDRAG, card found={card is not None}, zone={card._nc_drag_zone if card else 'N/A'}")
                 if card:
                     self._start_nc_drag(card)
                 return 0
@@ -1416,7 +1400,6 @@ class WindowsCardDecorator:
         # 自实现拖拽模式（备用）
         if active and active.dragging:
             if _ev_injected != active._drag_start_injected:
-                _dlog(f"[_on_mouse_move DRAG] DROP mismatch: start_injected={active._drag_start_injected} ev_injected={_ev_injected} mx=({mx},{my})")
                 return 1
             dx = mx - active.drag_start_x
             dy = my - active.drag_start_y
@@ -1430,12 +1413,10 @@ class WindowsCardDecorator:
             if not was_pending:
                 active._move_pending = True
                 self._post_ui(WM_TUI_MOVEWIN, card=active)
-            _dlog(f"[_on_mouse_move DRAG] drag_start=({active.drag_start_x},{active.drag_start_y}) dxdy=({dx},{dy}) win_start=({active.win_start_x},{active.win_start_y}) target=({new_x},{new_y}) was_pending={was_pending}")
             return 1
 
         if active and active.resizing:
             if _ev_injected != active._drag_start_injected:
-                _dlog(f"[_on_mouse_move RESIZE] DROP mismatch: start_injected={active._drag_start_injected} ev_injected={_ev_injected} mx=({mx},{my})")
                 return 1
             dx = mx - active.drag_start_x
             dy = my - active.drag_start_y
@@ -1460,7 +1441,6 @@ class WindowsCardDecorator:
             if not was_pending:
                 active._move_pending = True
                 self._post_ui(WM_TUI_MOVEWIN, card=active)
-            _dlog(f"[_on_mouse_move RESIZE] zone={z} dxdy=({dx},{dy}) target=({nx},{ny},{nw},{nh}) was_pending={was_pending}")
             return 1
 
         if card and card.editing:
@@ -1478,13 +1458,9 @@ class WindowsCardDecorator:
 
     def _on_lbutton_down(self, card, mx, my, data):
         if not card or not card.editing:
-            _dlog(f"[_on_lbutton_down] SKIP: card={card is not None} editing={card.editing if card else 'N/A'}")
             return None
         zone = self._hit_test_card(card, mx, my)
-        _zone_names = {v: k for k, v in vars(HitZone).items() if isinstance(v, int)}
-        zn = _zone_names.get(zone, str(zone))
         _ev_injected = (int(data.flags) & 1) != 0
-        _dlog(f"[_on_lbutton_down] zone={zn} mx=({mx},{my}) editing={card.editing} scrcpy_hwnd={card.scrcpy_hwnd} INJECTED={_ev_injected}")
 
         if zone in (HitZone.TRAFFIC_CLOSE, HitZone.TRAFFIC_MIN, HitZone.TRAFFIC_PIN):
             if zone == HitZone.TRAFFIC_CLOSE:
@@ -1517,10 +1493,7 @@ class WindowsCardDecorator:
             card.win_start_x, card.win_start_y = sx, sy
             card.win_start_w, card.win_start_h = sw, sh
             self._active_card = card
-            _dlog(f"  → NC {'DRAG' if _is_drag_zone else 'RESIZE'} START zone={zn} injected={_ev_injected} win_start=({sx},{sy}) size=({sw},{sh})")
             # Step 3: PostMessage 到 UI 线程发送 WM_NCLBUTTONDOWN
-            # （不能在钩子线程里直接 PostMessage 跨进程窗口，避免死锁/吞消息；
-            #  先在本进程 UI 线程中转一下更安全）
             self._post_ui(WM_TUI_NCDRAG, card=card)
             return 1  # 关键：吞噬 LDOWN
 
@@ -1529,10 +1502,6 @@ class WindowsCardDecorator:
     def _on_lbutton_up(self, card, mx, my, data):
         active = self._active_card
         _ev_injected = (int(data.flags) & 1) != 0
-        _dlog(f"[_on_lbutton_up] mx=({mx},{my}) active_card={active is not None} "
-              f"nc_drag={active._nc_drag_active if active else 'N/A'} "
-              f"drag={active.dragging if active else 'N/A'} resize={active.resizing if active else 'N/A'} "
-              f"INJECTED={_ev_injected}")
         if not active:
             return None
 
@@ -1543,10 +1512,8 @@ class WindowsCardDecorator:
             # Windows 原生模态循环已经把 scrcpy 窗口移动到最终位置，
             # 我们只需要：同步 overlay + 保存 geometry + 清理状态
             if _ev_injected != active._drag_start_injected:
-                _dlog(f"  → DROP NC LUP mismatch: start_injected={active._drag_start_injected} ev_injected={_ev_injected}")
                 return 1
             sx, sy, sw, sh = self._window_rect(active.scrcpy_hwnd)
-            _dlog(f"  → NC END final rect=({sx},{sy},{sw},{sh})")
             active._nc_drag_active = False
             active._nc_drag_zone = HitZone.NONE
             active.dragging = False
@@ -1565,7 +1532,6 @@ class WindowsCardDecorator:
         # ════════════════════════════════════
         if active.dragging or active.resizing:
             if _ev_injected != active._drag_start_injected:
-                _dlog(f"  → DROP LUP mismatch: start_injected={active._drag_start_injected} ev_injected={_ev_injected}")
                 return 1
             dx = mx - active.drag_start_x
             dy = my - active.drag_start_y
@@ -1590,11 +1556,7 @@ class WindowsCardDecorator:
             active.dragging = False
             active.resizing = False
             self._active_card = None
-            b_sx, b_sy, b_sw, b_sh = self._window_rect(active.scrcpy_hwnd)
-            _dlog(f"  → FINAL MoveWindow: before=({b_sx},{b_sy},{b_sw},{b_sh}) target=({nx},{ny},{nw},{nh})")
             user32.MoveWindow(wintypes.HWND(active.scrcpy_hwnd), nx, ny, nw, nh, True)
-            a_sx, a_sy, a_sw, a_sh = self._window_rect(active.scrcpy_hwnd)
-            _dlog(f"  → AFTER MoveWindow: actual=({a_sx},{a_sy},{a_sw},{a_sh})")
             self._sync_overlay_now(active)
             if active.on_geometry_changed:
                 try:

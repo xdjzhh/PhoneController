@@ -74,9 +74,14 @@ class NavigationMonitor:
         self._on_end_callbacks: List[Callable[[NavigationState], None]] = []
         self._on_update_callbacks: List[Callable[[NavigationState], None]] = []
         self._lock = threading.Lock()
-        self._debug = True  # 开启调试日志
+        self._debug = False  # 仅在排障时改为 True 打印通知/Activity 细节
 
     def _log(self, msg: str):
+        """真正的导航状态/错误信息，默认就输出"""
+        print(f"[NavMonitor] {msg}", flush=True)
+
+    def _debug_log(self, msg: str):
+        """调试类细节（每条通知、Activity 命中、miss 计数等），仅 _debug=True 时输出"""
         if self._debug:
             print(f"[NavMonitor] {msg}", flush=True)
 
@@ -121,7 +126,7 @@ class NavigationMonitor:
             if focus_match:
                 return (focus_match.group(1), focus_match.group(2))
         except Exception as e:
-            self._log(f"Failed to get current activity: {e}")
+            self._debug_log(f"Failed to get current activity: {e}")
         return (None, None)
 
     def _extract_notification_fields(self, record: str) -> Tuple[str, str, bool]:
@@ -219,7 +224,7 @@ class NavigationMonitor:
             combined_text = f"{title} {text}"
 
             if self._debug and combined_text.strip():
-                self._log(f"  Notif from {pkg}: ongoing={is_ongoing}, title='{title[:30]}', text='{text[:50]}'")
+                self._debug_log(f"  Notif from {pkg}: ongoing={is_ongoing}, title='{title[:30]}', text='{text[:50]}'")
 
             # 如果不要求ongoing，或者确实是ongoing
             if app_cfg["require_ongoing"] and not is_ongoing:
@@ -243,7 +248,6 @@ class NavigationMonitor:
             if is_navi:
                 self._log(f"  -> NAVIGATION DETECTED via notification for {pkg}!")
                 return (pkg, app_cfg["name"], title, text)
-
         return None
 
     def _check_navigation_activity(self, pkg: str, activity: str) -> bool:
@@ -265,12 +269,12 @@ class NavigationMonitor:
         # 检查导航关键词
         for kw in app_cfg.get("activity_keywords", []):
             if kw in activity:
-                self._log(f"Activity '{activity}' matches nav keyword '{kw}'")
+                self._debug_log(f"Activity '{activity}' matches nav keyword '{kw}'")
                 return True
 
         # 额外检查：Activity名中包含navi（导航通用关键词）
         if "navi" in act_lower and "main" not in act_lower and "home" not in act_lower:
-            self._log(f"Activity '{activity}' matches generic nav keyword")
+            self._debug_log(f"Activity '{activity}' matches generic nav keyword")
             return True
 
         return False
@@ -349,7 +353,7 @@ class NavigationMonitor:
                         # 只有连续多次检测不到才判定为结束（防止单次检测失败误判）
                         if self._state.is_navigating:
                             consecutive_miss += 1
-                            self._log(f"Navigation not detected, miss count={consecutive_miss}/3")
+                            self._debug_log(f"Navigation not detected, miss count={consecutive_miss}/3")
                             if consecutive_miss >= 3:
                                 # 导航结束
                                 ended_state = NavigationState()

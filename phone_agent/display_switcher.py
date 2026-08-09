@@ -35,7 +35,41 @@ class DisplaySwitcher:
         "在",
         "去",
         "到",
+        "进入",
+        "进",
+        "切到",
+        "启动",
+        "开",
     ]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 同义词映射（用户常用简称）：
+    #   关键词 → 匹配对应的 app_package 或 窗口标题
+    #   命中关键词后，直接走"匹配动词+窗口标题"等效逻辑，用户不需要说全称。
+    # ═══════════════════════════════════════════════════════════════════
+    APP_ALIASES = {
+        # 高德地图（导航）
+        "高德": "高德地图",
+        "高德地图": "高德地图",
+        "地图": "高德地图",  # 用户说"打开地图"默认=高德地图（配置里有导航几何信息）
+        "导航": "高德地图",  # 默认"导航"=高德地图
+        "开始导航": "高德地图",
+        "导航一下": "高德地图",
+        "带我去": "高德地图",
+        "导航去": "高德地图",
+        # 百度地图
+        "百度": "百度地图",
+        "百度地图": "百度地图",
+        # 微信
+        "微信": "微信",
+        "微": "微信",
+        # 抖音
+        "抖音": "抖音",
+        "抖": "抖音",
+        # 天气
+        "天气": "天气",
+        "天气预报": "天气",
+    }
 
     def __init__(self, config_path=None):
         self._script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,6 +114,35 @@ class DisplaySwitcher:
         self._load_app_list()
         return list(self._app_list.keys())
 
+    def _resolve_alias_to_window_title(self, word: str) -> Optional[str]:
+        """
+        通过 APP_ALIASES 同义词表把用户的简称（"高德"/"导航"/"微信"）
+        映射成 display_config.json 里的正式窗口标题（"高德地图"等）。
+        返回 None 表示不是任何已知别名。
+        """
+        # 优先精确匹配
+        if word in self.APP_ALIASES:
+            return self.APP_ALIASES[word]
+        # 其次：检查关键词是否出现在 word 里（"我要高德导航一下"→"高德"命中）
+        for alias, title in self.APP_ALIASES.items():
+            if alias and alias in word:
+                return title
+        return None
+
+    def _find_package_by_window_title(self, window_title: str) -> Optional[str]:
+        """通过窗口标题找 app_package；找不到尝试 APP_ALIASES 同义词反查再找"""
+        if not self._app_list:
+            return None
+        # 精确匹配
+        for pkg, wt in self._app_list.items():
+            if wt == window_title:
+                return pkg
+        # 同义词表的 title → display_config 里实际 title 模糊匹配
+        for pkg, wt in self._app_list.items():
+            if window_title and (window_title in wt or wt in window_title):
+                return pkg
+        return None
+
     def detect_switch_intent(self, text: str) -> Tuple[Optional[str], Optional[str]]:
         """
         检测文本中的屏幕切换意图。
@@ -105,7 +168,7 @@ class DisplaySwitcher:
                 return "main", None
 
         # 2. 检测是否切换到某个 app
-        # 方式：遍历所有已配置的 app 名称，检查是否出现在文本中
+        # 2.1 遍历所有已配置的 app 名称，检查是否出现在文本中
         for app_package, window_title in self._app_list.items():
             # 检查窗口标题是否出现在文本中（如"微信"、"淘宝"）
             if window_title in text:
@@ -123,8 +186,31 @@ class DisplaySwitcher:
                     if verb + app_package in text:
                         return "app", app_package
 
-        # 3. 使用正则匹配更复杂的模式
-        # 模式：切换到/操作/在 + App名 + 后面的内容
+        # 2.2 使用 APP_ALIASES 同义词联想（关键：解决"高德"/"导航"/"微信"等简称匹配不到的问题）
+        for verb in self.SWITCH_VERBS:
+            if verb in text:
+                # 取动词之后的文本片段（"切换到高德地图导航回家" → "高德地图导航回家"）
+                try:
+                    tail = text.split(verb, 1)[1]
+                except Exception:
+                    continue
+                if not tail:
+                    continue
+                # 先用 APP_ALIASES 精确/包含匹配找同义词对应的标准 window_title
+                for alias, std_title in self.APP_ALIASES.items():
+                    if alias and alias in tail:
+                        pkg = self._find_package_by_window_title(std_title)
+                        if pkg is not None:
+                            return "app", pkg
+
+        # 2.3 文本完全不含切换动词，但只有同义词（例如用户直接说"高德"、"导航"、"微信"）
+        for alias, std_title in self.APP_ALIASES.items():
+            if text == alias or (text.startswith(alias) and len(text) <= max(6, len(alias) + 4)):
+                pkg = self._find_package_by_window_title(std_title)
+                if pkg is not None:
+                    return "app", pkg
+
+        # 2.4 使用正则匹配更复杂的模式（兜底）
         for verb in self.SWITCH_VERBS:
             pattern = re.compile(rf"{re.escape(verb)}([\u4e00-\u9fa5a-zA-Z0-9_]+)")
             matches = pattern.findall(text)
@@ -135,6 +221,12 @@ class DisplaySwitcher:
                 # 模糊匹配：检查 app 名称是否是匹配词的一部分
                 for name_lower, pkg in self._app_names_lower.items():
                     if name_lower and name_lower in match_lower:
+                        return "app", pkg
+                # 再走一次同义词联想（同义词精确匹配）
+                std_title = self._resolve_alias_to_window_title(match)
+                if std_title:
+                    pkg = self._find_package_by_window_title(std_title)
+                    if pkg is not None:
                         return "app", pkg
 
         return None, None

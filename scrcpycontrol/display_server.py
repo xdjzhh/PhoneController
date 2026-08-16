@@ -504,24 +504,67 @@ def start_display():
                     'error': 'No ADB device found'
                 }), 500
             device = devices[0]
-            
-            # Launch app on main display using monkey
+
+            # Step 2 (no config): Switch to main (home) screen FIRST on display 0
+            print(f"[Main] Switching to main (home) screen on display 0...")
+            try:
+                device.shell("am start -a android.intent.action.MAIN -c android.intent.category.HOME --display 0")
+                import time as _tm; _tm.sleep(0.8)
+            except Exception as h_err:
+                print(f"[Main] am start HOME warning (non-critical): {h_err}")
+                try:
+                    device.shell("input keyevent KEYCODE_HOME")
+                    import time as _tm2; _tm2.sleep(0.5)
+                except Exception:
+                    pass
+
+            # Step 3 (no config): Then launch app on main display (am start preferred, monkey fallback)
             print(f"[Main] Launching app {app_package} on main display...")
-            monkey_cmd = f"monkey -p {app_package} -c android.intent.category.LAUNCHER 1"
-            result = device.shell(monkey_cmd)
-            
-            if "No activities found" in result or "Error" in result:
+            launched = False
+            error_txt = ""
+            try:
+                intent_result = device.shell(f"cmd package resolve-activity --brief {app_package}")
+                if intent_result and "/" in intent_result and "No activity found" not in intent_result:
+                    activity = None
+                    for line in intent_result.strip().split('\n'):
+                        if '/' in line and not line.startswith('#'):
+                            activity = line.strip()
+                            break
+                    if activity is None:
+                        activity = intent_result.strip().split('\n')[-1].strip()
+                    if activity and '/' in activity:
+                        am_result = device.shell(f"am start -n {activity} --display 0")
+                        if am_result and ("Error" not in am_result and "Exception" not in am_result):
+                            launched = True
+                            print(f"[Main] App {app_package} launched via am start on display 0: {activity}")
+                        else:
+                            error_txt = (am_result or "").strip()[:200]
+            except Exception as a_err:
+                error_txt = f"am start error: {a_err}"
+
+            if not launched:
+                # Fallback: monkey cold start on display 0
+                monkey_cmd = f"monkey -p {app_package} --display 0 -c android.intent.category.LAUNCHER 1"
+                result = device.shell(monkey_cmd)
+                if "No activities found" in result or "Error" in result:
+                    if not error_txt:
+                        error_txt = result.strip()[:200]
+                else:
+                    launched = True
+                    print(f"[Main] App {app_package} launched via monkey on display 0")
+
+            if not launched:
                 return jsonify({
                     'success': False,
-                    'error': f'Failed to launch app: {result}'
+                    'error': f'Failed to launch app on main display: {error_txt}'
                 }), 500
-            else:
-                return jsonify({
-                    'success': True,
-                    'app_package': app_package,
-                    'display_type': 'main',
-                    'message': f'App {app_package} launched on main display'
-                })
+
+            return jsonify({
+                'success': True,
+                'app_package': app_package,
+                'display_type': 'main',
+                'message': f'App {app_package} launched on main display (after home switch)'
+            })
         except Exception as e:
             return jsonify({
                 'success': False,
@@ -543,14 +586,12 @@ def start_display():
         # Build WindowConfig VO from config dict
         win_config = WindowConfig.from_dict(display_config, is_main=False)
         
-        # Resolve virtual display size matching window aspect ratio automatically
-        # (prevents letterbox black bars for landscape/portrait/square windows)
-        nd_w, nd_h, nd_dpi = win_config.resolve_virtual_display_size(win_config.default_orientation)
+        # Resolve virtual display size automatically by window aspect ratio
+        # (w >= h → wide VD; w < h → tall VD). No orientation / swapping.
+        nd_w, nd_h, nd_dpi = win_config.resolve_virtual_display_size()
         win_config.new_display_width = nd_w
         win_config.new_display_height = nd_h
         win_config.new_display_dpi = nd_dpi
-        win_config.rotation = 0
-        win_config.user_rotation = 0  # lock to natural direction on Android side
 
         display_id = len(multi_display.displays)
 

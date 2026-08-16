@@ -131,15 +131,25 @@ class ActionHandler:
                 app_package = APP_PACKAGES.get(app_name)
                 if app_package:
                     try:
+                        # device_factory.launch_app already called dm.start_app_display
+                        # internally. Do NOT call start_app_display again here — that
+                        # would trigger a duplicate am start and pop the app twice.
+                        # Instead, just look up the running display to get its ID.
                         dm = get_display_manager()
-                        result = dm.start_app_display(app_package)
-                        if result.get("success"):
-                            android_display_id = result.get("android_display_id")
+                        disp = dm._app_display_map.get(app_package)
+                        if disp is not None and disp.running:
+                            android_display_id = getattr(disp, "android_display_id", None)
                             if android_display_id is not None:
                                 device_factory.set_active_display(android_display_id)
-                                print(f"[ActionHandler] Switched to virtual display for {app_name} (id={android_display_id})")
+                                print(f"[ActionHandler] Switched to virtual display for "
+                                      f"{app_name} (id={android_display_id})")
+                            else:
+                                print(f"[ActionHandler] {app_name} virtual display running "
+                                      f"but display ID not parsed yet → using main display")
                         else:
-                            print(f"[ActionHandler] No virtual display for {app_name}, using main display")
+                            # App was launched on main display (no virtual config)
+                            device_factory.set_active_display(0)
+                            print(f"[ActionHandler] {app_name} using main display (no virtual card)")
                     except Exception as e:
                         print(f"[ActionHandler] Failed to switch display: {e}")
             except Exception:

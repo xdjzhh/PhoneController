@@ -18,25 +18,29 @@ USE_VIRTUAL_DISPLAY = os.environ.get("USE_VIRTUAL_DISPLAY", "1") == "1"
 
 def _launch_app_via_virtual_display(package: str) -> bool:
     """
-    Launch an app via virtual display using DisplayManager.
+    Launch an app via DisplayManager (virtual display if configured, else main).
 
     Args:
         package: App package name.
 
     Returns:
-        True if launched via virtual display, False otherwise.
+        True if launched, False otherwise.
     """
     try:
         dm = get_display_manager()
         result = dm.start_app_display(package)
         if result.get("success"):
-            print(f"[VirtualDisplay] App {package} launched via virtual display")
+            display_type = result.get("display_type", "unknown")
+            dedup = result.get("deduplicated", False)
+            extra = " (deduplicated)" if dedup else ""
+            print(f"[DisplayManager] App {package} launched via {display_type} display{extra}")
             return True
         else:
-            print(f"[VirtualDisplay] Failed to start virtual display for {package}: {result.get('error')}")
+            print(f"[DisplayManager] Failed to start display for {package}: "
+                  f"{result.get('message') or result.get('error')}")
             return False
     except Exception as e:
-        print(f"[VirtualDisplay] Error launching {package}: {e}")
+        print(f"[DisplayManager] Error launching {package}: {e}")
         import traceback
         traceback.print_exc()
         return False

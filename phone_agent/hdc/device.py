@@ -17,26 +17,29 @@ USE_VIRTUAL_DISPLAY = os.environ.get("USE_VIRTUAL_DISPLAY", "1") == "1"
 
 def _launch_app_via_virtual_display(bundle: str) -> bool:
     """
-    Try to launch an app via virtual display using DisplayManager.
+    Try to launch an app via DisplayManager (virtual display if configured, else main).
 
     Args:
         bundle: HarmonyOS app bundle name.
 
     Returns:
-        True if launched via virtual display, False otherwise.
+        True if launched, False otherwise.
     """
     try:
         dm = get_display_manager()
         result = dm.start_app_display(bundle)
         if result.get("success"):
             display_type = result.get("display_type", "unknown")
-            print(f"[VirtualDisplay] App {bundle} launched via {display_type} display")
+            dedup = result.get("deduplicated", False)
+            extra = " (deduplicated)" if dedup else ""
+            print(f"[DisplayManager] App {bundle} launched via {display_type} display{extra}")
             return True
         else:
-            print(f"[VirtualDisplay] Failed to launch {bundle}: {result.get('error')}")
+            print(f"[DisplayManager] Failed to launch {bundle}: "
+                  f"{result.get('message') or result.get('error')}")
             return False
     except Exception as e:
-        print(f"[VirtualDisplay] Error: {e}")
+        print(f"[DisplayManager] Error: {e}")
         return False
 
 def get_current_app(device_id: str | None = None) -> str:

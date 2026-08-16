@@ -55,12 +55,16 @@ class DisplayManager:
 
         self._main_display = None
         self._main_display_running = False
-        self._main_rotation = 0
         self._multi_display = None
         self._app_display_map = {}
-        self._app_orientation = {}
         self._lock = threading.Lock()
         self._initialized = False
+
+        # Idempotency cache: avoid re-launching the same no-config app on
+        # main display within a short window. Prevents double-am-start bugs
+        # when callers invoke start_app_display twice for the same package.
+        self._main_launch_cache = {}   # pkg → last launch timestamp
+        self._MAIN_LAUNCH_DEDUP_SEC = 20
 
         self._screen_monitor_thread = None
         self._screen_monitor_stop = False
@@ -137,47 +141,31 @@ class DisplayManager:
         """Get config property - loaded configuration."""
         return self.load_config()
 
-    def start_main_display(self, rotation=None):
+    def start_main_display(self):
         """
         Start the main display (phone screen mirror).
-
-        Args:
-            rotation: Screen rotation (0, 1, 2, 3). None = use current setting.
 
         Returns:
             Dict with success status and display info.
         """
         with self._lock:
-            return self._start_main_display_locked(rotation)
+            return self._start_main_display_locked()
 
-    def _start_main_display_locked(self, rotation=None):
+    def _start_main_display_locked(self):
         """Start main display assuming lock is already held."""
-        if rotation is None:
-            rotation = self._main_rotation
 
         if self._main_display_running and self._main_display and self._main_display.running:
-            if hasattr(self._main_display.config, 'rotation') and self._main_display.config.rotation == rotation:
-                return {
-                    "success": True,
-                    "message": "Main display already running",
-                    "display_type": "main",
-                    "rotation": rotation,
-                }
-            else:
-                print(f"[DisplayManager] Main display rotation mismatch ({rotation}), restarting...")
-                self._stop_main_display_locked()
+            return {
+                "success": True,
+                "message": "Main display already running",
+                "display_type": "main",
+            }
 
         cfg = self.load_config()
         main_cfg = cfg.get("main_display", {})
 
         # Build WindowConfig VO from config dict
         win_config = WindowConfig.from_dict(main_cfg, is_main=True)
-
-        # Apply rotation to window dimensions (landscape swaps w/h)
-        if rotation in (90, 270):
-            win_config.swap_dimensions_for_orientation("landscape")
-            win_config.rotation = rotation
-            print(f"[DisplayManager] Landscape mode: window size {win_config.window_width}x{win_config.window_height}")
 
         try:
             self._main_display = MainDisplay(
@@ -187,13 +175,12 @@ class DisplayManager:
                 display_manager=self,
             )
 
-            print(f"[DisplayManager] Starting main display (rotation={rotation})...")
+            print(f"[DisplayManager] Starting main display...")
             self._main_display.start()
             time.sleep(2)
 
             if self._main_display.running:
                 self._main_display_running = True
-                self._main_rotation = rotation
                 self._initialized = True
                 print("[DisplayManager] Main display started successfully")
                 # Start navigation monitor after main display is up
@@ -203,7 +190,6 @@ class DisplayManager:
                     "message": "Main display started",
                     "display_type": "main",
                     "window_title": win_config.window_title,
-                    "rotation": rotation,
                 }
             else:
                 self._main_display = None
@@ -240,15 +226,18 @@ class DisplayManager:
             )
         return self._multi_display
 
-    def start_app_display(self, app_package, orientation=None):
+    def start_app_display(self, app_package):
         """
         Start a virtual display for an app.
+
+        Each card defines its own window_width/window_height in config; virtual
+        display resolution is selected automatically from the card's aspect ratio
+        (w >= h → wide VD, w < h → tall VD). No orientation mode or w/h swapping.
 
         If the app is already running, returns immediately without creating a new one.
 
         Args:
             app_package: Android app package name.
-            orientation: Display orientation - "portrait", "landscape", or None to use config default.
 
         Returns:
             Dict with success status and display info.
@@ -256,82 +245,150 @@ class DisplayManager:
         cfg = self.load_config()
         app_cfg = cfg.get("app_displays", {}).get(app_package, {}) or {}
 
-        # 若未显式指定orientation，则使用config中的default_orientation，默认portrait
-        if orientation is None:
-            orientation = app_cfg.get("default_orientation", "portrait")
-
-        if orientation not in ("portrait", "landscape"):
-            return {"success": False, "error": "orientation must be 'portrait' or 'landscape'"}
-
         with self._lock:
             if app_package in self._app_display_map:
                 display = self._app_display_map[app_package]
                 if display.running:
-                    current_orient = self._app_orientation.get(app_package, "portrait")
-                    if current_orient == orientation:
-                        print(f"[DisplayManager] App {app_package} already running ({orientation})")
-                        self.activate_app_window(app_package)
-                        return {
-                            "success": True,
-                            "message": "App display already running",
-                            "display_type": "virtual",
-                            "app_package": app_package,
-                            "window_title": display.window_title,
-                            "orientation": orientation,
-                        }
-                    else:
-                        print(f"[DisplayManager] App {app_package} running but orientation mismatch (current={current_orient}, target={orientation}), restarting...")
-                        stopped = self._stop_app_display_locked(app_package)
-                        print(f"[DisplayManager] Old display stopped result: {stopped}")
-                        time.sleep(3.0)  # 等待旧scrcpy进程退出、端口释放、Android端虚拟屏销毁
+                    print(f"[DisplayManager] App {app_package} already running")
+                    self.activate_app_window(app_package)
+                    return {
+                        "success": True,
+                        "message": "App display already running",
+                        "display_type": "virtual",
+                        "app_package": app_package,
+                        "window_title": display.window_title,
+                    }
                 else:
                     del self._app_display_map[app_package]
 
             if not app_cfg:
-                print(f"[DisplayManager] No display config for {app_package}, using main display")
+                # Step 1: Check display_config → app NOT in config → use main display.
+                # Step 2: Switch to main (home) screen first, then launch app on main display.
+                print(f"[DisplayManager] No display config for {app_package} → main display flow")
+
+                # Idempotency guard: if we already launched this package on main
+                # display within the last N seconds, skip re-launching to avoid
+                # double-popup bugs caused by duplicate upstream calls.
+                now = time.time()
+                last_ts = self._main_launch_cache.get(app_package)
+                if last_ts is not None and (now - last_ts) < self._MAIN_LAUNCH_DEDUP_SEC:
+                    print(f"[DisplayManager] {app_package} already launched on main display "
+                          f"{now - last_ts:.1f}s ago → skipping duplicate am start")
+                    return {
+                        "success": True,
+                        "message": "App already launched on main display (deduplicated)",
+                        "display_type": "main",
+                        "app_package": app_package,
+                        "android_display_id": None,
+                        "deduplicated": True,
+                    }
+
                 if not self._main_display_running:
                     self._start_main_display_locked()
+
+                device = self._get_adb_device()
+                if device is None:
+                    return {
+                        "success": False,
+                        "message": "No ADB device available",
+                        "display_type": "main",
+                        "app_package": app_package,
+                        "android_display_id": None,
+                    }
+
+                # 2a. Switch to main (home) screen so user sees main display content
+                print(f"[DisplayManager] Switching to main (home) screen on display 0...")
+                try:
+                    device.shell("am start -a android.intent.action.MAIN -c android.intent.category.HOME --display 0")
+                    time.sleep(0.8)
+                except Exception as h_err:
+                    print(f"[DisplayManager] am start HOME warning (non-critical): {h_err}")
+                    try:
+                        device.shell("input keyevent KEYCODE_HOME")
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+
+                # 2b. Launch the app on main display (display 0)
+                print(f"[DisplayManager] Launching {app_package} on main display...")
+                launched = False
+                err_msg = ""
+                try:
+                    # Prefer am start (no cold start if app is already running)
+                    resolve = device.shell(f"cmd package resolve-activity --brief {app_package}")
+                    if resolve and "/" in resolve and "No activity found" not in resolve:
+                        activity = None
+                        for line in resolve.strip().split('\n'):
+                            if '/' in line and not line.startswith('#'):
+                                activity = line.strip()
+                                break
+                        if activity is None:
+                            activity = resolve.strip().split('\n')[-1].strip()
+                        if activity and '/' in activity:
+                            am_result = device.shell(f"am start -n {activity} --display 0")
+                            if am_result and ("Error" not in am_result and "Exception" not in am_result):
+                                launched = True
+                                print(f"[DisplayManager] App started via am start on display 0: {activity}")
+                            else:
+                                err_msg = (am_result or "").strip()[:200]
+                except Exception as a_err:
+                    err_msg = f"am start error: {a_err}"
+
+                if not launched:
+                    # Fallback: monkey launcher for cold start
+                    try:
+                        monkey_result = device.shell(
+                            f"monkey -p {app_package} --display 0 "
+                            f"-c android.intent.category.LAUNCHER 1"
+                        )
+                        if monkey_result and ("No activities found" in monkey_result or "Error" in monkey_result):
+                            err_msg = f"monkey failed: {monkey_result.strip()[:200]}"
+                        else:
+                            launched = True
+                            print(f"[DisplayManager] App started via monkey on display 0")
+                    except Exception as m_err:
+                        err_msg = f"monkey error: {m_err}"
+
+                if not launched:
+                    return {
+                        "success": False,
+                        "message": f"Failed to launch app on main display: {err_msg}",
+                        "display_type": "main",
+                        "app_package": app_package,
+                        "android_display_id": None,
+                    }
+
+                self._main_launch_cache[app_package] = time.time()
                 return {
                     "success": True,
-                    "message": "Using main display (no virtual display config)",
+                    "message": "App launched on main display",
                     "display_type": "main",
                     "app_package": app_package,
+                    "android_display_id": None,
                 }
 
             win_w = app_cfg.get("window_width", 540)
             win_h = app_cfg.get("window_height", 960)
 
             # ===== Build WindowConfig VO and resolve virtual display size =====
-            # Mac card style is always applied (hardcoded in AppVirtualDisplay).
-            # WindowConfig.resolve_virtual_display_size automatically matches
-            # VD resolution to window aspect ratio to avoid letterbox black bars.
+            # VD resolution is selected automatically by window aspect ratio.
             win_config = WindowConfig.from_dict(app_cfg, is_main=False)
-            win_config.default_orientation = orientation
-
-            # Ensure window dimensions match the requested orientation
-            win_config.swap_dimensions_for_orientation(orientation)
-
-            # Resolve correct VD width/height/DPI based on window aspect ratio
-            nd_w, nd_h, nd_dpi = win_config.resolve_virtual_display_size(orientation)
+            nd_w, nd_h, nd_dpi = win_config.resolve_virtual_display_size()
             win_config.new_display_width = nd_w
             win_config.new_display_height = nd_h
             win_config.new_display_dpi = nd_dpi
-            win_config.rotation = 0
-            win_config.user_rotation = 0
 
-            # Determine orientation description for debug output
-            is_landscape_vd = nd_w > nd_h
-            nd_orient_desc = f"{nd_w}x{nd_h}/{nd_dpi or 'default'}dpi({'横屏' if is_landscape_vd else '竖屏' if win_config.window_width < win_config.window_height else '正方形'}natural)"
+            nd_desc = f"{nd_w}x{nd_h}/{nd_dpi or 'default'}dpi"
+            win_desc = (f"{win_config.window_width}x{win_config.window_height}"
+                        f"({'wide' if win_config.window_width >= win_config.window_height else 'tall'})")
 
             mvd = self._get_multi_display()
 
             try:
-                print(f"[DisplayManager] ========== 创建{orientation}虚拟屏参数 ==========")
+                print(f"[DisplayManager] ========== 创建虚拟屏参数 ==========")
                 print(f"[DisplayManager] app_package           : {app_package}")
-                print(f"[DisplayManager] window 尺寸           : {win_config.window_width}x{win_config.window_height} ({'横屏✅' if win_config.window_width > win_config.window_height else '竖屏'})")
-                print(f"[DisplayManager] new_display (安卓)    : {nd_orient_desc}")
-                print(f"[DisplayManager] scrcpy rotation       : 0 (不做编码旋转)")
-                print(f"[DisplayManager] wm user-rotation      : lock 0 (natural方向，防FLAG_ROTATES_WITH_CONTENT)")
+                print(f"[DisplayManager] window 尺寸           : {win_desc}")
+                print(f"[DisplayManager] new_display (安卓)    : {nd_desc}")
                 print(f"[DisplayManager] =================================================")
 
                 display = AppVirtualDisplay(
@@ -346,9 +403,8 @@ class DisplayManager:
 
                 mvd.displays.append(display)
                 self._app_display_map[app_package] = display
-                self._app_orientation[app_package] = orientation
 
-                print(f"[DisplayManager] Starting virtual display for {app_package} ({orientation})...")
+                print(f"[DisplayManager] Starting virtual display for {app_package}...")
                 display.start()
                 time.sleep(2)
 
@@ -366,13 +422,12 @@ class DisplayManager:
                             threading.Thread(target=_delayed_switch, daemon=True).start()
                     return {
                         "success": True,
-                        "message": f"App virtual display started ({orientation})",
+                        "message": "App virtual display started",
                         "display_type": "virtual",
                         "app_package": app_package,
                         "window_title": display.window_title,
                         "display_id": display.display_id,
                         "android_display_id": getattr(display, "android_display_id", None),
-                        "orientation": orientation,
                     }
                 else:
                     failed_id = display.display_id
@@ -381,7 +436,6 @@ class DisplayManager:
                     mvd._free_display_id(failed_id)  # 启动失败，归还id
                     if app_package in self._app_display_map:
                         del self._app_display_map[app_package]
-                    self._app_orientation.pop(app_package, None)
                     return {
                         "success": False,
                         "error": "App virtual display failed to start",
@@ -432,7 +486,6 @@ class DisplayManager:
                     self._multi_display.displays.remove(display)
                 self._multi_display._free_display_id(old_display_id)  # 归还id到空闲池，供后续安全复用
             del self._app_display_map[app_package]
-            self._app_orientation.pop(app_package, None)
             print(f"[DisplayManager] Stopped virtual display for {app_package} (display_id={old_display_id} returned to pool)")
             time.sleep(0.5)
             return {"success": True, "message": "App display stopped"}
@@ -715,33 +768,6 @@ class DisplayManager:
                     return False
         except Exception:
             return False
-
-    def set_display_orientation(self, app_package=None, orientation="portrait"):
-        """
-        Set the orientation of a display (main or virtual).
-
-        - For main display: uses scrcpy --rotation (0=portrait, 1=landscape)
-        - For virtual display: stops and recreates with swapped width/height
-
-        Args:
-            app_package: App package name. None or "main" means main display.
-            orientation: "portrait" or "landscape".
-
-        Returns:
-            Dict with success status and display info.
-        """
-        if orientation not in ("portrait", "landscape"):
-            return {"success": False, "error": "orientation must be 'portrait' or 'landscape'"}
-
-        is_main = (app_package is None or app_package == "main")
-
-        if is_main:
-            target_rotation = 270 if orientation == "landscape" else 0
-            print(f"[DisplayManager] Setting main display to {orientation} (rotation={target_rotation})...")
-            return self.start_main_display(rotation=target_rotation)
-
-        print(f"[DisplayManager] Setting {app_package} to {orientation} mode...")
-        return self.start_app_display(app_package, orientation=orientation)
 
     def set_window_opacity(self, app_package=None, opacity=1.0):
         """

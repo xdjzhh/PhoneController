@@ -293,7 +293,7 @@ def list_displays():
 
 @app.route('/display/start', methods=['POST'])
 def start_app_display():
-    """启动 app 虚拟显示"""
+    """启动 app 虚拟显示（卡片的窗口宽高/分辨率已在 display_config.json 中按各自宽高比定义）"""
     global display_manager
     if not display_manager:
         return jsonify({'success': False, 'error': 'Display manager not initialized'}), 500
@@ -301,8 +301,7 @@ def start_app_display():
     app_package = data.get('app_package', '')
     if not app_package:
         return jsonify({'success': False, 'error': 'app_package is required'}), 400
-    orientation = data.get('orientation', None)
-    result = display_manager.start_app_display(app_package, orientation=orientation)
+    result = display_manager.start_app_display(app_package)
     status_code = 200 if result.get('success') else 500
     return jsonify(result), status_code
 
@@ -392,22 +391,6 @@ def set_window_opacity():
     except (TypeError, ValueError):
         return jsonify({'success': False, 'error': 'opacity must be a number between 0.0 and 1.0'}), 400
     result = display_manager.set_window_opacity(app_package, opacity)
-    status_code = 200 if result.get('success') else 500
-    return jsonify(result), status_code
-
-
-@app.route('/display/orientation', methods=['POST'])
-def set_display_orientation():
-    """设置屏幕方向（横屏/竖屏），支持主屏和虚拟屏"""
-    global display_manager
-    if not display_manager:
-        return jsonify({'success': False, 'error': 'Display manager not initialized'}), 500
-    data = request.get_json() or {}
-    app_package = data.get('app_package')  # None 或 "main" 表示主屏
-    orientation = data.get('orientation', 'portrait')
-    if orientation not in ('portrait', 'landscape'):
-        return jsonify({'success': False, 'error': "orientation must be 'portrait' or 'landscape'"}), 400
-    result = display_manager.set_display_orientation(app_package, orientation)
     status_code = 200 if result.get('success') else 500
     return jsonify(result), status_code
 
@@ -531,7 +514,6 @@ def main():
     print(f"   POST http://{args.host}:{args.port}/display/screen_monitor/stop")
     print(f"   GET  http://{args.host}:{args.port}/display/screen_monitor/status")
     print(f"   POST http://{args.host}:{args.port}/display/opacity")
-    print(f"   POST http://{args.host}:{args.port}/display/orientation")
     print(f"   POST http://{args.host}:{args.port}/display/edit_mode")
     print(f"   POST http://{args.host}:{args.port}/notification/show")
     print(f"   POST http://{args.host}:{args.port}/notification/hide")

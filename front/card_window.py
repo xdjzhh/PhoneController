@@ -37,6 +37,30 @@ if os.name == 'nt':
                 pass
 
 
+# ═══════════════════ Curved Surface Layout (方案1 伪曲面) ═══════════════════
+# 所有可调参数集中在此；严格遵守"最小改动原则"：
+#   · 原始界面对卡片已做出排列 → 默认绝不改动任何卡片的 x/y/w/h（布局完全尊重原界面）。
+#   · 只想体验"整体贴在超宽屏曲面"的视觉效果 → 只开 CURVED_VFX_OVERLAY（只在 overlay 自绘层加视觉氛围，像素级叠加，完全不动布局）。
+#   · 想额外加"一键按柱面弧度重新排列卡片" → 把 CURVED_REARRANGE_CARDS=True（会覆盖原界面的布局，默认关闭避免破坏你现有排列）。
+# ═══════════════════════════════════════════════════════════════════════════════
+# ───────── 布局层（会改卡片真实位置/大小） ─────────
+CURVED_REARRANGE_CARDS = False           # 重排开关：False=100% 保留原界面排列（默认）；True=注册/注销卡片时自动按柱面弧度重新摆放
+CURVED_RADIUS_PX = 3200                  # （仅 REARRANGE=True 生效）柱面曲率半径（越大越平；推荐 1800~5000）
+CURVED_VIEW_DISTANCE_PX = 1600           # （仅 REARRANGE=True 生效）观察者距离
+CURVED_CARD_SPACING_DEG = 6.0            # （仅 REARRANGE=True 生效）相邻卡片中心夹角（度；越大间距越疏）
+CURVED_SIDE_SCALE_MIN = 0.88             # （仅 REARRANGE=True 生效）最边缘卡片的最小整体缩放
+CURVED_SIDE_LIFT_PX = 42                 # （仅 REARRANGE=True 生效）边缘卡片向上翘多少像素
+CURVED_BASE_W = 360                      # （仅 REARRANGE=True 生效）基准卡片宽（0=自动取当前卡片中位数宽）
+CURVED_BASE_H = 640                      # （仅 REARRANGE=True 生效）基准卡片高（0=自动取当前卡片中位数高）
+
+# ───────── 视觉层（仅改 overlay 自绘像素，绝不触碰卡片真实位置/大小/排列） ─────────
+CURVED_VFX_OVERLAY = True                # 视觉层总开关：False=完全不叠加曲面视觉氛围（100% 原样）；True=每张卡片按自己在屏幕全局位置自动获得"越靠边越像曲面边缘"的效果
+CURVED_VIGNETTE_STRENGTH = 0.18          # 卡片径向暗角强度（0=关闭；推荐 0.10~0.28）
+CURVED_SIDE_DESATURATE = 0.20            # 屏幕边缘卡片饱和度降低（0=原色；推荐 0.10~0.28）
+CURVED_SIDE_SHADOW_ALPHA = 80            # 屏幕边缘卡片额外内阴影 alpha（0~180）
+CURVED_SIDE_SHADOW_OFFSET = 8            # 屏幕边缘卡片额外内阴影扩散像素（0~16）
+
+
 # ──────────────────────────── Mac Card Style Defaults ────────────────────────────
 
 CARD_CORNER_RADIUS = 20
@@ -73,6 +97,7 @@ if os.name == 'nt':
     WM_TUI_MOVEOVERLAY = WM_USER + 5
     WM_TUI_MOVEWIN = WM_USER + 6
     WM_TUI_NCDRAG = WM_USER + 7   # 线程安全触发原生NC拖拽
+    WM_TUI_ARRANGE_ALL = WM_USER + 8  # 按超宽屏曲面重排所有卡片
     WM_TUI_QUIT = WM_USER + 99
 
     WH_MOUSE_LL = 14
@@ -130,6 +155,9 @@ if os.name == 'nt':
     IDC_SIZEWE = 32644
     IDC_SIZENWSE = 32642
     IDC_SIZENESW = 32643
+
+    SM_CXSCREEN = 0
+    SM_CYSCREEN = 1
 
     GA_ROOT = 2
     GWL_EXSTYLE = -20
@@ -248,7 +276,12 @@ class CardState:
 
         self.editing = False
         self.hover_button = -1
-        # 旧的自实现拖拽标记（保留字段兼容，但不再使用核心路径）
+        # ───── CurvedSurface 布局相关字段（方案1 伪曲面） ─────
+        self._order_index = 0          # 加入顺序（重排用，由 register_window 赋值）
+        self._curved_theta_deg = 0.0   # 柱面中心角（度），0 = 屏幕正中
+        self._curved_screen_scale = 1.0  # 当前整体缩放比（_redraw 用它等比缩放按钮等）
+        self._curved_side_t = 0.0      # 0=正中心，1=最边缘（给 vignette/饱和度/阴影插值用）
+        # ───── 自实现拖拽标记（保留字段兼容，但不再使用核心路径） ─────
         self.dragging = False
         self.resizing = False
         self.resize_zone = HitZone.NONE
@@ -382,6 +415,7 @@ class WindowsCardDecorator:
     def __init__(self):
         self._cards = {}
         self._card_ptrs = {}
+        self._next_order = 0           # CurvedSurface：下一张卡片的加入序号（按插入序重排）
         self._ui_hwnd = None
         self._ui_thread = None
         self._ui_thread_id = None
@@ -483,6 +517,8 @@ class WindowsCardDecorator:
                 WM_TUI_REDRAW: "REDRAW",
                 WM_TUI_MOVEOVERLAY: "MOVEOVERLAY",
                 WM_TUI_MOVEWIN: "MOVEWIN",
+                WM_TUI_NCDRAG: "NCDRAG",
+                WM_TUI_ARRANGE_ALL: "ARRANGE_ALL",
                 WM_TUI_QUIT: "QUIT",
             }
             user32.PostMessageW(wintypes.HWND(self._msg_hwnd), wintypes.UINT(msg),
@@ -759,6 +795,108 @@ class WindowsCardDecorator:
             user32.MoveWindow(wintypes.HWND(card.overlay_hwnd), sx2, sy2, sw2, sh2, True)
             self._ensure_overlay_above_scrcpy(card)
 
+    def _arrange_all_cards_curved(self):
+        """UI 线程内调用：按柱面（方案1 伪曲面）重排所有卡片。
+
+        ⚠️  注意：这个函数会**覆盖原界面已有的卡片排列**，只有在
+            CURVED_REARRANGE_CARDS=True 时才应该被主动调用。
+            默认开关是 False，即完全尊重原界面的 x/y/w/h。
+
+        数学模型（简单柱面透视，无需真 3D）：
+            R = CURVED_RADIUS_PX           # 柱面半径
+            D = CURVED_VIEW_DISTANCE_PX    # 观察者距离
+            θ = 卡片中心角（弧度，中心卡片 θ=0）
+            1) 屏幕水平相对偏移 x = R * tanθ（近大远小 + 间距自然扩散）
+            2) 透视缩放   scale = D / (D - R*(1-cosθ))  简化成 clamp(1/cosθ, MIN, 1.0)
+            3) 边缘上翘（抵消视觉显矮） y = CURVED_SIDE_LIFT_PX * (1 - cosθ)  方向：屏幕 y 减小
+        """
+        global CURVED_REARRANGE_CARDS, CURVED_RADIUS_PX, CURVED_VIEW_DISTANCE_PX, \
+            CURVED_CARD_SPACING_DEG, CURVED_SIDE_SCALE_MIN, CURVED_SIDE_LIFT_PX, \
+            CURVED_BASE_W, CURVED_BASE_H
+        if not CURVED_REARRANGE_CARDS:
+            return
+        cards_sorted = sorted(self._cards.values(), key=lambda c: c._order_index)
+        n = len(cards_sorted)
+        if n <= 0:
+            return
+
+        import math
+        # ────── 1) 确定基准卡片尺寸 ──────
+        base_w, base_h = CURVED_BASE_W, CURVED_BASE_H
+        if base_w <= 0 or base_h <= 0:
+            # 自动：取当前卡片的中位数大小（如果还没创建 overlay，就用常见 360x640 兜底）
+            sizes_w, sizes_h = [], []
+            for c in cards_sorted:
+                try:
+                    _, _, sw, sh = self._window_rect(c.scrcpy_hwnd)
+                    if sw > 100 and sh > 100:
+                        sizes_w.append(sw); sizes_h.append(sh)
+                except Exception:
+                    pass
+            if sizes_w:
+                sizes_w.sort(); sizes_h.sort()
+                base_w = sizes_w[len(sizes_w) // 2] if base_w <= 0 else base_w
+                base_h = sizes_h[len(sizes_h) // 2] if base_h <= 0 else base_h
+        if base_w <= 0: base_w = 360
+        if base_h <= 0: base_h = 640
+
+        # ────── 2) 屏幕几何中心 ──────
+        cx_screen = user32.GetSystemMetrics(SM_CXSCREEN) // 2
+        cy_screen = user32.GetSystemMetrics(SM_CYSCREEN) // 2
+
+        # ────── 3) 给每张卡片算 θ + 正投影 ──────
+        center_i = (n - 1) / 2.0
+        max_abs_i = max(abs(n - 1 - center_i), abs(0 - center_i)) if n > 1 else 1.0
+
+        R = max(1.0, float(CURVED_RADIUS_PX))
+        spacing_deg = max(1.0, float(CURVED_CARD_SPACING_DEG))
+        scale_min = max(0.5, min(1.0, float(CURVED_SIDE_SCALE_MIN)))
+        lift_px = float(CURVED_SIDE_LIFT_PX)
+
+        for idx, c in enumerate(cards_sorted):
+            i_offset = idx - center_i
+            theta_deg = i_offset * spacing_deg
+            theta_rad = math.radians(theta_deg)
+            cos_t = math.cos(theta_rad)
+            if abs(cos_t) < 1e-4:
+                cos_t = 1e-4
+
+            # scale = sec(theta) 但限制到 [scale_min, 1.0]
+            scale_raw = 1.0 / cos_t
+            scale = max(scale_min, min(1.0, scale_raw))
+
+            # x 相对中心偏移（柱面正切展开），y 相对中心上翘
+            x_off = R * math.tan(theta_rad)
+            y_off = -lift_px * max(0.0, 1.0 - cos_t)  # 负号=屏幕 y 向上（变高）
+
+            # 最终尺寸和位置
+            nw = int(round(base_w * scale))
+            nh = int(round(base_h * scale))
+            nx = int(round(cx_screen + x_off - nw / 2.0))
+            ny = int(round(cy_screen + y_off - nh / 2.0))
+
+            # side_t: 0=中心 1=最边缘（给 vignette/阴影/饱和度插值）
+            side_t = 0.0 if max_abs_i <= 1e-6 else min(1.0, abs(i_offset) / max_abs_i)
+
+            c._curved_theta_deg = theta_deg
+            c._curved_screen_scale = scale
+            c._curved_side_t = side_t
+
+            # 真实移动两个窗口
+            try:
+                user32.MoveWindow(wintypes.HWND(c.scrcpy_hwnd), nx, ny, nw, nh, True)
+            except Exception:
+                pass
+            if c.overlay_hwnd:
+                try:
+                    user32.MoveWindow(wintypes.HWND(c.overlay_hwnd), nx, ny, nw, nh, True)
+                except Exception:
+                    pass
+                c.overlay_width = nw
+                c.overlay_height = nh
+                self._ensure_overlay_above_scrcpy(c)
+                self._redraw_overlay_on_ui(c)
+
     def _sync_overlay_now(self, card):
         if not card.overlay_hwnd:
             return
@@ -910,7 +1048,139 @@ class WindowsCardDecorator:
                     self._draw_dash(ptr, w, h, cx, cy, int(bw * 0.4))
                 else:
                     self._draw_check(ptr, w, h, cx, cy, int(bw * 0.35))
+
+        # ═══════════════════ CurvedSurface 视觉叠加（方案1 伪曲面） ═══════════════════
+        # ══ 默认绝不改变卡片布局。视觉层只叠加"越靠近屏幕全局边缘 → 曲面感越强"的视觉：
+        #   A) 每张卡片自身的径向 vignette 暗角（中心亮，四围渐暗）
+        #   B) 屏幕左右边缘卡片 → 轻微去饱和度（往灰度混）
+        #   C) 屏幕左右边缘卡片 → 内侧圆角软阴影
+        #
+        # ⚠️  关键约束：绝不能改动每个像素原有的 alpha（A 通道必须保持原值），
+        #             否则会破坏"非编辑模式穿透 / 编辑模式命中"的 per-pixel-alpha 策略！
+        #             暗角/饱和度只乘 BGR，A 通道原样写回。
+        # ════════════════════════════════════════════════════════════════════════════════
+        if CURVED_VFX_OVERLAY:
+            self._apply_curved_vfx(ptr, w, h, card)
+
         return hbm
+
+    def _compute_curved_side_t_for_card(self, card):
+        """根据卡片当前在全局屏幕里的位置，算 0~1 的曲面边缘强度 t。
+
+        · t=0 → 卡片中心就在屏幕几何中心，完全平面感
+        · t=1 → 卡片中心已经到达屏幕左/右边缘（屏幕半宽的 90% 处），曲面边缘氛围最强
+        · 只看水平偏移（超宽屏曲面是横向弯曲，垂直方向不参与）
+        """
+        try:
+            sx, sy, sw, sh = self._window_rect(card.scrcpy_hwnd)
+        except Exception:
+            return 0.0
+        if sw <= 0 or sh <= 0:
+            return 0.0
+        card_cx = sx + sw / 2.0
+        screen_cx = user32.GetSystemMetrics(SM_CXSCREEN) / 2.0
+        half_w = max(1.0, screen_cx * 0.90)  # 90% 半宽就视为"贴边"，避免跑出屏幕外才满
+        dx = abs(card_cx - screen_cx)
+        t = dx / half_w
+        if t < 0.0:
+            return 0.0
+        if t > 1.0:
+            return 1.0
+        return t
+
+    def _apply_curved_vfx(self, buf, w, h, card):
+        """按屏幕全局 side_t 对整张 overlay 位图做曲面氛围叠加（只改 BGR，保持 A 不变）。"""
+        global CURVED_VIGNETTE_STRENGTH, CURVED_SIDE_DESATURATE, CURVED_SIDE_SHADOW_ALPHA, CURVED_SIDE_SHADOW_OFFSET
+
+        # ══ 根据卡片当前在屏幕里的位置动态算 t（完全不依赖任何布局重排） ══
+        t = float(self._compute_curved_side_t_for_card(card))
+        if t <= 1e-6 and CURVED_VIGNETTE_STRENGTH <= 1e-6 and CURVED_SIDE_DESATURATE <= 1e-6:
+            return  # 屏幕正中央且 3 项效果全关 → 完全跳过
+
+        vig_strength = max(0.0, min(0.6, float(CURVED_VIGNETTE_STRENGTH) * (0.35 + 0.65 * t)))
+        desat = max(0.0, min(1.0, float(CURVED_SIDE_DESATURATE) * t))
+        shadow_alpha_raw = int(round(max(0.0, min(200.0, float(CURVED_SIDE_SHADOW_ALPHA) * t))))
+        shadow_radius = int(round(max(0.0, min(24.0, float(CURVED_SIDE_SHADOW_OFFSET) * (0.35 + 0.9 * t)))))
+
+        # 快速路径：三项都没实际开启 → 跳过（保留上面 t=0 分支，防御式）
+        if vig_strength <= 1e-6 and desat <= 1e-6 and shadow_alpha_raw <= 0:
+            return
+
+        hw, hh = w * 0.5, h * 0.5
+        # 径向 vignette 归一化距离：用椭圆半径（不是圆形），避免卡片四角太暗
+        inv_rx2 = 1.0 / (hw * hw) if hw > 0 else 0.0
+        inv_ry2 = 1.0 / (hh * hh) if hh > 0 else 0.0
+        # 阴影用"离内框边缘的距离"：shadow_radius 越大，阴影越宽
+        sr = float(max(0, shadow_radius))
+        shadow_inv = (1.0 / sr) if sr > 0 else 0.0
+        shadow_premul = shadow_alpha_raw / 255.0  # 0~1 与 vignette 合成
+
+        # 预计算每个 y 行的 (y-hh)^2 / ry^2  （节省一半乘法）
+        y_dy2_norm = [0.0] * h
+        for y in range(h):
+            dy = y - hh + 0.5
+            y_dy2_norm[y] = dy * dy * inv_ry2
+
+        # ────── 按像素循环处理（只改 B、G、R，A 永远保持） ──────
+        stride = w * 4
+        for y in range(h):
+            row_off = y * stride
+            y_sh_d_top = float(y) * shadow_inv
+            y_sh_d_bot = float(max(0, h - 1 - y)) * shadow_inv
+            y_vig_y2 = y_dy2_norm[y]
+            for x in range(w):
+                idx = row_off + x * 4
+                a = buf[idx + 3]
+                if a == 0:
+                    continue  # 完全透明，跳过所有视觉叠加
+
+                # 1) 计算归一化椭圆径向距离 d
+                dx = x - hw + 0.5
+                dist2 = dx * dx * inv_rx2 + y_vig_y2
+                # d^2 -> 0 中心, >1 四围；smoothstep 版本： s = clamp(d^2, 0, 1)
+                d2 = dist2
+                if d2 < 0.0:
+                    d2 = 0.0
+                elif d2 > 1.0:
+                    d2 = 1.0
+                vig_s = d2 * d2 * (3.0 - 2.0 * d2)  # smoothstep(0,1,d2) 更自然
+                darken = vig_s * vig_strength         # 0~0.3+
+                if darken > 0.99:
+                    darken = 0.99
+
+                # 2) 阴影：计算距 4 条内边最近距离的 s_shadow（0~1，越大越靠近边）
+                s_shadow = 0.0
+                if shadow_premul > 1e-6 and sr > 0.0:
+                    x_sh_d_left = float(x) * shadow_inv
+                    x_sh_d_right = float(max(0, w - 1 - x)) * shadow_inv
+                    d_edge = min(x_sh_d_left, x_sh_d_right, y_sh_d_top, y_sh_d_bot)
+                    if d_edge < 1.0:
+                        s_shadow = 1.0 - d_edge  # 贴边=1，往外渐淡
+
+                # 最终黑色（BGR=0）混入量： darken + shadow
+                mix_black = darken + shadow_premul * s_shadow
+                if mix_black > 1.0:
+                    mix_black = 1.0
+
+                # 3) 取原 BGR，去饱和（亮度按 601 公式 Y=0.299R+0.587G+0.114B）
+                b = buf[idx]; g = buf[idx + 1]; r = buf[idx + 2]
+                if desat > 1e-6:
+                    yl = 0.114 * b + 0.587 * g + 0.299 * r  # 灰度值
+                    b = b * (1.0 - desat) + yl * desat
+                    g = g * (1.0 - desat) + yl * desat
+                    r = r * (1.0 - desat) + yl * desat
+
+                # 4) 混入黑色（暗角 + 阴影）
+                if mix_black > 1e-6:
+                    b *= (1.0 - mix_black)
+                    g *= (1.0 - mix_black)
+                    r *= (1.0 - mix_black)
+
+                # 5) 写回 BGR（A 保持不变！）
+                buf[idx] = 255 if b >= 255.0 else (0 if b <= 0.0 else int(b + 0.5))
+                buf[idx + 1] = 255 if g >= 255.0 else (0 if g <= 0.0 else int(g + 0.5))
+                buf[idx + 2] = 255 if r >= 255.0 else (0 if r <= 0.0 else int(r + 0.5))
+                # buf[idx + 3] = a  ← 绝对不写回，保留原图命中测试 alpha
 
     def _draw_circle(self, buf, w, h, cx, cy, r, color, alpha):
         if alpha == 0:
@@ -996,6 +1266,9 @@ class WindowsCardDecorator:
                 card = self._card_from_lparam(lParam)
                 if card:
                     self._start_nc_drag(card)
+                return 0
+            elif msg_val == WM_TUI_ARRANGE_ALL:
+                self._arrange_all_cards_curved()
                 return 0
             elif msg_val == WM_TUI_QUIT:
                 user32.PostQuitMessage(0)
@@ -1603,9 +1876,15 @@ class WindowsCardDecorator:
                         on_geometry_changed=on_geometry_changed,
                         on_minimize=on_minimize)
         card.editing = False
+        card._order_index = self._next_order
+        self._next_order += 1
         self._cards[scrcpy_hwnd] = card
         self._card_ptrs[id(card)] = card
         self._post_ui(WM_TUI_CREATEOVERLAY, card=card)
+        # ═══ 关键：默认绝不覆盖用户原有布局（CURVED_REARRANGE_CARDS=False） ═══
+        # 只有显式开启了"想重新按曲面排列卡片"时才会触发重排（会破坏原界面已有的排列）。
+        if CURVED_REARRANGE_CARDS:
+            self._post_ui(WM_TUI_ARRANGE_ALL)
 
     def unregister_window(self, scrcpy_hwnd):
         scrcpy_hwnd = int(scrcpy_hwnd)
@@ -1616,6 +1895,8 @@ class WindowsCardDecorator:
         self._post_ui(WM_TUI_DESTROYOVERLAY, card=card)
         if self._active_card == card:
             self._active_card = None
+        if CURVED_REARRANGE_CARDS:
+            self._post_ui(WM_TUI_ARRANGE_ALL)
 
     def set_edit_mode(self, scrcpy_hwnd, editing):
         scrcpy_hwnd = int(scrcpy_hwnd)

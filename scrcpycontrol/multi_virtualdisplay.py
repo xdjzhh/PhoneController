@@ -5,7 +5,7 @@ each showing a different app, like a desktop environment.
 
 All windows use Mac-style card decoration by default (borderless, always-on-top,
 rounded corners, drop shadow, traffic lights, drag & resize).
-Functional parameters (position, size, orientation, resolution, bitrate) are
+Functional parameters (position, size, resolution, bitrate) are
 passed via the WindowConfig VO from the front module.
 
 Requirements:
@@ -115,10 +115,6 @@ class MainDisplay:
         cmd.extend(["--max-fps", str(cfg.max_fps)])
         cmd.extend(["--video-bit-rate", cfg.bitrate])
         cmd.extend(["--video-codec", cfg.video_codec])
-
-        # Display orientation (270 = landscape counter-clockwise for main display)
-        if cfg.rotation and cfg.rotation != 0:
-            cmd.extend(["--display-orientation", str(cfg.rotation)])
 
         # Behavior flags
         if cfg.keep_active:
@@ -339,8 +335,8 @@ class AppVirtualDisplay:
     then launches/moves the target app onto that display.
 
     Uses Mac-style card window decoration by default (same as MainDisplay).
-    Resolution is automatically matched to window aspect ratio to avoid
-    letterbox black bars (portrait/landscape/square auto-detection).
+    Resolution is automatically matched to window aspect ratio (wide/tall) to
+    avoid letterbox black bars.
     """
 
     def __init__(self, app_package, config: WindowConfig, display_id=None,
@@ -405,11 +401,8 @@ class AppVirtualDisplay:
 
         Key design points:
         - --new-display creates an Android VirtualDisplay; resolution/DPI are chosen
-          to match the window aspect ratio (handled by WindowConfig.resolve_virtual_display_size)
+          directly from the window aspect ratio (handled by WindowConfig.resolve_virtual_display_size)
         - --no-vd-system-decorations hides status/nav bars on the virtual screen
-        - --display-orientation=0 (no encoding rotation); rotation is done at the
-          Android system level via `wm user-rotation lock` to ensure apps receive
-          proper orientation change events
         - Mac card style defaults (borderless + always-on-top + dark background)
           are hardcoded, same as MainDisplay
         """
@@ -420,9 +413,9 @@ class AppVirtualDisplay:
             cmd.extend(["-s", self.device_serial])
 
         # ── Virtual display resolution ──
-        # Use WindowConfig to resolve correct VD size matching window aspect ratio.
-        # This prevents letterbox black bars when window ratio ≠ VD ratio.
-        nd_w, nd_h, nd_dpi = cfg.resolve_virtual_display_size(cfg.default_orientation)
+        # WindowConfig.resolve_virtual_display_size selects wide vs tall VD
+        # automatically using window aspect ratio (w >= h → wide).
+        nd_w, nd_h, nd_dpi = cfg.resolve_virtual_display_size()
         nd_arg = f"{nd_w}x{nd_h}"
         if nd_dpi:
             nd_arg += f"/{nd_dpi}"
@@ -442,12 +435,6 @@ class AppVirtualDisplay:
         cmd.extend(["--max-fps", str(cfg.max_fps)])
         cmd.extend(["--video-bit-rate", cfg.bitrate])
         cmd.extend(["--video-codec", cfg.video_codec])
-
-        # scrcpy encoding rotation: fixed at 0 for app displays.
-        # Actual screen rotation is handled by Android wm user-rotation lock
-        # (applied after display creation), so apps receive native orientation events.
-        if cfg.rotation and cfg.rotation != 0:
-            cmd.extend(["--display-orientation", str(cfg.rotation)])
 
         # Behavior flags
         if cfg.no_vd_system_decorations:
@@ -700,17 +687,6 @@ class AppVirtualDisplay:
 
             display_id = self.android_display_id
 
-            # Lock user-rotation to natural direction (same as normal app launch)
-            if hasattr(self.config, 'user_rotation'):
-                try:
-                    wm_cmd = f"wm user-rotation -d {display_id} lock {self.config.user_rotation}"
-                    wm_result = device.shell(wm_cmd)
-                    if wm_result and ("Error" not in wm_result and "Unknown" not in wm_result and "Exception" not in wm_result):
-                        print(f"[{self.window_title}] Set wm user-rotation lock {self.config.user_rotation} on display {display_id}")
-                        time.sleep(0.5)
-                except Exception as wm_err:
-                    print(f"[{self.window_title}] wm user-rotation error (non-critical): {wm_err}")
-
             # Step 1: Launch home/launcher on the virtual display so it's not black
             # Use NEW_TASK | MULTIPLE_TASK flags to create a separate instance on the VD
             # without moving the home task away from the main display.
@@ -772,7 +748,7 @@ class AppVirtualDisplay:
             # Step 3: Swipe down from top as reliable fallback
             # Use display-specific input injection to target the virtual display
             print(f"[{self.window_title}] Sending swipe-down gesture on display {display_id}...")
-            nd_w, nd_h, _ = self.config.resolve_virtual_display_size(self.config.default_orientation)
+            nd_w, nd_h, _ = self.config.resolve_virtual_display_size()
             sx = nd_w // 2
             sy = 5
             ex = nd_w // 2
@@ -805,10 +781,8 @@ class AppVirtualDisplay:
 
         Process:
         1. Wait for virtual display to initialize and parse display ID
-        2. Lock Android user-rotation to the natural orientation (prevents
-           FLAG_ROTATES_WITH_CONTENT from forcing rotation back to portrait)
-        3. Try `am start --display` first (no cold start if app is already running)
-        4. Fall back to `monkey` launcher for cold starts
+        2. Try `am start --display` first (no cold start if app is already running)
+        3. Fall back to `monkey` launcher for cold starts
         """
         try:
             # Get ADB device
@@ -840,27 +814,6 @@ class AppVirtualDisplay:
                     return
 
             display_id = self.android_display_id
-
-            # Lock user-rotation to natural direction (0)
-            # This is critical for landscape apps: without this lock, apps with
-            # FLAG_ROTATES_WITH_CONTENT can cause the system to rotate the virtual
-            # display back to portrait even if the VD was created landscape.
-            if hasattr(self.config, 'user_rotation'):
-                try:
-                    wm_cmd = f"wm user-rotation -d {display_id} lock {self.config.user_rotation}"
-                    wm_result = device.shell(wm_cmd)
-                    if wm_result and ("Error" in wm_result or "Unknown" in wm_result or "Exception" in wm_result):
-                        print(f"[{self.window_title}] wm user-rotation failed: {wm_result.strip()[:200]}")
-                    else:
-                        is_landscape_nd = (self.config.new_display_width or 0) > (self.config.new_display_height or 0)
-                        if self.config.user_rotation == 0:
-                            orient_desc = "natural(横屏)" if is_landscape_nd else "natural(竖屏)"
-                        else:
-                            orient_desc = f"rot={self.config.user_rotation}"
-                        print(f"[{self.window_title}] Set wm user-rotation to lock {self.config.user_rotation} ({orient_desc}) on display {display_id}")
-                        time.sleep(0.5)
-                except Exception as wm_err:
-                    print(f"[{self.window_title}] wm user-rotation error (non-critical): {wm_err}")
 
             print(f"[{self.window_title}] Moving app {self.app_package} to display {display_id}...")
 
@@ -897,10 +850,6 @@ class AppVirtualDisplay:
                     print(f"[{self.window_title}] Monkey also failed: {result.strip()[:200]}")
                 else:
                     print(f"[{self.window_title}] App launched via monkey (cold start)")
-
-            # Wait for rotation lock to settle
-            if hasattr(self.config, 'user_rotation') and self.config.user_rotation != 0:
-                time.sleep(2.0)
 
         except Exception as e:
             print(f"[{self.window_title}] Launch app error: {e}")

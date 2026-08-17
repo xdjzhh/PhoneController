@@ -639,21 +639,30 @@ def create_notification_window(config=None, config_path=None):
 
         def _save_geometry(self):
             if not self._config_path or not os.path.exists(self._config_path):
+                print(f"[Notification] [SAVE] ABORT: config_path invalid or missing (config_path={self._config_path!r}, exists={os.path.exists(self._config_path) if self._config_path else None})", flush=True)
                 return
             try:
-                with open(self._config_path, 'r', encoding='utf-8') as f:
-                    cfg = json.load(f)
                 g = self.geometry()
-                if 'notification_panel' not in cfg:
-                    cfg['notification_panel'] = {}
-                cfg['notification_panel']['window_x'] = g.x()
-                cfg['notification_panel']['window_y'] = g.y()
-                cfg['notification_panel']['window_width'] = g.width()
-                cfg['notification_panel']['window_height'] = g.height()
-                with open(self._config_path, 'w', encoding='utf-8') as f:
-                    json.dump(cfg, f, indent=2, ensure_ascii=False)
+                new = {
+                    'window_x': g.x(),
+                    'window_y': g.y(),
+                    'window_width': g.width(),
+                    'window_height': g.height(),
+                }
+                # 从 ConfigManager 进程内缓存取 old 值（避免为打印日志再单独读一次磁盘）
+                from scrcpycontrol.config_manager import ConfigManager
+                mgr = ConfigManager.get(self._config_path)
+                old = {
+                    k: mgr.get_value(f'notification_panel.{k}')
+                    for k in ('window_x', 'window_y', 'window_width', 'window_height')
+                }
+                # 唯一入口：刷新单例缓存 → debounce 写磁盘
+                mgr.update_section('notification_panel', new)
+                print(f"[Notification] [SAVE] SUCCESS | old={old} → new={new} | file={self._config_path!r}", flush=True)
             except Exception as e:
-                print(f"[Notification] save geometry failed: {e}", flush=True)
+                print(f"[Notification] [SAVE] FAILED: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
 
         def showEvent(self, event):
             super().showEvent(event)
@@ -671,10 +680,15 @@ def create_notification_window(config=None, config_path=None):
             else:
                 scroll_y = 0
                 scroll_h = h
-            if hasattr(self, '_scroll'):
-                self._scroll.setGeometry(0, scroll_y, w, scroll_h)
-            if hasattr(self, '_empty_label'):
-                self._empty_label.setGeometry(0, scroll_y, w, scroll_h)
+            self._scroll.setGeometry(0, scroll_y, w, scroll_h)
+            # Request a geometry save (debounced) — 与 ThinkingLogWindow 行为完全一致
+            self._geometry_save_timer.start()
+            self.update()
+
+        def moveEvent(self, event):
+            super().moveEvent(event)
+            # Request a geometry save (debounced) — 与 ThinkingLogWindow 行为完全一致
+            self._geometry_save_timer.start()
 
         def leaveEvent(self, event):
             if self._hover_btn != -1:

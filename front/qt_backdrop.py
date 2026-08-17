@@ -58,6 +58,14 @@ def _run_backdrop_process(pipe_conn, config_path=None):
     if _proj_root not in sys.path:
         sys.path.insert(0, _proj_root)
 
+    # 声明 ConfigManager 身份：backdrop_manager 维护 notification_panel / thinking_log
+    try:
+        from scrcpycontrol.config_manager import ConfigManager, OWNER_BACKDROP_MANAGER
+        mgr = ConfigManager.get(config_path=config_path) if config_path else ConfigManager.get()
+        mgr.set_owner(OWNER_BACKDROP_MANAGER)
+    except Exception as e:
+        print(f"[QtBackdrop] WARNING: set_owner failed: {e}", flush=True)
+
     import ctypes
     user32 = ctypes.windll.user32
 
@@ -78,6 +86,15 @@ def _run_backdrop_process(pipe_conn, config_path=None):
         except ImportError:
             create_notification_window = None
             print("[QtBackdrop] qt_notification module not found, notification panel disabled", flush=True)
+
+    try:
+        from front.qt_thinking_log import create_thinking_log_panel
+    except ImportError:
+        try:
+            from qt_thinking_log import create_thinking_log_panel
+        except ImportError:
+            create_thinking_log_panel = None
+            print("[QtBackdrop] qt_thinking_log module not found, thinking panel disabled", flush=True)
 
     # ── Windows 常量 ──
     GWL_STYLE = -16
@@ -337,6 +354,9 @@ def _run_backdrop_process(pipe_conn, config_path=None):
         def set_notif_window(self, notif_window):
             self._notif_window = notif_window
 
+        def set_thinking_window(self, thinking_window):
+            self._thinking_window = thinking_window
+
         def _icon_at(self, pos):
             for i in range(2):
                 ix, iy, isize, _ = self._get_icon_rect(i)
@@ -361,6 +381,15 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                     self._notif_window.update()
                 except Exception as e:
                     print(f"[DockToolbar] Toggle notif edit error: {e}", flush=True)
+            if hasattr(self, '_thinking_window') and self._thinking_window:
+                try:
+                    if show:
+                        self._thinking_window._set_edit_mode(True)
+                    else:
+                        self._thinking_window._set_edit_mode(False)
+                    self._thinking_window.update()
+                except Exception as e:
+                    print(f"[DockToolbar] Toggle thinking edit error: {e}", flush=True)
 
         def _do_fade(self):
             target = 0.92 if self._hovering else 0.0
@@ -590,147 +619,237 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                 self.setCursor(Qt.ArrowCursor)
             super().mouseMoveEvent(event)
 
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
+    # ──────────────────────────────────────────────────────────────────
+    # CATCH-ALL wrapper so any error in the Qt child process is reported
+    # back to the parent via pipe instead of crashing silently.
+    # ──────────────────────────────────────────────────────────────────
+    import traceback as _tb
 
-    bg_w = 2560
-    bg_h = 2080
-    notif_cfg = None
+    def _inner_main():
+        # Original (unmodified) Qt UI bootstrap + event loop lives here.
+        # Defining as an inner function avoids re-indenting 200+ existing lines.
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
 
-    try:
-        if config_path and os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-            max_x = 0
-            max_y = 0
-            all_windows = [cfg.get('main_display', {})]
-            for wcfg in cfg.get('app_displays', {}).values():
-                all_windows.append(wcfg)
-            notif_cfg = cfg.get('notification_panel', None)
-            if notif_cfg:
-                all_windows.append(notif_cfg)
-            for wc in all_windows:
-                wx = wc.get('window_x', 0)
-                wy = wc.get('window_y', 0)
-                ww = wc.get('window_width', 540)
-                wh = wc.get('window_height', 960)
-                max_x = max(max_x, wx + ww)
-                max_y = max(max_y, wy + wh)
-            if max_x > 0 and max_y > 0:
-                bg_w = max(max_x + 200, 1920)
-                bg_h = max(max_y + 200, 1080)
-    except Exception:
-        pass
+        bg_w = 2560
+        bg_h = 2080
+        notif_cfg = None
+        thinking_cfg = None  # ← 提前初始化：即使 config 不存在 / 解析失败也不会 NameError
 
-    widget = BackdropWidget(width=bg_w, height=bg_h)
-    widget.show()
-    widget._apply_win32_style()
-    QTimer.singleShot(200, widget._apply_win32_style)
-    QTimer.singleShot(1000, widget._apply_win32_style)
-
-    notif_window = None
-    if create_notification_window and notif_cfg:
         try:
-            notif_window = create_notification_window(config=notif_cfg, config_path=config_path)
-            if notif_window:
-                notif_window.show()
-                QTimer.singleShot(100, notif_window._apply_style)
-                QTimer.singleShot(500, notif_window._apply_style)
-                print("[QtBackdrop] Notification panel created", flush=True)
+            if config_path and os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                max_x = 0
+                max_y = 0
+                all_windows = [cfg.get('main_display', {})]
+                for wcfg in cfg.get('app_displays', {}).values():
+                    all_windows.append(wcfg)
+                notif_cfg = cfg.get('notification_panel', None)
+                if notif_cfg:
+                    all_windows.append(notif_cfg)
+                thinking_cfg = cfg.get('thinking_log', None)
+                if thinking_cfg:
+                    all_windows.append(thinking_cfg)
+                for wc in all_windows:
+                    wx = wc.get('window_x', 0)
+                    wy = wc.get('window_y', 0)
+                    ww = wc.get('window_width', 540)
+                    wh = wc.get('window_height', 960)
+                    max_x = max(max_x, wx + ww)
+                    max_y = max(max_y, wy + wh)
+                if max_x > 0 and max_y > 0:
+                    bg_w = max(max_x + 200, 1920)
+                    bg_h = max(max_y + 200, 1080)
+        except Exception:
+            pass
+
+        widget = BackdropWidget(width=bg_w, height=bg_h)
+        widget.show()
+        widget._apply_win32_style()
+        QTimer.singleShot(200, widget._apply_win32_style)
+        QTimer.singleShot(1000, widget._apply_win32_style)
+    
+        notif_window = None
+        if create_notification_window and notif_cfg:
+            try:
+                notif_window = create_notification_window(config=notif_cfg, config_path=config_path)
+                if notif_window:
+                    notif_window.show()
+                    QTimer.singleShot(100, notif_window._apply_style)
+                    QTimer.singleShot(500, notif_window._apply_style)
+                    print("[QtBackdrop] Notification panel created", flush=True)
+            except Exception as e:
+                print(f"[QtBackdrop] Failed to create notification panel: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                notif_window = None
+    
+        thinking_window = None
+        if create_thinking_log_panel and thinking_cfg:
+            try:
+                thinking_window = create_thinking_log_panel(
+                    config=thinking_cfg, cfg_path=config_path
+                )
+                if thinking_window:
+                    thinking_window.show()
+                    QTimer.singleShot(100, thinking_window._apply_style)
+                    QTimer.singleShot(500, thinking_window._apply_style)
+                    print("[QtBackdrop] Thinking log panel created", flush=True)
+            except Exception as e:
+                print(f"[QtBackdrop] Failed to create thinking panel: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                thinking_window = None
+    
+        dock_window = None
+        try:
+            dock_window = DockToolbarWidget(pipe_conn=pipe_conn)
+            dock_window.setWindowOpacity(0.0)
+            dock_window.show()
+            QTimer.singleShot(100, dock_window._apply_win32_style)
+            QTimer.singleShot(300, dock_window._apply_win32_style)
+            print("[QtBackdrop] Dock toolbar created", flush=True)
         except Exception as e:
-            print(f"[QtBackdrop] Failed to create notification panel: {e}", flush=True)
+            print(f"[QtBackdrop] Failed to create dock toolbar: {e}", flush=True)
             import traceback
             traceback.print_exc()
-            notif_window = None
-
-    dock_window = None
-    try:
-        dock_window = DockToolbarWidget(pipe_conn=pipe_conn)
-        dock_window.setWindowOpacity(0.0)
-        dock_window.show()
-        QTimer.singleShot(100, dock_window._apply_win32_style)
-        QTimer.singleShot(300, dock_window._apply_win32_style)
-        print("[QtBackdrop] Dock toolbar created", flush=True)
-    except Exception as e:
-        print(f"[QtBackdrop] Failed to create dock toolbar: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        dock_window = None
-
-    if dock_window and notif_window:
-        dock_window.set_notif_window(notif_window)
-
-    bg_hwnd = _safe_hwnd(widget.winId())
-    notif_hwnd = _safe_hwnd(notif_window.winId()) if notif_window else 0
-    dock_hwnd = _safe_hwnd(dock_window.winId()) if dock_window else 0
-    pipe_conn.send({'status': 'ready', 'hwnd': bg_hwnd, 'notif_hwnd': notif_hwnd, 'dock_hwnd': dock_hwnd})
-
-    def poll_pipe():
-        nonlocal widget, notif_window, dock_window
-        while pipe_conn.poll():
-            try:
-                msg = pipe_conn.recv()
-                if not isinstance(msg, dict):
-                    continue
-                cmd = msg.get('cmd', '')
-                if cmd == 'stop':
-                    app.quit()
-                    return
-                elif cmd == 'ensure_bottom':
-                    widget.ensure_bottom()
-                elif cmd == 'show_notification':
-                    if notif_window:
-                        notif_window.show()
-                        notif_window._apply_style()
-                elif cmd == 'hide_notification':
-                    if notif_window:
-                        notif_window.hide()
-                elif cmd == 'toggle_notification':
-                    if notif_window:
-                        if notif_window.isVisible():
-                            notif_window.hide()
-                        else:
+            dock_window = None
+    
+        if dock_window and notif_window:
+            dock_window.set_notif_window(notif_window)
+    
+        if dock_window and thinking_window:
+            dock_window.set_thinking_window(thinking_window)
+    
+        bg_hwnd = _safe_hwnd(widget.winId())
+        notif_hwnd = _safe_hwnd(notif_window.winId()) if notif_window else 0
+        thinking_hwnd = _safe_hwnd(thinking_window.winId()) if thinking_window else 0
+        dock_hwnd = _safe_hwnd(dock_window.winId()) if dock_window else 0
+        pipe_conn.send({
+            'status': 'ready',
+            'hwnd': bg_hwnd,
+            'notif_hwnd': notif_hwnd,
+            'thinking_hwnd': thinking_hwnd,
+            'dock_hwnd': dock_hwnd,
+        })
+    
+        def poll_pipe():
+            nonlocal widget, notif_window, thinking_window, dock_window
+            while pipe_conn.poll():
+                try:
+                    msg = pipe_conn.recv()
+                    if not isinstance(msg, dict):
+                        continue
+                    cmd = msg.get('cmd', '')
+                    if cmd == 'stop':
+                        app.quit()
+                        return
+                    elif cmd == 'ensure_bottom':
+                        widget.ensure_bottom()
+                    elif cmd == 'show_notification':
+                        if notif_window:
                             notif_window.show()
                             notif_window._apply_style()
-                elif cmd == 'refresh_notifications':
-                    # Legacy: no-op, data is pushed via update_notifications
-                    pass
-                elif cmd == 'update_notifications':
-                    if notif_window:
-                        data = msg.get('data', [])
-                        notif_window.set_notifications_data(data)
-            except EOFError:
-                app.quit()
-                return
-            except Exception as e:
-                print(f"[QtBackdrop] Pipe poll error: {e}", flush=True)
+                    elif cmd == 'hide_notification':
+                        if notif_window:
+                            notif_window.hide()
+                    elif cmd == 'toggle_notification':
+                        if notif_window:
+                            if notif_window.isVisible():
+                                notif_window.hide()
+                            else:
+                                notif_window.show()
+                                notif_window._apply_style()
+                    elif cmd == 'refresh_notifications':
+                        # Legacy: no-op, data is pushed via update_notifications
+                        pass
+                    elif cmd == 'update_notifications':
+                        if notif_window:
+                            data = msg.get('data', [])
+                            notif_window.set_notifications_data(data)
+                    elif cmd == 'show_thinking':
+                        if thinking_window:
+                            thinking_window.show()
+                            thinking_window._apply_style()
+                    elif cmd == 'hide_thinking':
+                        if thinking_window:
+                            thinking_window.hide()
+                    elif cmd == 'toggle_thinking':
+                        if thinking_window:
+                            if thinking_window.isVisible():
+                                thinking_window.hide()
+                            else:
+                                thinking_window.show()
+                                thinking_window._apply_style()
+                    elif cmd == 'append_thinking':
+                        if thinking_window:
+                            data = msg.get('data') or {}
+                            if isinstance(data, str):
+                                thinking_window.append_log(data)
+                            elif isinstance(data, dict):
+                                thinking_window.append_log(
+                                    data.get('message', ''),
+                                    step=data.get('step'),
+                                    source=data.get('source'),
+                                    tag=data.get('tag'),
+                                    timestamp=bool(data.get('timestamp', True)),
+                                )
+                    elif cmd == 'clear_thinking':
+                        if thinking_window:
+                            thinking_window.clear_log()
+                except EOFError:
+                    app.quit()
+                    return
+                except Exception as e:
+                    print(f"[QtBackdrop] Pipe poll error: {e}", flush=True)
+    
+        poll_timer = QTimer()
+        poll_timer.timeout.connect(poll_pipe)
+        poll_timer.start(100)
+    
+        bottom_timer = QTimer()
+        bottom_timer.timeout.connect(widget.ensure_bottom)
+        bottom_timer.start(2000)
+    
+        def _ensure_notif_topmost():
+            if notif_window and notif_window.isVisible():
+                notif_window.ensure_topmost()
+    
+        notif_timer = QTimer()
+        notif_timer.timeout.connect(_ensure_notif_topmost)
+        notif_timer.start(3000)
+    
+        def _ensure_thinking_topmost():
+            if thinking_window and thinking_window.isVisible():
+                thinking_window.ensure_topmost()
+    
+        thinking_timer = QTimer()
+        thinking_timer.timeout.connect(_ensure_thinking_topmost)
+        thinking_timer.start(3000)
+    
+        def _ensure_dock_topmost():
+            if dock_window:
+                dock_window._apply_win32_style()
+    
+        dock_timer = QTimer()
+        dock_timer.timeout.connect(_ensure_dock_topmost)
+        dock_timer.start(3000)
+    
+        sys.exit(app.exec())
+        # ── end of _inner_main ──
 
-    poll_timer = QTimer()
-    poll_timer.timeout.connect(poll_pipe)
-    poll_timer.start(100)
+    try:
+        _inner_main()
+    except Exception as _proc_err:
+        _err_str = _tb.format_exc()
+        print(f"[QtBackdrop] CHILD PROCESS CRASHED:\n{_err_str}", file=sys.stderr, flush=True)
+        try:
+            pipe_conn.send({'status': 'error', 'error': _err_str})
+        except Exception:
+            pass
 
-    bottom_timer = QTimer()
-    bottom_timer.timeout.connect(widget.ensure_bottom)
-    bottom_timer.start(2000)
-
-    def _ensure_notif_topmost():
-        if notif_window and notif_window.isVisible():
-            notif_window.ensure_topmost()
-
-    notif_timer = QTimer()
-    notif_timer.timeout.connect(_ensure_notif_topmost)
-    notif_timer.start(3000)
-
-    def _ensure_dock_topmost():
-        if dock_window:
-            dock_window._apply_win32_style()
-
-    dock_timer = QTimer()
-    dock_timer.timeout.connect(_ensure_dock_topmost)
-    dock_timer.start(3000)
-
-    sys.exit(app.exec())
 
 
 class QtBackdropManager:
@@ -743,6 +862,7 @@ class QtBackdropManager:
         self._config_path = config_path
         self._backdrop_hwnd = None
         self._notif_hwnd = None
+        self._thinking_hwnd = None
         self._dock_hwnd = None
         self._ready = False
         self._notif_timer = None
@@ -777,9 +897,10 @@ class QtBackdropManager:
                 if msg.get('status') == 'ready':
                     self._backdrop_hwnd = msg.get('hwnd')
                     self._notif_hwnd = msg.get('notif_hwnd', 0)
+                    self._thinking_hwnd = msg.get('thinking_hwnd', 0)
                     self._dock_hwnd = msg.get('dock_hwnd', 0)
                     self._ready = True
-                    print(f"[QtBackdrop] Started successfully, hwnd={self._backdrop_hwnd}, notif_hwnd={self._notif_hwnd}, dock_hwnd={self._dock_hwnd}", flush=True)
+                    print(f"[QtBackdrop] Started successfully, hwnd={self._backdrop_hwnd}, notif_hwnd={self._notif_hwnd}, thinking_hwnd={self._thinking_hwnd}, dock_hwnd={self._dock_hwnd}", flush=True)
                     self._start_notification_refresh()
                     self._start_listener()
                     return True
@@ -910,6 +1031,61 @@ class QtBackdropManager:
                 print(f"[QtBackdrop] Manual notification refresh error: {e}", flush=True)
         threading.Thread(target=_do_refresh, daemon=True).start()
 
+    # ==== Thinking Log Window Control (和通知窗口完全一致：同样受 backdrop_manager 管控) ====
+
+    @property
+    def thinking_hwnd(self):
+        return self._thinking_hwnd
+
+    def show_thinking(self):
+        if not self._ready or not self._parent_conn:
+            return
+        try:
+            self._parent_conn.send({'cmd': 'show_thinking'})
+        except Exception:
+            pass
+
+    def hide_thinking(self):
+        if not self._ready or not self._parent_conn:
+            return
+        try:
+            self._parent_conn.send({'cmd': 'hide_thinking'})
+        except Exception:
+            pass
+
+    def toggle_thinking(self):
+        if not self._ready or not self._parent_conn:
+            return
+        try:
+            self._parent_conn.send({'cmd': 'toggle_thinking'})
+        except Exception:
+            pass
+
+    def append_thinking_log(self, message, step=None, source=None, tag=None, timestamp=True):
+        if not self._ready or not self._parent_conn:
+            return
+        try:
+            self._parent_conn.send({
+                'cmd': 'append_thinking',
+                'data': {
+                    'message': message,
+                    'step': step,
+                    'source': source,
+                    'tag': tag,
+                    'timestamp': timestamp,
+                },
+            })
+        except Exception:
+            pass
+
+    def clear_thinking(self):
+        if not self._ready or not self._parent_conn:
+            return
+        try:
+            self._parent_conn.send({'cmd': 'clear_thinking'})
+        except Exception:
+            pass
+
     def stop(self):
         self._ready = False
         if self._parent_conn:
@@ -956,4 +1132,12 @@ def get_backdrop_manager(config_path=None):
     global _backdrop_manager
     if _backdrop_manager is None:
         _backdrop_manager = QtBackdropManager(config_path=config_path)
+    else:
+        # 单例已存在，但调用方新传入了有效 config_path 且原先保存的是 None（典型场景：
+        # console_tee 早期先触发 get_backdrop_manager() 无参创建，后续 start_backdrop_window()
+        # 才传正确路径）→ 把正确路径补进单例，避免子进程收到 None 导致窗口不加载
+        if (config_path is not None) and (_backdrop_manager._config_path is None):
+            old = _backdrop_manager._config_path
+            _backdrop_manager._config_path = config_path
+            print(f"[QtBackdrop] get_backdrop_manager: filled singleton config_path (was {old!r}, now {config_path!r})", flush=True)
     return _backdrop_manager

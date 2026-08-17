@@ -20,6 +20,8 @@ from .qt_notification import (
     NotificationParser,
     NotificationItem,
 )
+from .qt_thinking_log import create_thinking_log_panel
+from .console_tee import install_console_tee, uninstall_console_tee, ConsoleTee
 
 __all__ = [
     'get_card_window_decorator',
@@ -30,4 +32,8 @@ __all__ = [
     'create_notification_window',
     'NotificationParser',
     'NotificationItem',
+    'create_thinking_log_panel',
+    'install_console_tee',
+    'uninstall_console_tee',
+    'ConsoleTee',
 ]

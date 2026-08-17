@@ -45,6 +45,13 @@ class DisplayManager:
         self.config_path = config_path
         self._config = None
 
+        # 声明 ConfigManager 身份：DisplayManager 维护 main_display / app_displays
+        try:
+            from scrcpycontrol.config_manager import ConfigManager, OWNER_DISPLAY_MANAGER
+            ConfigManager.get(config_path=self.config_path).set_owner(OWNER_DISPLAY_MANAGER)
+        except Exception as e:
+            print(f"[DisplayManager] WARNING: set_owner failed: {e}", flush=True)
+
         if scrcpy_path is None:
             scrcpy_path = self._find_scrcpy()
         self.scrcpy_path = scrcpy_path
@@ -119,22 +126,32 @@ class DisplayManager:
         return None
 
     def load_config(self):
-        """Load display configuration from JSON file."""
-        if self._config is None:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                self._config = json.load(f)
+        """Load display configuration from JSON file.
+
+        唯一真相源：ConfigManager 单例。
+        self._config 直接绑定单例内部缓存对象的引用 → 后续原地修改 app_displays /
+        main_display 等节就是直接刷新 ConfigManager 缓存，由 ConfigManager 统一写磁盘。
+        """
+        from scrcpycontrol.config_manager import ConfigManager
+        mgr = ConfigManager.get(config_path=self.config_path)
+        self._config = mgr.get_config_object()
         return self._config
 
     def reload_config(self):
-        """Force reload configuration from file."""
-        self._config = None
-        return self.load_config()
+        """Force reload configuration from disk (覆盖当前缓存)。"""
+        from scrcpycontrol.config_manager import ConfigManager
+        mgr = ConfigManager.get(config_path=self.config_path)
+        self._config = mgr.reload(from_disk=True)
+        return self._config
 
     def save_config(self):
-        """Save current configuration back to JSON file."""
-        if self._config is not None:
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(self._config, f, ensure_ascii=False, indent=2)
+        """Save current configuration back to JSON file (立即写磁盘)。
+
+        真正的写逻辑由 ConfigManager 统一负责：写前自动与磁盘最新 JSON 合并、
+        原子写磁盘，不会覆盖 Qt 窗口或其他进程刚写入的新坐标/尺寸。
+        """
+        from scrcpycontrol.config_manager import ConfigManager
+        ConfigManager.get(config_path=self.config_path).save_now()
 
     @property
     def config(self):
@@ -937,6 +954,7 @@ class DisplayManager:
             app_cfg = cfg.get("app_displays", {}).get(app_package, {})
             if "nav_geometry" not in app_cfg:
                 app_cfg["nav_geometry"] = {}
+
             nav = app_cfg["nav_geometry"]
             nav["window_x"] = x
             nav["window_y"] = y

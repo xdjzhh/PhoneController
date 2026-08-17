@@ -36,7 +36,7 @@ app = Flask(__name__)
 # Global state
 main_display = None  # MainDisplay instance
 main_display_running = False
-app_displays = {}  # {app_package: display_info}  # TODO: remove after migration
+app_displays = {}  # {app_package: display_info}  # runtime registry of app display metadata
 multi_display = None  # MultiVirtualDisplay instance
 app_display_map = {}  # {app_package: AppVirtualDisplay}
 screen_keyhot = None  # ScreenControlKeyHot instance
@@ -47,26 +47,34 @@ next_port = 8887
 
 
 def load_config():
-    """Load display configuration from JSON file (called once at startup)."""
+    """Load configuration from JSON file.
+
+    唯一真相源：ConfigManager 单例。
+    全局 config 直接绑定单例内部缓存对象的引用 → 后续原地修改就是直接刷新
+    ConfigManager 缓存，由 ConfigManager 统一写磁盘。
+    """
     global config_path, config
+    from scrcpycontrol.config_manager import ConfigManager
     if config_path is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, "display_config.json")
-    
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = json.load(f)
+    mgr = ConfigManager.get(config_path=config_path)
+    config = mgr.get_config_object()
     return config
 
 
 def save_config():
-    """Save current in-memory configuration back to JSON file."""
+    """Save current in-memory configuration back to JSON file (立即写磁盘)。
+
+    真正的写逻辑由 ConfigManager 统一负责：写前自动与磁盘最新 JSON 合并、
+    原子写磁盘，不会覆盖 Qt 窗口或其他进程刚写入的新坐标/尺寸。
+    """
     global config_path, config
+    from scrcpycontrol.config_manager import ConfigManager
     if config_path is None:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(script_dir, "display_config.json")
-    
-    with open(config_path, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    ConfigManager.get(config_path=config_path).save_now()
 
 
 def find_scrcpy():

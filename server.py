@@ -450,6 +450,15 @@ def refresh_notifications():
 
 
 def main():
+    # ── Install console tee FIRST so every subsequent print/stderr message
+    #    appears BOTH in terminal AND in thinking log card window ──
+    try:
+        from front.console_tee import install_console_tee
+        install_console_tee()
+    except Exception as _tee_err:
+        # Never let the tee bootstrap crash server startup
+        print(f"[server] console_tee install skipped: {_tee_err}", flush=True)
+
     parser = argparse.ArgumentParser(description='Phone Agent HTTP Server')
     parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
     parser.add_argument('--port', type=int, default=8080, help='Port to listen on')
@@ -524,13 +533,15 @@ def main():
         print(f"   ✅ Qt Linux dark backdrop active — virtual cards float above")
         if backdrop_manager.notification_hwnd:
             print(f"   ✅ macOS-style notification panel active (auto-refreshes via ADB)")
+        if getattr(backdrop_manager, 'thinking_hwnd', 0):
+            print(f"   ✅ Thinking log panel active — mirrors this terminal (same manager as notification)")
     else:
         print(f"   ⚠️  Backdrop disabled — cards float over regular desktop")
-    print(f"\n🖱️  Window controls:")
+    print(f"\n🖱️  Window controls (Notification panel + Thinking log panel: identical behavior):")
     print(f"   🟥 Red button    → Close window")
     print(f"   🟨 Yellow button → Minimize")
     print(f"   🟩 Green button  → Pin/fix window (hide controls)")
-    print(f"   🖱️  Right-click (on pinned card) → Re-enter edit mode")
+    print(f"   🛠️  Dock toolbar  → Toggle edit mode on BOTH notification + scrcpy cards")
     print(f"\nPress Ctrl+C to stop")
 
     try:

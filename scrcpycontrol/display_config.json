@@ -12,21 +12,33 @@
     "video_codec": "h264",
     "keep_active": true,
     "turn_screen_off": true,
-    "stay_awake": true
+    "stay_awake": true,
+    "_owner": "display_manager"
   },
   "notification_panel": {
     "window_title": "通知",
-    "window_x": 2,
-    "window_y": 425,
+    "window_x": -6,
+    "window_y": 355,
     "window_width": 280,
-    "window_height": 520,
-    "default_opacity": 1.0
+    "window_height": 277,
+    "default_opacity": 1.0,
+    "_owner": "backdrop_manager"
+  },
+  "thinking_log": {
+    "window_title": "思考步骤",
+    "window_x": -12,
+    "window_y": 675,
+    "window_width": 320,
+    "window_height": 180,
+    "default_opacity": 0.95,
+    "max_blocks": 500,
+    "_owner": "backdrop_manager"
   },
   "app_displays": {
     "com.huawei.android.totemweather": {
       "window_title": "天气",
-      "window_x": 22,
-      "window_y": 0,
+      "window_x": 15,
+      "window_y": 7,
       "window_width": 283,
       "window_height": 382,
       "default_opacity": 1.0,
@@ -37,7 +49,8 @@
       "bitrate": "2M",
       "video_codec": "h264",
       "keep_active": true,
-      "stay_awake": true
+      "stay_awake": true,
+      "_owner": "display_manager"
     },
     "com.tencent.mm": {
       "window_title": "微信",
@@ -52,7 +65,8 @@
       "bitrate": "8M",
       "video_codec": "h264",
       "keep_active": true,
-      "stay_awake": true
+      "stay_awake": true,
+      "_owner": "display_manager"
     },
     "com.ss.android.ugc.aweme": {
       "window_title": "抖音",
@@ -67,12 +81,13 @@
       "bitrate": "8M",
       "video_codec": "h264",
       "keep_active": true,
-      "stay_awake": true
+      "stay_awake": true,
+      "_owner": "display_manager"
     },
     "com.autonavi.minimap": {
       "window_title": "高德地图",
-      "window_x": 1355,
-      "window_y": 16,
+      "window_x": 1381,
+      "window_y": 30,
       "window_width": 521,
       "window_height": 293,
       "default_opacity": 1.0,
@@ -92,7 +107,8 @@
       "bitrate": "8M",
       "video_codec": "h264",
       "keep_active": true,
-      "stay_awake": true
+      "stay_awake": true,
+      "_owner": "display_manager"
     },
     "com.baidu.BaiduMap": {
       "window_title": "百度地图",
@@ -110,7 +126,8 @@
       "bitrate": "8M",
       "video_codec": "h264",
       "keep_active": true,
-      "stay_awake": true
+      "stay_awake": true,
+      "_owner": "display_manager"
     }
   }
 }

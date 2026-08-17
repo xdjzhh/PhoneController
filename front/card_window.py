@@ -1236,6 +1236,18 @@ class WindowsCardDecorator:
                 card = self._card_from_lparam(lParam)
                 if card:
                     self._destroy_overlay(card)
+                    # Clean up the card pointer reference now that the windows
+                    # are actually destroyed (matches the card object lifetime
+                    # and prevents a subtle "traffic lights remain on desktop"
+                    # race when unregister_window runs on a worker thread).
+                    self._card_ptrs.pop(id(card), None)
+                else:
+                    # Extra safeguard: if we somehow can't find the card anymore
+                    # (very rare) but the caller still passed a valid overlay
+                    # hwnd via lparam upper bits etc., try to destroy any
+                    # layered windows whose parent info we've lost. Normally
+                    # unreachable, but safe to clean up pointer dict orphans.
+                    self._card_ptrs.pop(int(lParam), None)
                 return 0
             elif msg_val == WM_TUI_SHOWHIDE:
                 card = self._card_from_lparam(lParam)
@@ -1891,7 +1903,21 @@ class WindowsCardDecorator:
         if scrcpy_hwnd not in self._cards:
             return
         card = self._cards.pop(scrcpy_hwnd)
-        self._card_ptrs.pop(id(card), None)
+        # ═══════════════════════════════════════════════════════════════
+        # BUG FIX: do NOT pop card from _card_ptrs here (before UI thread
+        # has processed the destroy message). unregister_window runs on a
+        # worker thread, while _destroy_overlay must run on the UI thread
+        # (async PostMessage). If we pop _card_ptrs eagerly here, by the
+        # time the UI thread receives WM_TUI_DESTROYOVERLAY and calls
+        # _card_from_lparam, the card will already be gone from the dict
+        # and _destroy_overlay will never run → overlay/traffic lights
+        # stick forever on the desktop.
+        #
+        # Instead: only remove it from _cards here (so nobody can look the
+        # card up by hwnd anymore), and leave _card_ptrs intact so the UI
+        # thread can still find the card. The UI thread will clean up
+        # _card_ptrs after it has actually destroyed the windows.
+        # ═══════════════════════════════════════════════════════════════
         self._post_ui(WM_TUI_DESTROYOVERLAY, card=card)
         if self._active_card == card:
             self._active_card = None

@@ -1,23 +1,57 @@
-Pillow>=12.0.0
-openai>=2.9.0
+# Open-AutoGLM Dependencies
+# Compatible with Python 3.10 (C:\Users\DELL\AppData\Local\Programs\Python\Python310)
+# NOTE: All comments are ASCII-only to avoid Windows GBK vs UTF-8 decoding errors in pip.
 
-# For iOS Support
-requests>=2.31.0
+# ===== GUI (Qt) =====
+PySide6==6.11.1
+PySide6_Essentials==6.11.1
+PySide6_Addons==6.11.1
+pywin32==311
 
-# For Server Mode
-flask>=3.0.0
+# ===== Vision / Image Processing =====
+Pillow==12.3.0
+opencv-python==5.0.0.93
+# numpy 2.3.x requires Python>=3.11; max supported on Python 3.10 is 2.2.6
+numpy==2.2.6
 
-# For Model Deployment
+# ===== Automation (ADB / Input) =====
+adbutils==0.14.1
+pyautogui==0.9.54
+# NOTE: PyAV must be installed as a pre-built wheel (never compile from source
+# on Windows as it requires FFmpeg dev libs). This works on Python 3.10:
+#   python -m pip install --user --only-binary :all: "av==17.1.0"
+av==17.1.0
+# NOTE: scrcpy-client is split-installed because:
+#   (1) PyPI scrcpy-client 0.4.x metadata requires `av<10,>=9`, which forces
+#       a source build of PyAV 9.x that is BROKEN on Python 3.10 + modern
+#       Cython (noexcept mismatch in av/logging.pyx).
+#   (2) scrcpy/core.py imports `AdbConnection` from adbutils, but this class
+#       was REMOVED in adbutils 0.14+.  We need a 1-line post-install patch.
+#
+# --- OPTION A (fast, if a working Python 3.13 env exists nearby) ---
+# Copy three pure-Python folders from Py3.13's Lib/site-packages into
+# Py3.10's USER site-packages (see SCREEN_OFF_FALLBACK.md Section 5):
+#   - scrcpy/
+#   - scrcpy_client-0.4.1.dist-info/
+#   - scrcpy_ui/
+#
+# --- OPTION B (self-contained, NO Py3.13 required, RECOMMENDED for new hosts) ---
+# Step B1: install scrcpy-client without deps (bypasses the broken av<10 pin):
+#   python -m pip install --user --no-deps scrcpy-client==0.4.7
+# Step B2: patch scrcpy/core.py import line 11 (replace dead AdbConnection
+#          with adbutils 0.14+ compatible _AdbStreamConnection).  Either run
+#          the auto-patch script in SCREEN_OFF_FALLBACK.md Section 5b, or
+#          manually change line 11 to:
+#   from adbutils import AdbDevice, AdbError, Network, _AdbStreamConnection, adb
+# Step B3: validate import works:
+#   python -c "import scrcpy, av; print(scrcpy.POWER_MODE_OFF, scrcpy.POWER_MODE_NORMAL)"
 
-## After installing sglang or vLLM, please run pip install -U transformers again to upgrade to 5.0.0rc0.
-## Any dependency conflicts related to Transformers can be ignored.
+# ===== Server / Network =====
+Flask==3.1.3
+requests==2.32.5
 
-# sglang>=0.5.6.post1
-# vllm>=0.12.0
-# transformers>=5.0.0rc0
+# ===== LLM SDK =====
+openai==2.32.0
 
-# Optional: for development
-# pytest>=7.0.0
-# pre-commit>=4.5.0
-# black>=23.0.0
-# mypy>=1.0.0
+# ===== Packaging / Utils =====
+setuptools==80.9.0

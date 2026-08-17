@@ -26,6 +26,10 @@ ENV/
 env/
 .venv/
 
+# Project-local Python dependency tree (installed via pip --target to avoid
+# needing system site-packages write permission; see server.py sys.path patch)
+_pydeps/
+
 # IDE
 .idea/
 .vscode/

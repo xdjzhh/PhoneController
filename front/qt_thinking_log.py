@@ -32,10 +32,15 @@ if os.name == 'nt':
     GWL_EXSTYLE = -20
     WS_CLIPSIBLINGS = 0x04000000
     WS_CLIPCHILDREN = 0x02000000
+    WS_POPUP = 0x80000000
     WS_DISABLED = 0x08000000
     WS_THICKFRAME = 0x00040000
     WS_MINIMIZEBOX = 0x00020000
     WS_MAXIMIZEBOX = 0x00010000
+    WS_BORDER = 0x00800000
+    WS_DLGFRAME = 0x00400000
+    WS_CAPTION = WS_BORDER | WS_DLGFRAME  # 0x00C00000  —— 系统标题栏（窗口头）样式位，必须强制清掉
+    WS_SYSMENU = 0x00080000
     WS_EX_TOOLWINDOW = 0x00000080
     WS_EX_NOACTIVATE = 0x08000000
     WS_EX_NOPARENTNOTIFY = 0x00000004
@@ -50,6 +55,12 @@ if os.name == 'nt':
     SWP_NOOWNERZORDER = 0x0200
     SWP_FRAMECHANGED = 0x0020
     SWP_SHOWWINDOW = 0x0040
+    # Windows 消息：resize / move 循环结束、样式改变时会触发
+    WM_CREATE = 0x0001
+    WM_SHOWWINDOW = 0x0018
+    WM_ENTERSIZEMOVE = 0x0231
+    WM_EXITSIZEMOVE = 0x0232
+    WM_STYLECHANGED = 0x007D
 
     class ACCENT_POLICY(ctypes.Structure):
         _fields_ = [
@@ -436,12 +447,9 @@ def create_thinking_log_panel(
         def resizeEvent(self, event):
             super().resizeEvent(event)
             w, h = self.width(), self.height()
-            if self._editing:
-                log_y = CHROME_H
-                log_h = h - CHROME_H
-            else:
-                log_y = 0
-                log_h = h
+            # 完全删掉 title 区域，内容顶到最上面（红绿灯浮在左上角覆盖即可，不再让位）
+            log_y = 0
+            log_h = h
             self._log_view.setGeometry(0, log_y, w, log_h)
             # Request a geometry save (debounced)
             self._geometry_save_timer.start()
@@ -474,8 +482,10 @@ def create_thinking_log_panel(
                 user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_EXSTYLE, new_ex)
 
                 style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE)
-                new_style = style | WS_CLIPSIBLINGS | WS_CLIPCHILDREN
-                new_style &= ~(WS_DISABLED | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+                new_style = style | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_POPUP
+                # 强制清掉：标题栏、边框、系统菜单、缩放/最小化/最大化框、禁用状态
+                new_style &= ~(WS_CAPTION | WS_BORDER | WS_DLGFRAME | WS_SYSMENU
+                               | WS_DISABLED | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
                 user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE, new_style)
 
                 _apply_acrylic_blur(hwnd, color=PANEL_ACCENT_COLOR)
@@ -494,11 +504,13 @@ def create_thinking_log_panel(
             self._apply_style()
 
         def nativeEvent(self, eventType, message):
+            """仅处理窗口创建/显示的样式刷新。
+            绝对不监听 WM_STYLECHANGED！（SetWindowPos(FRAMECHANGED) 会主动触发，
+            监了就会死循环 → 耗尽 Qt 定时器句柄）。
+            """
             try:
                 if os.name == 'nt' and eventType == b"windows_generic_MSG":
                     msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
-                    WM_CREATE = 0x0001
-                    WM_SHOWWINDOW = 0x0018
                     if msg.message == WM_CREATE:
                         QTimer.singleShot(0, self._apply_style)
                     elif msg.message == WM_SHOWWINDOW:
@@ -523,23 +535,7 @@ def create_thinking_log_panel(
             p.fillPath(path, PANEL_FILL)
 
             if self._editing:
-                # Chrome title bar separator
-                p.setPen(QPen(QColor(255, 255, 255, 18), 1))
-                p.drawLine(10, CHROME_H - 1, w - 10, CHROME_H - 1)
-
-                # Title (right-aligned, like macOS window titles)
-                title_font = QFont()
-                title_font.setPointSize(10)
-                title_font.setBold(True)
-                p.setFont(title_font)
-                p.setPen(TEXT_SECONDARY)
-                p.drawText(
-                    QRect(10, 0, w - 10, CHROME_H),
-                    Qt.AlignVCenter | Qt.AlignCenter,
-                    self._win_title,
-                )
-
-                # Traffic lights
+                # Traffic lights（只保留红绿灯，其他 title 绘制：横线、居中标题、line count badge 全部删除）
                 for i in range(3):
                     colors = [TRAFFIC_CLOSE, TRAFFIC_MIN, TRAFFIC_MAX]
                     h_colors = [TRAFFIC_CLOSE_H, TRAFFIC_MIN_H, TRAFFIC_MAX_H]
@@ -563,22 +559,6 @@ def create_thinking_log_panel(
                         gf.setBold(True)
                         p.setFont(gf)
                         p.drawText(QRect(bx, by - 1, 12, 14), Qt.AlignCenter, g)
-
-                # Line count badge
-                try:
-                    n = self._log_view.document().blockCount()
-                except Exception:
-                    n = 0
-                if n:
-                    cf = QFont()
-                    cf.setPointSize(9)
-                    p.setFont(cf)
-                    p.setPen(TEXT_TERTIARY)
-                    p.drawText(
-                        QRect(10, 0, w - 10, CHROME_H),
-                        Qt.AlignVCenter | Qt.AlignRight,
-                        f"{n} 行",
-                    )
 
             p.end()
 
@@ -700,10 +680,14 @@ def create_thinking_log_panel(
             super().mouseMoveEvent(event)
 
         def mouseReleaseEvent(self, event):
+            was_resizing = (self._drag_mode != self.NONE)
             self._drag_mode = self.NONE
             self._drag_start = None
             self._drag_start_geom = None
             super().mouseReleaseEvent(event)
+            if was_resizing:
+                # resize/move 拖拽刚结束 → 立即重刷一次样式，确保系统没有留下窗口头
+                self._apply_style()
 
         def _do_resize(self, gpos):
             if self._drag_start_geom is None:

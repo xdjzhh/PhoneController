@@ -104,14 +104,49 @@ class DisplayManager:
         raise FileNotFoundError("scrcpy not found.")
 
     def _detect_device(self):
-        """Detect first connected ADB device."""
+        """Detect first connected ADB device.
+        If no device is found, print a full, actionable Chinese diagnostic so the
+        user understands exactly why scrcpy 4.1 later reports "Could not find any
+        ADB device" and what to do next.
+        """
         try:
             import adbutils
             devices = adbutils.adb.device_list()
             if devices:
+                print(f"[DisplayManager] ADB 检测到 {len(devices)} 台设备，使用: {devices[0].serial}")
                 return devices[0].serial
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DisplayManager] 警告: ADB 设备枚举异常: {e}")
+
+        # --- No ADB device found.  Print a human-readable fix guide immediately ---
+        print("=" * 78, flush=True)
+        print("[DisplayManager] ❌ 未检测到任何 ADB 设备 → scrcpy 4.1 必然报错：", flush=True)
+        print("                  ERROR: Could not find any ADB device", flush=True)
+        print("                  ERROR: Server connection failed", flush=True)
+        print("", flush=True)
+        print("请按下列【按场景分步骤】修复，完成后再次运行 `adb devices` 确认列表有设备：", flush=True)
+        print("", flush=True)
+        print("  场景 A : 真机用 USB 线连接 (推荐)", flush=True)
+        print("    ① 手机: 设置 → 关于手机 → 连点 7 次「版本号」开启开发者选项", flush=True)
+        print("    ② 手机: 设置 → 开发者选项 → 打开【USB 调试】", flush=True)
+        print("    ③ 电脑: 换一根支持「数据传输」的 USB 线 (纯充电线不行)", flush=True)
+        print("    ④ 插上后手机会弹【允许 USB 调试】，必须勾选「始终允许」→ 确定", flush=True)
+        print("", flush=True)
+        print("  场景 B : 本地模拟器 (夜神/雷电/MuMu/逍遥/Hyper-V 安卓模拟器)", flush=True)
+        print("    模拟器必须先手动执行 ADB 连接命令 (按模拟器端口查官方文档，常见端口：", flush=True)
+        print("      夜神 127.0.0.1:62001  雷电 127.0.0.1:5555  MuMu 127.0.0.1:7555", flush=True)
+        print("      逍遥 127.0.0.1:21503  BlueStacks 127.0.0.1:5555)", flush=True)
+        print("    示例: adb connect 127.0.0.1:5555", flush=True)
+        print("", flush=True)
+        print("  场景 C : 无线调试 (Wifi ADB)", flush=True)
+        print("    先让手机和电脑在同一 Wi-Fi，手机开发者选项里打开「无线调试」→", flush=True)
+        print("    配对码配对: adb pair <ip>:<pair_port> → adb connect <ip>:<debug_port>", flush=True)
+        print("", flush=True)
+        print("  万能修复（adb server 卡住时立即执行）:", flush=True)
+        print("    adb kill-server", flush=True)
+        print("    adb start-server", flush=True)
+        print("    adb devices  <-- 此时 List of devices attached 下方必须至少有一行", flush=True)
+        print("=" * 78, flush=True)
         return None
 
     def _get_adb_device(self):
@@ -177,6 +212,15 @@ class DisplayManager:
                 "message": "Main display already running",
                 "display_type": "main",
             }
+
+        # Early-fail: no ADB device detected -> scrcpy will 100% fail.
+        # Skip actually invoking scrcpy to avoid confusing stderr.
+        if not self.device_serial:
+            msg = (
+                "未检测到 ADB 设备，已跳过启动主屏（请按上面的诊断指南连接设备后重试）。"
+            )
+            print(f"[DisplayManager] ⚠️  {msg}", flush=True)
+            return {"success": False, "error": msg, "need_device": True}
 
         cfg = self.load_config()
         main_cfg = cfg.get("main_display", {})
@@ -399,6 +443,16 @@ class DisplayManager:
             win_desc = (f"{win_config.window_width}x{win_config.window_height}"
                         f"({'wide' if win_config.window_width >= win_config.window_height else 'tall'})")
 
+            # Early-fail: no ADB device detected -> scrcpy will 100% fail.
+            if not self.device_serial:
+                msg = (
+                    f"未检测到 ADB 设备，跳过创建 {app_package} 虚拟屏"
+                    "（请按启动时的诊断指南连接设备后重试）。"
+                )
+                print(f"[DisplayManager] ⚠️  {msg}", flush=True)
+                return {"success": False, "error": msg, "need_device": True,
+                        "display_type": "virtual", "app_package": app_package}
+
             mvd = self._get_multi_display()
 
             try:
@@ -581,47 +635,71 @@ class DisplayManager:
             return False, str(e)
 
     def screen_off(self):
-        """
-        Turn off the physical screen via scrcpy-client.
+        """Turn OFF the physical screen backlight only.
 
-        Only turns off the backlight, does not trigger lock screen.
+        Strictly uses scrcpy-client POWER_MODE_OFF which is the ONLY method
+        that guarantees "only turn backlight off, never relock the device".
+        Any failure (scrcpy-client missing, connection timeout, etc.) is
+        caught and converted to a non-fatal dict result so the caller
+        (ScreenMonitor) can continue without crashing the process.
 
-        Returns:
-            Dict with success status.
+        This matches the original behavior in Python 3.13 exactly.
         """
         try:
-            import scrcpy
+            try:
+                import scrcpy
+            except ImportError as e_im:
+                return {
+                    "success": False,
+                    "error": f"scrcpy-client not installed: {e_im}. Run: pip install scrcpy-client",
+                    "method": "scrcpy_client",
+                }
+
             success, message = self._set_screen_power_mode(scrcpy.POWER_MODE_OFF)
             return {
                 "success": success,
                 "message": message,
-                "method": "scrcpy_client" if success else "failed",
+                "method": "scrcpy_client",
             }
-        except ImportError:
+        except Exception as e:
+            # CRITICAL: Never let screen_off throw — it runs inside the
+            # background ScreenMonitor thread and must not kill the process.
+            print(f"[ScreenPower] screen_off suppressed exception (non-fatal): {type(e).__name__}: {e}")
             return {
                 "success": False,
-                "error": "scrcpy-client not installed. Run: pip install scrcpy-client",
+                "error": f"{type(e).__name__}: {e}",
+                "method": "scrcpy_client",
             }
 
     def screen_on(self):
-        """
-        Turn on the physical screen via scrcpy-client.
+        """Turn ON the physical screen backlight.
 
-        Returns:
-            Dict with success status.
+        Uses scrcpy-client POWER_MODE_NORMAL only (matches original Py313
+        implementation exactly).  Any failure is swallowed and returned as
+        a dict so process stability is guaranteed.
         """
         try:
-            import scrcpy
+            try:
+                import scrcpy
+            except ImportError as e_im:
+                return {
+                    "success": False,
+                    "error": f"scrcpy-client not installed: {e_im}. Run: pip install scrcpy-client",
+                    "method": "scrcpy_client",
+                }
+
             success, message = self._set_screen_power_mode(scrcpy.POWER_MODE_NORMAL)
             return {
                 "success": success,
                 "message": message,
-                "method": "scrcpy_client" if success else "failed",
+                "method": "scrcpy_client",
             }
-        except ImportError:
+        except Exception as e:
+            print(f"[ScreenPower] screen_on suppressed exception (non-fatal): {type(e).__name__}: {e}")
             return {
                 "success": False,
-                "error": "scrcpy-client not installed. Run: pip install scrcpy-client",
+                "error": f"{type(e).__name__}: {e}",
+                "method": "scrcpy_client",
             }
 
     def _is_keyguard_locked(self, device=None, verbose=False):
@@ -1316,9 +1394,15 @@ class DisplayManager:
                         print("[ScreenMonitor] Screen unlocked successfully")
                         print("[ScreenMonitor] Turning off physical screen after unlock...")
                         try:
-                            self.screen_off()
+                            result = self.screen_off()
+                            if result.get("success"):
+                                print(f"[ScreenMonitor] ✅ Turned off physical screen OK: method={result.get('method')}, chain={result.get('methods_used')}")
+                            else:
+                                print(f"[ScreenMonitor] ❌ Failed to turn off physical screen: {result.get('error') or result.get('message')}, chain={result.get('methods_used')}")
                         except Exception as e:
-                            print(f"[ScreenMonitor] Failed to turn off screen after unlock: {e}")
+                            print(f"[ScreenMonitor] Failed to turn off screen after unlock (exception): {e}")
+                            import traceback
+                            traceback.print_exc()
                     else:
                         print("[ScreenMonitor] Unlock may have failed - retrying on next cycle")
 

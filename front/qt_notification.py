@@ -38,6 +38,10 @@ if os.name == 'nt':
     WS_THICKFRAME = 0x00040000
     WS_MINIMIZEBOX = 0x00020000
     WS_MAXIMIZEBOX = 0x00010000
+    WS_BORDER = 0x00800000
+    WS_DLGFRAME = 0x00400000
+    WS_CAPTION = WS_BORDER | WS_DLGFRAME  # 0x00C00000  —— 系统标题栏（窗口头）样式位，必须强制清掉
+    WS_SYSMENU = 0x00080000
     WS_EX_TOOLWINDOW = 0x00000080
     WS_EX_NOACTIVATE = 0x08000000
     WS_EX_NOPARENTNOTIFY = 0x00000004
@@ -54,6 +58,12 @@ if os.name == 'nt':
     SWP_SHOWWINDOW = 0x0040
     DWMWA_WINDOW_CORNER_PREFERENCE = 33
     DWMWCP_ROUND = 2
+    # Windows 消息：resize / move 循环结束、样式改变时会触发
+    WM_CREATE = 0x0001
+    WM_SHOWWINDOW = 0x0018
+    WM_ENTERSIZEMOVE = 0x0231
+    WM_EXITSIZEMOVE = 0x0232
+    WM_STYLECHANGED = 0x007D
 
     class ACCENT_POLICY(ctypes.Structure):
         _fields_ = [
@@ -674,12 +684,9 @@ def create_notification_window(config=None, config_path=None):
         def resizeEvent(self, event):
             super().resizeEvent(event)
             w, h = self.width(), self.height()
-            if self._editing:
-                scroll_y = CHROME_H
-                scroll_h = h - CHROME_H
-            else:
-                scroll_y = 0
-                scroll_h = h
+            # 完全删掉 title 区域，内容顶到最上面（红绿灯浮在左上角覆盖即可，不再让位）
+            scroll_y = 0
+            scroll_h = h
             self._scroll.setGeometry(0, scroll_y, w, scroll_h)
             # Request a geometry save (debounced) — 与 ThinkingLogWindow 行为完全一致
             self._geometry_save_timer.start()
@@ -700,6 +707,8 @@ def create_notification_window(config=None, config_path=None):
         def _apply_style(self):
             """Minimal Win32 style: topmost, noactivate, toolwindow, acrylic blur.
             Does NOT intercept any mouse/keyboard messages - Qt handles all events.
+            【最小必要改动】：清掉 WS_CAPTION/WS_BORDER/WS_DLGFRAME/WS_SYSMENU，
+            确保无论何时都不会出现系统窗口头（title bar）。
             """
             if os.name != 'nt':
                 return
@@ -713,8 +722,10 @@ def create_notification_window(config=None, config_path=None):
                 user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_EXSTYLE, new_ex)
 
                 style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE)
-                new_style = style | WS_CLIPSIBLINGS | WS_CLIPCHILDREN
-                new_style &= ~(WS_DISABLED | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+                new_style = style | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_POPUP
+                # 强制清掉：标题栏、边框、系统菜单、缩放/最小化/最大化框、禁用状态
+                new_style &= ~(WS_CAPTION | WS_BORDER | WS_DLGFRAME | WS_SYSMENU
+                               | WS_DISABLED | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
                 user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE, new_style)
 
                 _apply_acrylic_blur(hwnd, color=0x00000000)
@@ -731,15 +742,14 @@ def create_notification_window(config=None, config_path=None):
             self._apply_style()
 
         def nativeEvent(self, eventType, message):
-            """Only handle window creation/style refresh messages.
+            """Only handle window creation/show style refresh.
             Do NOT intercept mouse/keyboard events - let Qt process them normally.
-            This is the KEY fix: returning super() lets Qt handle close/minimize properly.
+            绝对不监听 WM_STYLECHANGED！（SetWindowPos(FRAMECHANGED) 会主动触发它，
+            监了就会样式刷新死循环 → 耗尽 Qt 定时器句柄）。
             """
             try:
                 if os.name == 'nt' and eventType == b"windows_generic_MSG":
                     msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
-                    WM_CREATE = 0x0001
-                    WM_SHOWWINDOW = 0x0018
                     if msg.message == WM_CREATE:
                         QTimer.singleShot(0, self._apply_style)
                     elif msg.message == WM_SHOWWINDOW:
@@ -776,13 +786,6 @@ def create_notification_window(config=None, config_path=None):
                         gf.setBold(True)
                         p.setFont(gf)
                         p.drawText(QRect(bx, by - 1, 12, 14), Qt.AlignCenter, g)
-
-                if self._notifs:
-                    cf = QFont()
-                    cf.setPointSize(9)
-                    p.setFont(cf)
-                    p.setPen(TEXT_TERTIARY)
-                    p.drawText(QRect(10, 0, w - 20, CHROME_H), Qt.AlignVCenter | Qt.AlignRight, f"{len(self._notifs)} 条通知")
 
             p.end()
 
@@ -900,10 +903,14 @@ def create_notification_window(config=None, config_path=None):
             super().mouseMoveEvent(event)
 
         def mouseReleaseEvent(self, event):
+            was_resizing = (self._drag_mode != self.NONE)
             self._drag_mode = self.NONE
             self._drag_start = None
             self._drag_start_geom = None
             super().mouseReleaseEvent(event)
+            if was_resizing:
+                # resize/move 拖拽刚结束 → 立即重刷一次样式，确保系统没有留下窗口头
+                self._apply_style()
 
         def _do_resize(self, gpos):
             if self._drag_start_geom is None:

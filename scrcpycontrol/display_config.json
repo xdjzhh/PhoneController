@@ -17,10 +17,10 @@
   },
   "notification_panel": {
     "window_title": "通知",
-    "window_x": -6,
-    "window_y": 355,
+    "window_x": -10,
+    "window_y": 342,
     "window_width": 280,
-    "window_height": 277,
+    "window_height": 301,
     "default_opacity": 1.0,
     "_owner": "backdrop_manager"
   },

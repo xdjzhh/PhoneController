@@ -219,6 +219,13 @@ def start_main_display():
     
     cfg = load_config()
     main_cfg = cfg.get('main_display', {})
+
+    # ── default_load 开关 (用户需求：default_load=false 不创建窗口卡片) ──
+    default_load = bool(main_cfg.get("default_load", True))
+    if not default_load:
+        print("[Main] ⏭️  main_display.default_load=false → SKIP starting main display "
+              "(no window card created)", flush=True)
+        return
     
     scrcpy_path = find_scrcpy()
     port = next_port

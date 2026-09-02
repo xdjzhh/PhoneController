@@ -1,5 +1,26 @@
 {
   "lock_password": "666666",
+  "notification_panel": {
+    "window_title": "通知",
+    "window_x": 19,
+    "window_y": 362,
+    "window_width": 280,
+    "window_height": 301,
+    "default_opacity": 1.0,
+    "default_load": true,
+    "_owner": "backdrop_manager"
+  },
+  "thinking_log": {
+    "window_title": "思考步骤",
+    "window_x": 28,
+    "window_y": 702,
+    "window_width": 320,
+    "window_height": 180,
+    "default_opacity": 0.95,
+    "max_blocks": 500,
+    "default_load": true,
+    "_owner": "backdrop_manager"
+  },
   "main_display": {
     "window_title": "手机桌面",
     "window_x": 1625,
@@ -13,26 +34,8 @@
     "keep_active": true,
     "turn_screen_off": true,
     "stay_awake": true,
+    "default_load": true,
     "_owner": "display_manager"
-  },
-  "notification_panel": {
-    "window_title": "通知",
-    "window_x": -10,
-    "window_y": 342,
-    "window_width": 280,
-    "window_height": 301,
-    "default_opacity": 1.0,
-    "_owner": "backdrop_manager"
-  },
-  "thinking_log": {
-    "window_title": "思考步骤",
-    "window_x": -12,
-    "window_y": 675,
-    "window_width": 320,
-    "window_height": 180,
-    "default_opacity": 0.95,
-    "max_blocks": 500,
-    "_owner": "backdrop_manager"
   },
   "app_displays": {
     "com.huawei.android.totemweather": {
@@ -50,6 +53,7 @@
       "video_codec": "h264",
       "keep_active": true,
       "stay_awake": true,
+      "default_load": true,
       "_owner": "display_manager"
     },
     "com.tencent.mm": {
@@ -66,6 +70,7 @@
       "video_codec": "h264",
       "keep_active": true,
       "stay_awake": true,
+      "default_load": false,
       "_owner": "display_manager"
     },
     "com.ss.android.ugc.aweme": {
@@ -82,6 +87,7 @@
       "video_codec": "h264",
       "keep_active": true,
       "stay_awake": true,
+      "default_load": false,
       "_owner": "display_manager"
     },
     "com.autonavi.minimap": {
@@ -108,25 +114,7 @@
       "video_codec": "h264",
       "keep_active": true,
       "stay_awake": true,
-      "_owner": "display_manager"
-    },
-    "com.baidu.BaiduMap": {
-      "window_title": "百度地图",
-      "window_x": 60,
-      "window_y": 620,
-      "window_width": 960,
-      "window_height": 540,
-      "default_opacity": 1.0,
-      "new_display_width": 1260,
-      "new_display_height": 2844,
-      "wide_new_display_width": 1920,
-      "wide_new_display_height": 1080,
-      "wide_new_display_dpi": 320,
-      "max_fps": 60,
-      "bitrate": "8M",
-      "video_codec": "h264",
-      "keep_active": true,
-      "stay_awake": true,
+      "default_load": true,
       "_owner": "display_manager"
     }
   }

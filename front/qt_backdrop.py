@@ -673,35 +673,49 @@ def _run_backdrop_process(pipe_conn, config_path=None):
     
         notif_window = None
         if create_notification_window and notif_cfg:
-            try:
-                notif_window = create_notification_window(config=notif_cfg, config_path=config_path)
-                if notif_window:
-                    notif_window.show()
-                    QTimer.singleShot(100, notif_window._apply_style)
-                    QTimer.singleShot(500, notif_window._apply_style)
-                    print("[QtBackdrop] Notification panel created", flush=True)
-            except Exception as e:
-                print(f"[QtBackdrop] Failed to create notification panel: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
+            # ── default_load 开关：default_load=false 时不创建通知面板窗口卡片 ──
+            notif_default_load = bool(notif_cfg.get("default_load", True))
+            if not notif_default_load:
+                print("[QtBackdrop] ⏭️  notification_panel.default_load=false "
+                      "→ SKIP creating notification window", flush=True)
                 notif_window = None
+            else:
+                try:
+                    notif_window = create_notification_window(config=notif_cfg, config_path=config_path)
+                    if notif_window:
+                        notif_window.show()
+                        QTimer.singleShot(100, notif_window._apply_style)
+                        QTimer.singleShot(500, notif_window._apply_style)
+                        print("[QtBackdrop] Notification panel created", flush=True)
+                except Exception as e:
+                    print(f"[QtBackdrop] Failed to create notification panel: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    notif_window = None
     
         thinking_window = None
         if create_thinking_log_panel and thinking_cfg:
-            try:
-                thinking_window = create_thinking_log_panel(
-                    config=thinking_cfg, cfg_path=config_path
-                )
-                if thinking_window:
-                    thinking_window.show()
-                    QTimer.singleShot(100, thinking_window._apply_style)
-                    QTimer.singleShot(500, thinking_window._apply_style)
-                    print("[QtBackdrop] Thinking log panel created", flush=True)
-            except Exception as e:
-                print(f"[QtBackdrop] Failed to create thinking panel: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
+            # ── default_load 开关：default_load=false 时不创建思考日志窗口卡片 ──
+            thinking_default_load = bool(thinking_cfg.get("default_load", True))
+            if not thinking_default_load:
+                print("[QtBackdrop] ⏭️  thinking_log.default_load=false "
+                      "→ SKIP creating thinking log window", flush=True)
                 thinking_window = None
+            else:
+                try:
+                    thinking_window = create_thinking_log_panel(
+                        config=thinking_cfg, cfg_path=config_path
+                    )
+                    if thinking_window:
+                        thinking_window.show()
+                        QTimer.singleShot(100, thinking_window._apply_style)
+                        QTimer.singleShot(500, thinking_window._apply_style)
+                        print("[QtBackdrop] Thinking log panel created", flush=True)
+                except Exception as e:
+                    print(f"[QtBackdrop] Failed to create thinking panel: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    thinking_window = None
     
         dock_window = None
         try:

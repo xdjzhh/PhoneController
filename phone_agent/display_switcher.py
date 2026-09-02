@@ -243,6 +243,145 @@ class DisplaySwitcher:
             return target
         return None
 
+    # ═══════════════════════════════════════════════════════════════════
+    # 关闭 APP 意图识别（等价于红绿灯 🔴 red-close 抽象独立方法，
+    # 完全仿照 detect_switch_intent 的模式实现；命中后由 PhoneAgent
+    # 在执行循环前置阶段直接处理，不依赖 AI 输出 Close action。）
+    # ═══════════════════════════════════════════════════════════════════
+
+    CLOSE_VERBS = [
+        "关闭",
+        "关掉",
+        "退出",
+        "停止",
+        "关了",
+        "结束",
+        "收起",
+        "缩小",
+        "关",       # 单字"关抖音"
+        "退",       # 单字"退抖音"
+        "关掉",
+        "关掉了",
+        "关闭了",
+        "停止运行",
+        "终止",
+        "杀掉",
+        "杀",
+        "结束掉",
+    ]
+
+    _APP_NAME_REGEX = None  # 懒初始化：所有 display_config 已配置 app window title + 同义词合并的正则
+
+    def _build_close_regex(self):
+        """把所有已配置 app 名 + 同义词合并构建一个大正则，用于抽"关闭XXX"里的 APP 名"""
+        if self._APP_NAME_REGEX is not None:
+            return self._APP_NAME_REGEX
+        self._load_app_list()
+        # 合并：display_config window_title + 包名 + APP_ALIASES 所有 key/value
+        candidates = set()
+        for _pkg, wt in (self._app_list or {}).items():
+            if wt:
+                candidates.add(wt)
+        for pkg in (self._app_list or {}).keys():
+            if pkg:
+                candidates.add(pkg)
+        for alias, title in self.APP_ALIASES.items():
+            if alias:
+                candidates.add(alias)
+            if title:
+                candidates.add(title)
+        # 从长到短排序，保证长词优先匹配（如"高德地图">"高德"）
+        sorted_names = sorted(candidates, key=len, reverse=True)
+        if not sorted_names:
+            self._APP_NAME_REGEX = re.compile(r"^$")  # 空占位
+        else:
+            escaped = [re.escape(n) for n in sorted_names if n]
+            self._APP_NAME_REGEX = re.compile("(" + "|".join(escaped) + ")")
+        return self._APP_NAME_REGEX
+
+    def detect_close_intent(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        检测文本中的「关闭目标应用」意图。
+        完全仿照 detect_switch_intent 的抽象方法模式，
+        用于 PhoneAgent 在执行循环前置阶段直接处理关闭命令。
+
+        Returns:
+            (target_type, target) 元组:
+            - target_type: "close_app" 表示命中关闭意图；None 表示无关闭意图
+            - target:      app 包名（当 target_type="close_app" 时），否则 None
+        """
+        if not text:
+            return None, None
+        self._load_app_list()
+        if not self._app_list:
+            return None, None
+
+        text = text.strip()
+        if not text:
+            return None, None
+
+        # ── Step 1: 文本里是否有任何「关闭动词」？ ──
+        has_close_verb = False
+        for v in self.CLOSE_VERBS:
+            if v in text:
+                has_close_verb = True
+                break
+        if not has_close_verb:
+            return None, None
+
+        # ── Step 2: 在「关闭动词 + 其他字符」里找 app 名 ──
+        # 2.1 遍历所有 display_config 已配置的 window_title + 包名
+        for pkg, wt in self._app_list.items():
+            for verb in self.CLOSE_VERBS:
+                if verb + wt in text or wt + verb in text:
+                    return "close_app", pkg
+                if verb + pkg in text:
+                    return "close_app", pkg
+
+        # 2.2 使用 APP_ALIASES 同义词（"关闭抖" → "抖音" → com.ss.android.ugc.aweme）
+        for alias, std_title in self.APP_ALIASES.items():
+            if not alias:
+                continue
+            for verb in self.CLOSE_VERBS:
+                if verb + alias in text or alias + verb in text:
+                    resolved_pkg = self._find_package_by_window_title(std_title)
+                    if resolved_pkg is not None:
+                        return "close_app", resolved_pkg
+
+        # 2.3 兜底正则：先找「关闭动词」，然后在其前后用大正则抽 app 名
+        #    支持句子顺序："关闭 高德地图 导航回家" / "把 抖音 关闭"
+        try:
+            name_re = self._build_close_regex()
+            m = name_re.search(text)
+            if m:
+                hit_name = m.group(1)
+                # 先看是不是包名本身
+                if self._app_list and hit_name in self._app_list:
+                    return "close_app", hit_name
+                # 否则 window_title → 包名
+                found = self._find_package_by_window_title(hit_name)
+                if found:
+                    return "close_app", found
+                # 再走一次同义词反查
+                std_title = self._resolve_alias_to_window_title(hit_name)
+                if std_title:
+                    found = self._find_package_by_window_title(std_title)
+                    if found:
+                        return "close_app", found
+        except Exception:
+            pass
+
+        return None, None
+
+    def is_close_app_intent(self, text: str) -> bool:
+        return self.detect_close_intent(text)[0] == "close_app"
+
+    def get_close_app_target(self, text: str) -> Optional[str]:
+        target_type, target = self.detect_close_intent(text)
+        if target_type == "close_app":
+            return target
+        return None
+
 
 _switcher = None
 

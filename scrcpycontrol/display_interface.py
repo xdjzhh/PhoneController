@@ -213,6 +213,23 @@ class DisplayManager:
                 "display_type": "main",
             }
 
+        cfg = self.load_config()
+        main_cfg = cfg.get("main_display", {})
+
+        # ── default_load 开关 (用户需求：default_load=false 不创建窗口卡片) ──
+        #    缺省默认 True (兼容未写该字段的旧配置)；False 时直接 SKIP，不启动 scrcpy。
+        default_load = bool(main_cfg.get("default_load", True))
+        if not default_load:
+            msg = "main_display.default_load=false → SKIP starting main display (no window card created)"
+            print(f"[DisplayManager] ⏭️  {msg}", flush=True)
+            return {
+                "success": True,
+                "skipped": True,
+                "default_load": False,
+                "message": msg,
+                "display_type": "main",
+            }
+
         # Early-fail: no ADB device detected -> scrcpy will 100% fail.
         # Skip actually invoking scrcpy to avoid confusing stderr.
         if not self.device_serial:

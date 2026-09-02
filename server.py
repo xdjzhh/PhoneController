@@ -134,11 +134,56 @@ def initialize_display_manager(start_main: bool = True, start_monitor: bool = Tr
         if start_main:
             print("📱 Starting main display...")
             result = display_manager.start_main_display()
+            # ── default_load 兼容：main_display.default_load=false 时也是 success+skipped，
+            #    不应当让初始化失败，只需要打印提示并继续后续流程。
             if result.get("success"):
-                print("✅ Main display started successfully")
+                if result.get("skipped"):
+                    print(f"⏭️  Main display skipped by config: {result.get('message')}")
+                else:
+                    print("✅ Main display started successfully")
             else:
                 print(f"⚠️  Main display failed to start: {result.get('error')}")
                 return False
+
+        # ── default_load：批量启动 app_displays 中 default_load=true 的应用卡片 ──
+        #    用户需求：启动 APP 时判断 default_load=true 才创建窗口卡片，false 不创建。
+        if display_manager is not None:
+            try:
+                dm_cfg = display_manager.load_config()
+                app_displays_cfg = dm_cfg.get("app_displays", {}) or {}
+                total_apps = len(app_displays_cfg)
+                auto_count = 0
+                skip_count = 0
+                print(f"\n🚀 Auto-starting app displays (default_load=true only): "
+                      f"found {total_apps} app_display entries...")
+                for pkg, app_cfg in app_displays_cfg.items():
+                    if not isinstance(app_cfg, dict):
+                        continue
+                    default_load = bool(app_cfg.get("default_load", True))
+                    if not default_load:
+                        win_title = app_cfg.get("window_title", pkg)
+                        print(f"   ⏭️  SKIP [{win_title} | {pkg}] -> default_load=false")
+                        skip_count += 1
+                        continue
+                    # default_load=true → 自动创建卡片窗口
+                    try:
+                        _r = display_manager.start_app_display(pkg)
+                        if _r.get("success"):
+                            print(f"   ✅ START [{pkg}] ok (android_display_id="
+                                  f"{_r.get('android_display_id')})")
+                            auto_count += 1
+                        else:
+                            print(f"   ⚠️  START [{pkg}] failed: {_r.get('error')}")
+                    except Exception as e_start:
+                        print(f"   ⚠️  START [{pkg}] exception: {e_start}")
+                print(f"   🔚 App displays auto-start done: {auto_count} started / "
+                      f"{skip_count} skipped (default_load=false) / "
+                      f"{total_apps - auto_count - skip_count} failed")
+            except Exception as e_auto:
+                print(f"⚠️  Failed to auto-start app_displays: {e_auto}")
+                import traceback
+                traceback.print_exc()
+
         if start_monitor:
             print("👁️  Starting screen lock monitor...")
             monitor_result = display_manager.start_screen_monitor()
@@ -469,8 +514,6 @@ def main():
     parser.add_argument('--no-main-display', action='store_true', help='Do not start main display on startup')
     parser.add_argument('--no-screen-monitor', action='store_true', help='Do not start screen lock monitor')
     parser.add_argument('--no-backdrop', action='store_true', help='Do not start Qt Linux desktop backdrop')
-    parser.add_argument('--auto-start', default='com.huawei.android.totemweather,com.autonavi.minimap',
-                        help='Comma-separated app packages to auto-start on launch (default: weather + Amap)')
     args = parser.parse_args()
     
     # Initialize agent config
@@ -491,21 +534,6 @@ def main():
         )
     elif not args.no_backdrop:
         start_backdrop_window()
-
-    # Auto-start configured app cards (e.g. weather, Amap navigation)
-    if display_manager and args.auto_start:
-        auto_apps = [p.strip() for p in args.auto_start.split(',') if p.strip()]
-        import time as _time
-        _time.sleep(3)  # wait for main display to settle
-        for idx, app_pkg in enumerate(auto_apps):
-            print(f"📱 Auto-starting app card: {app_pkg}...")
-            result = display_manager.start_app_display(app_pkg)
-            if result.get('success'):
-                print(f"✅ {app_pkg} started: {result.get('message', '')}")
-            else:
-                print(f"⚠️  Failed to start {app_pkg}: {result.get('error', '')}")
-            if idx < len(auto_apps) - 1:
-                _time.sleep(2)  # stagger launches to avoid conflicts
     
     # Start server
     print(f"\n🚀 Starting server on {args.host}:{args.port}")

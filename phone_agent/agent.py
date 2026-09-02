@@ -108,6 +108,14 @@ class PhoneAgent:
 
         self._check_and_switch_display(task)
 
+        # ── 前置独立检测 #2：关闭 APP 意图（仿切换屏幕的抽象方法模式）
+        #    用户原话：「在ActionHandler中增加close是完全无效的，只有像切换屏幕一样，
+        #    抽象出一个方法用于关闭检测才能完成」
+        #    命中：直接关闭（虚拟卡片→复用红绿灯红灯；非卡片→保留原 am force-stop 逻辑）
+        #    并立刻结束 run，不再进入 AI 循环。
+        if self._check_and_close_app(task):
+            return f"已完成关闭操作：{task}"
+
         # First step with user prompt
         result = self._execute_step(task, is_first=True)
 
@@ -213,6 +221,119 @@ class PhoneAgent:
                     traceback.print_exc()
         except Exception as e:
             print(f"[Agent] Display switch detection failed: {e}")
+
+    def _check_and_close_app(self, text: str) -> bool:
+        """
+        「关闭应用」前置独立检测 —— 完全仿照 _check_and_switch_display 的模式。
+        不依赖 AI 输出 Close action，直接解析用户 task 命中关闭意图即执行。
+
+        Returns:
+            True  = 命中关闭意图并已执行（无论成功失败都视为命令已处理），
+                    agent.run 应直接 return 结束，不再进入 AI 循环。
+            False = 未命中任何关闭意图，继续原 AI 流程。
+        """
+        if not text:
+            return False
+
+        try:
+            from phone_agent.display_switcher import get_display_switcher
+            switcher = get_display_switcher()
+            target_type, target_pkg = switcher.detect_close_intent(text)
+            if target_type != "close_app" or not target_pkg:
+                return False  # 不是关闭意图，交给 AI
+
+            print(f"[Agent] Close-app intent detected: target={target_pkg}; "
+                  f"will dispatch same-as-traffic-light path vs original force-stop path")
+
+            # ── Step 1: 判断这个 package 是否在 display_config → app_displays 里 ──
+            #    直接复用 DisplaySwitcher 已加载好的 available_apps（它的实现
+            #    就是 display_config.app_displays.keys()，100% 一致、无歧义）。
+            #    不再绕 ConfigManager，避免之前 ConfigManager().get_config()
+            #    API 名写错 → 空 dict → 误判 Path B → force-stop 的问题。
+            has_card_entry = target_pkg in switcher.available_apps
+
+            # ── Step 2: 按两条路径执行关闭 ──
+            if has_card_entry:
+                # Path A = 复用红绿灯红灯关闭方式
+                try:
+                    from scrcpycontrol.display_interface import get_display_manager
+                    dm = get_display_manager()
+                    result = dm.stop_app_display(target_pkg)
+                    if result.get("success"):
+                        print(f"[Agent][Close] '{target_pkg}' card closed via stop_app_display "
+                              f"(same as 🔴 traffic light red button): "
+                              f"scrcpy window + decorator + virtual display + display map entry "
+                              f"all cleaned, display_id returned to pool")
+                        try:
+                            df = get_device_factory()
+                            df.reset_display()
+                        except Exception:
+                            pass
+                        return True
+                    else:
+                        print(f"[Agent][Close] stop_app_display('{target_pkg}') returned "
+                              f"non-success ({result.get('error','')}). "
+                              f"Falling back to original behavior (am force-stop).")
+                except Exception as e_stop:
+                    print(f"[Agent][Close] stop_app_display exception (fallback force-stop): {e_stop}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Path A 降级：卡片未运行/报错 → 仍执行原逻辑 am force-stop 保证一致性
+                try:
+                    ok, msg = self._force_stop_android_app(target_pkg)
+                    _info = " :".join(filter(None, [target_pkg, msg])) if msg else target_pkg
+                    print(f"[Agent][Close] Path A fallback am force-stop '{_info}'")
+                    if not ok:
+                        print(f"[Agent][Close] am force-stop warning: {msg}")
+                except Exception as e_fs:
+                    print(f"[Agent][Close] Path A fallback force-stop failed: {e_fs}")
+                return True
+            else:
+                # Path B = 非卡片应用 → 保持原逻辑不变（直接 am force-stop 主屏路径，不动窗口）
+                try:
+                    ok, msg = self._force_stop_android_app(target_pkg)
+                    if ok:
+                        print(f"[Agent][Close] '{target_pkg}' not in app_displays (no virtual card). "
+                              f"Keeping original behavior: am force-stop succeeded.")
+                    else:
+                        print(f"[Agent][Close] '{target_pkg}' not in app_displays. Original behavior "
+                              f"am force-stop executed but failed: {msg}")
+                except Exception as e_b:
+                    print(f"[Agent][Close] Path B (original am force-stop) exception: {e_b}")
+                    import traceback
+                    traceback.print_exc()
+                return True
+
+        except Exception as e_outer:
+            print(f"[Agent] Close-app pre-check failed (continuing with AI loop): {e_outer}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _force_stop_android_app(self, package: str):
+        """原逻辑：主屏上关闭 app = adb shell am force-stop <package>。
+        返回 (ok: bool, message: str)。不动任何窗口。"""
+        if not package:
+            return False, "empty package"
+        try:
+            import adbutils
+            device_id = getattr(self, "agent_config", None) and self.agent_config.device_id
+            if device_id:
+                try:
+                    dev = adbutils.adb.device(device_id)
+                    dev.shell(f"am force-stop {package}", timeout=10)
+                    return True, f"am force-stop {package} via device_id={device_id}"
+                except Exception:
+                    pass
+            devices = adbutils.adb.device_list()
+            if devices:
+                dev = devices[0]
+                dev.shell(f"am force-stop {package}", timeout=10)
+                return True, f"am force-stop {package} via first_device={dev.serial}"
+            return False, "no adb device connected"
+        except Exception as e:
+            return False, f"_force_stop_android_app error: {e}"
 
     def _execute_step(
         self, user_prompt: str | None = None, is_first: bool = False

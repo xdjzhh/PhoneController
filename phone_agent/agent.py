@@ -254,36 +254,62 @@ class PhoneAgent:
 
             # ── Step 2: 按两条路径执行关闭 ──
             if has_card_entry:
-                # Path A = 复用红绿灯红灯关闭方式
+                # ── Step 2.0: 用户新增 default_load 在关闭时的语义 ──
+                #    关闭命令时也需要判断 default_load：
+                #    • default_load = true  → 这是「启动时默认加载的常驻卡片」→ 【不销毁窗口卡片】
+                #       只可能 force-stop 手机端进程（保持桌面显示的窗口还在）。
+                #    • default_load = false → 临时卡片（启动时不加载，用户/AI 按需打开）→
+                #       【正常执行 stop_app_display】，复用红绿灯 🔴 关闭方式。
+                #    缺省默认 True（保持与启动阶段 bool(cfg.get(\"default_load\", True)) 的判定一致）。
                 try:
-                    from scrcpycontrol.display_interface import get_display_manager
-                    dm = get_display_manager()
-                    result = dm.stop_app_display(target_pkg)
-                    if result.get("success"):
-                        print(f"[Agent][Close] '{target_pkg}' card closed via stop_app_display "
-                              f"(same as 🔴 traffic light red button): "
-                              f"scrcpy window + decorator + virtual display + display map entry "
-                              f"all cleaned, display_id returned to pool")
-                        try:
-                            df = get_device_factory()
-                            df.reset_display()
-                        except Exception:
-                            pass
-                        return True
-                    else:
-                        print(f"[Agent][Close] stop_app_display('{target_pkg}') returned "
-                              f"non-success ({result.get('error','')}). "
-                              f"Falling back to original behavior (am force-stop).")
-                except Exception as e_stop:
-                    print(f"[Agent][Close] stop_app_display exception (fallback force-stop): {e_stop}")
-                    import traceback
-                    traceback.print_exc()
+                    from scrcpycontrol.display_interface import get_display_manager as _get_dm_cfg_reader
+                    _cfg_dm = _get_dm_cfg_reader()
+                    _cfg = _cfg_dm.load_config()
+                    _app_cfg = (_cfg.get("app_displays", {}) or {}).get(target_pkg, {}) or {}
+                    default_load = bool(_app_cfg.get("default_load", True))
+                except Exception as e_cfg:
+                    print(f"[Agent][Close] load default_load warning (assume true=resident): {e_cfg}")
+                    default_load = True
 
-                # Path A 降级：卡片未运行/报错 → 仍执行原逻辑 am force-stop 保证一致性
+                # Path A = 复用红绿灯红灯关闭方式（仅当 default_load=false 时才走）
+                if not default_load:
+                    try:
+                        from scrcpycontrol.display_interface import get_display_manager
+                        dm = get_display_manager()
+                        result = dm.stop_app_display(target_pkg)
+                        if result.get("success"):
+                            print(f"[Agent][Close] '{target_pkg}' card closed via stop_app_display "
+                                  f"(same as 🔴 traffic light red button, default_load=false): "
+                                  f"scrcpy window + decorator + virtual display + display map entry "
+                                  f"all cleaned, display_id returned to pool")
+                            try:
+                                df = get_device_factory()
+                                df.reset_display()
+                            except Exception:
+                                pass
+                            return True
+                        else:
+                            print(f"[Agent][Close] stop_app_display('{target_pkg}') returned "
+                                  f"non-success ({result.get('error','')}). "
+                                  f"Falling back to original behavior (am force-stop).")
+                    except Exception as e_stop:
+                        print(f"[Agent][Close] stop_app_display exception (fallback force-stop): {e_stop}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    # default_load=true（常驻卡片）：不销毁窗口，打印说明
+                    win_title = (isinstance(_app_cfg, dict) and _app_cfg.get("window_title")) or target_pkg
+                    print(f"[Agent][Close] '{win_title}' ({target_pkg}) default_load=true "
+                          f"→ resident card, WILL NOT destroy scrcpy window/card "
+                          f"(keeping same-as-startup desktop layout). "
+                          f"Falling back to original behavior: am force-stop only.")
+
+                # Path A 统一降级（default_load=true、或 stop_app_display 失败、或异常）
+                # → 仍执行原逻辑 am force-stop 保证一致性（不影响窗口）
                 try:
                     ok, msg = self._force_stop_android_app(target_pkg)
                     _info = " :".join(filter(None, [target_pkg, msg])) if msg else target_pkg
-                    print(f"[Agent][Close] Path A fallback am force-stop '{_info}'")
+                    print(f"[Agent][Close] Path A fallback am force-stop '{_info}' (window untouched)")
                     if not ok:
                         print(f"[Agent][Close] am force-stop warning: {msg}")
                 except Exception as e_fs:

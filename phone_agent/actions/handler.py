@@ -256,6 +256,34 @@ class ActionHandler:
             and package in app_displays_cfg
         )
 
+        # ==============================================================
+        # 【用户硬约束】：default_load=true 的卡片应用，我们植入的"卡片关闭 +
+        # set_active_display(0) + am force-stop"整条链路全部短路跳过，
+        # 以 return False 形式让上层把原命令**直接交给 AI 原生逻辑**继续。
+        # 注：main_display 关闭在 DisplayManager.stop_main_display 已做同
+        # 样的旁路，这里只处理 app_displays 卡片。
+        # ==============================================================
+        if has_card_entry:
+            try:
+                default_load = bool(
+                    (app_displays_cfg.get(package, {}) or {}).get("default_load", False)
+                )
+            except Exception:
+                default_load = False
+            if default_load:
+                print(f"[ActionHandler] Close '{app_name}' ({package}): "
+                      f"default_load=true → BYPASS implant close-path, "
+                      f"hand off to AI original logic (no stop_app_display, "
+                      f"no display_id recycle, no set_active_display, no "
+                      f"am force-stop).")
+                return ActionResult(
+                    False, False,
+                    message=(
+                        f"Close skipped (implant bypassed for default_load=true). "
+                        f"AI should continue with its original stop logic."
+                    ),
+                )
+
         if has_card_entry:
             # ── Path A: card app → reuse red-close button behavior ──
             print(f"[ActionHandler] Close '{app_name}' ({package}): "

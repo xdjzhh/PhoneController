@@ -282,8 +282,54 @@ class DisplayManager:
             traceback.print_exc()
             return {"success": False, "error": str(e)}
 
+    def stop_main_display(self):
+        """Public API: AI / HTTP / 用户请求关闭主屏。
+
+        Unique semantics (matches user-enforced bypass rule):
+        - 若 main_display.default_load=true：**完全不做任何停止动作**
+          （连 MainDisplay.stop() 都不调用，绝不 terminate 主屏 scrcpy；
+          因为主屏 scrcpy = 主屏窗口 + 控制通道，一关就等于主屏窗口消失
+          且 agent 的截图/操作/控制主链路全部失效）。
+          此时返回 success=False + skipped=True 明确告诉调用方：
+          "没执行关闭，请把请求交给 AI 原逻辑链路继续。"
+        - 若 main_display.default_load=false：正常调用底层
+          `_stop_main_display_locked()` 执行 terminate + state reset。
+
+        NOTE: 本 public API 故意**不提供**任何"强制关闭"参数。
+        DisplayManager 全局生命周期关机（stop_all / Ctrl+C 析构）场景若想硬清
+        主屏，请**直接调用 private 的 `_stop_main_display_locked()`**，
+        避免在 public API 上同时暴露"两种语义"让调用方混淆。
+        """
+        with self._lock:
+            if self._is_default_load(None):
+                print(
+                    "[DisplayManager] Bypass: main_display.default_load=true → "
+                    "AI/close request HAND-OFF to original logic. "
+                    "NOTE: main scrcpy is NOT stopped at all (stopping it would "
+                    "kill the main window + control socket, agent would lose the "
+                    "primary display channel)."
+                )
+                return {
+                    "success": False,
+                    "skipped": True,
+                    "default_load": True,
+                    "bypassed_implant_cleanup": True,
+                    "message": (
+                        "Main display close skipped: default_load=true. "
+                        "Handing the request to the original AI logic "
+                        "(main scrcpy process + window intentionally kept alive)."
+                    ),
+                }
+            self._stop_main_display_locked()
+            return {"success": True, "message": "Main display stopped"}
+
     def _stop_main_display_locked(self):
-        """Stop main display assuming lock is already held."""
+        """Private atomic: actually terminate the main scrcpy + reset all state.
+
+        ONLY call sites:
+        • DisplayManager.stop_all()  (global service shutdown, atexit)
+        • stop_main_display() 当 default_load=false 时（仅这一个 public 路径）
+        """
         if self._main_display:
             try:
                 self._main_display.stop()
@@ -544,6 +590,24 @@ class DisplayManager:
                     pass
                 return {"success": False, "error": str(e)}
 
+    # ------------------------------------------------------------------
+    # default_load 旁路工具（AI 原生关闭链短路判断）
+    # ------------------------------------------------------------------
+    def _is_default_load(self, app_package=None):
+        """查 display_config：
+        - app_package=None  -> main_display.default_load
+        - app_package=str   -> app_displays[app_package].default_load
+        返回：T/F（查不到当 False）。
+        """
+        try:
+            cfg = self.load_config()
+        except Exception:
+            return False
+        if app_package is None:
+            return bool(cfg.get("main_display", {}).get("default_load", False))
+        apps = cfg.get("app_displays", {}) or {}
+        return bool(apps.get(app_package, {}).get("default_load", False))
+
     def stop_app_display(self, app_package):
         """
         Stop a virtual display for an app.
@@ -555,6 +619,38 @@ class DisplayManager:
             Dict with success status.
         """
         with self._lock:
+            # ==============================================================
+            # 【AI 关闭链旁路 · 用户需求】
+            #   如果 display_config 中该 app 的 default_load=true，
+            #   说明这是 bootstrap / default_load 启动流程预置的常驻卡片，
+            #   关闭逻辑全部交给 AI 原执行路径（按原始 stop 语义：
+            #   display.stop() 本身原生的 unregister_decorator +
+            #   terminate scrcpy 即视为完成），
+            #   绝不执行"我们植入的额外清理动作"：
+            #     · _multi_display.displays.remove(display)
+            #     · _multi_display._free_display_id(old_display_id) 归还池子
+            #     · del self._app_display_map[app_package] （留 AI 之后自己重建）
+            #     · time.sleep(0.5) 强制延迟
+            # ==============================================================
+            if self._is_default_load(app_package):
+                if app_package not in self._app_display_map:
+                    return {
+                        "success": False,
+                        "error": f"No running display for {app_package}",
+                    }
+                display = self._app_display_map[app_package]
+                try:
+                    display.stop()  # 仅此一行原 stop：交给 AI 原生路径
+                except Exception as e:
+                    return {"success": False, "error": str(e)}
+                print(f"[DisplayManager] Bypass: pkg={app_package} default_load=true → "
+                      f"AI-native stop() executed, NO post-cleanup（保留 map/displays/pool 不动）。")
+                return {
+                    "success": True,
+                    "message": "App display stopped (AI native path, bypassed implant cleanup)",
+                    "bypassed_implant_cleanup": True,
+                    "default_load": True,
+                }
             return self._stop_app_display_locked(app_package)
 
     def _stop_app_display_locked(self, app_package):
@@ -1487,25 +1583,43 @@ class DisplayManager:
         return self._screen_monitor_running
 
     def stop_all(self):
-        """Stop all displays and screen monitor."""
-        print("[DisplayManager] Stopping all displays and services...")
+        """Stop all displays and screen monitor (service-level total shutdown).
+
+        Important distinction vs AI-requested per-card close:
+        • This method is only called when the whole orchestrator/service wants
+          to terminate (server teardown / Ctrl+C / atexit / process exit).
+          At this stage we MUST terminate every scrcpy process and clean every
+          state field — we intentionally SKIP the public bypass rules because
+          the bypass only applies to on-the-fly "close this card" requests
+          (stopping main scrcpy there would kill the agent's primary channel).
+        • Implementation uses private atomic methods so the bypass on public
+          APIs cannot accidentally prevent full teardown:
+          - app displays → _stop_app_display_locked(pkg) (hard atomic).
+          - main_display → _stop_main_display_locked()   (hard atomic, NO
+            detour via stop_main_display()  — the public API is exclusively
+            for AI/user close requests and intentionally never forces anything).
+        """
+        print("[DisplayManager] Stopping all displays and services (service-level shutdown)...")
 
         self.stop_screen_monitor()
         self._stop_navigation_monitor()
 
+        # 应用卡片：服务级硬清理（绕过 public stop_app_display 的 default_load=true 旁路）
         for pkg in list(self._app_display_map.keys()):
             try:
-                self.stop_app_display(pkg)
+                self._stop_app_display_locked(pkg)
             except Exception:
                 pass
 
-        if self._main_display:
-            try:
-                self._main_display.stop()
-            except Exception:
-                pass
-            self._main_display = None
-            self._main_display_running = False
+        # 主屏：服务级硬清理 → 直接调 private atomic，不通过 public stop_main_display()
+        # （public stop_main_display() 只服务于"AI/HTTP/用户单独关主屏请求"，
+        #  default_load=true 时它会完全跳过，stop_all 绝对不能依赖它。）
+        try:
+            with self._lock:
+                if self._main_display is not None:
+                    self._stop_main_display_locked()
+        except Exception:
+            pass
 
         if self._multi_display:
             try:

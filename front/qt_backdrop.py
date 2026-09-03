@@ -256,14 +256,30 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                     return
 
                 ex_style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_EXSTYLE)
+                # ==============================================================
+                # 【虚拟桌面强隔离·硬约束】绝对不能再 |= WS_EX_TOOLWINDOW 或
+                # &= ~WS_EX_APPWINDOW 。这两个组合会让窗口从 Windows
+                # IApplicationView 注册表被移除，VirtualDesktopManager 对它的
+                # GetViewForHwnd() 永远返回 MK_E_ELEMENTNOTFOUND（"找不到元素"），
+                # 结果就是 VDM **完全不感知这扇窗** → 窗口被当作全局浮动窗，
+                # "显示在每一个虚拟桌面上"。即用户反馈："每个桌面都有黑色
+                # 背景 + 通知卡片 + 思考卡片"，其实只是一套，但三个桌面都
+                # 看得见，不是被复制了三份。
+                #
+                # 保留：NOACTIVATE/NOPARENTNOTIFY/TOPMOST（仍然不抢焦点、
+                #       Topmost 置于最上层）。
+                # 主动加上 WS_EX_APPWINDOW（强制让 shell 把它当成一颗"应用
+                #       窗口缩略图"，这样 VDM 才分配 desktop GUID 绑定）。
+                # 清除：WS_EX_TOOLWINDOW（若前面 Qt 默认 Tool 设了也清）
+                # ==============================================================
                 new_ex = (
                     ex_style
                     | WS_EX_NOACTIVATE
-                    | WS_EX_TOOLWINDOW
                     | WS_EX_NOPARENTNOTIFY
                     | WS_EX_TOPMOST
+                    | WS_EX_APPWINDOW
                 )
-                new_ex &= ~WS_EX_APPWINDOW
+                new_ex &= ~WS_EX_TOOLWINDOW
                 user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_EXSTYLE, new_ex)
 
                 style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE)
@@ -475,8 +491,16 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                 if not hwnd:
                     return
                 ex_style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_EXSTYLE)
-                new_ex = ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_NOPARENTNOTIFY | WS_EX_TOPMOST | WS_EX_LAYERED
-                new_ex &= ~WS_EX_APPWINDOW
+                # 【虚拟桌面强隔离·硬约束】同 BackdropWidget._apply_win32_style：
+                # 去掉 WS_EX_TOOLWINDOW / 去掉 ~WS_EX_APPWINDOW，否则 VDM 不感知
+                # → 窗口显示在每个虚拟桌面。
+                new_ex = (ex_style
+                         | WS_EX_NOACTIVATE
+                         | WS_EX_NOPARENTNOTIFY
+                         | WS_EX_TOPMOST
+                         | WS_EX_LAYERED
+                         | WS_EX_APPWINDOW)
+                new_ex &= ~WS_EX_TOOLWINDOW
                 user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_EXSTYLE, new_ex)
                 style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE)
                 new_style = style | WS_CLIPSIBLINGS | WS_CLIPCHILDREN

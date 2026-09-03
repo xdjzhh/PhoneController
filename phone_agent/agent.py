@@ -254,6 +254,38 @@ class PhoneAgent:
 
             # ── Step 2: 按两条路径执行关闭 ──
             if has_card_entry:
+                # ==============================================================
+                # 【用户新硬约束】：如果该 app.default_load=true，
+                #   不允许走我们植入的「关闭卡片 + reset_display + am force-stop」链路，
+                #   而是**直接 False（未命中关闭意图）**→ 交给 AI 原逻辑执行。
+                #   检测点：复用 DisplayManager._is_default_load 或独立
+                #   读 display_config.json 里 app_displays[target_pkg].default_load。
+                #   True → 直接 return False 让 AI 循环继续；False → 我们的 Path A。
+                # ==============================================================
+                try:
+                    from scrcpycontrol.display_interface import get_display_manager
+                    dm = get_display_manager()
+                    # 兼容接口：DisplayManager 我们加了 _is_default_load(pkg)；
+                    # 若版本无该函数则从 JSON 文件直读兜底。
+                    if hasattr(dm, "_is_default_load") and callable(dm._is_default_load):
+                        default_load = bool(dm._is_default_load(target_pkg))
+                    else:
+                        import json, os
+                        cfg_path = getattr(dm, "config_path", None)
+                        default_load = False
+                        if cfg_path and os.path.isfile(cfg_path):
+                            with open(cfg_path, "r", encoding="utf-8") as f:
+                                cfg = json.load(f)
+                            default_load = bool(
+                                cfg.get("app_displays", {}).get(target_pkg, {}).get("default_load", False)
+                            )
+                    if default_load:
+                        print(f"[Agent][Close] pkg={target_pkg} default_load=true → "
+                              f"BYPASS implant close-path, return False to let AI original logic continue")
+                        return False
+                except Exception as e_probe:
+                    print(f"[Agent][Close] default_load probe failed (still proceed Path A): {e_probe}")
+
                 # Path A = 复用红绿灯红灯关闭方式
                 try:
                     from scrcpycontrol.display_interface import get_display_manager

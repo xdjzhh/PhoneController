@@ -466,7 +466,13 @@ def create_thinking_log_panel(
             super().leaveEvent(event)
 
         def _apply_style(self):
-            """Minimal Win32 style: topmost, noactivate, toolwindow, acrylic blur."""
+            """Win32 style 调整（虚拟桌面强隔离版）。
+            保留：topmost / noactivate / noparentnotify / layered。
+            关键：**置位 WS_EX_APPWINDOW / 清零 WS_EX_TOOLWINDOW**。
+            原因同 qt_notification._apply_style：打 TOOLWINDOW 并清 APPWINDOW
+            会把窗口踢出 IApplicationView 注册表 → VDM 完全不感知
+            → 一套窗口显示在每个桌面 3 次（每桌面都看见），并非真正创建 3 份。
+            """
             if os.name != 'nt':
                 return
             try:
@@ -475,10 +481,12 @@ def create_thinking_log_panel(
                     return
                 ex_style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_EXSTYLE)
                 new_ex = (ex_style
-                          | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-                          | WS_EX_NOPARENTNOTIFY | WS_EX_TOPMOST
-                          | WS_EX_LAYERED)
-                new_ex &= ~WS_EX_APPWINDOW
+                         | WS_EX_NOACTIVATE
+                         | WS_EX_NOPARENTNOTIFY
+                         | WS_EX_TOPMOST
+                         | WS_EX_LAYERED
+                         | WS_EX_APPWINDOW)
+                new_ex &= ~WS_EX_TOOLWINDOW
                 user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_EXSTYLE, new_ex)
 
                 style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE)

@@ -379,6 +379,22 @@ class PhoneAgent:
         current_app = device_factory.get_current_app(self.agent_config.device_id)
         print("+++++++++++++++current_app" + current_app)
 
+        # 黑屏计数：第1、2次正常发送黑屏截图，第3次仍黑屏则终止任务
+        if screenshot.is_sensitive:
+            self._black_screen_count = getattr(self, "_black_screen_count", 0) + 1
+            print(f"[Agent] Black/sensitive screen detected, count={self._black_screen_count}/3")
+            if self._black_screen_count >= 3:
+                print("[Agent] Black screen for 3 consecutive steps, terminating current task.")
+                return StepResult(
+                    success=False,
+                    finished=True,
+                    action=None,
+                    thinking="",
+                    message="连续3次截图为黑屏/敏感界面，已终止当前任务",
+                )
+        else:
+            self._black_screen_count = 0
+
         # Build messages
         if is_first:
             self._context.append(

@@ -80,7 +80,7 @@ class DisplayManager:
         # Navigation monitor for map auto-zoom
         self._nav_monitor = None
         self._navigating_app = None  # 当前正在导航的地图app包名
-        self._app_saved_geometry = {}  # 保存导航前的窗口几何，用于恢复
+        # 注：不再使用 _app_saved_geometry，导航/非导航尺寸直接从 config 读取
 
         atexit.register(self.stop_all)
 
@@ -1029,10 +1029,29 @@ class DisplayManager:
     def _move_and_resize_hwnd(self, hwnd, x, y, w, h):
         """Move and resize a window using MoveWindow Win32 API."""
         import ctypes
+        from ctypes import wintypes
         user32 = ctypes.windll.user32
-        result = user32.MoveWindow(ctypes.wintypes.HWND(hwnd), int(x), int(y), int(w), int(h), True)
+
+        # 诊断：移动前的窗口大小
+        before_rect = wintypes.RECT()
+        user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(before_rect))
+        before_w = before_rect.right - before_rect.left
+        before_h = before_rect.bottom - before_rect.top
+        print(f"[MoveWindow] hwnd={hwnd} target=({x},{y} {w}x{h}) before=({before_rect.left},{before_rect.top} {before_w}x{before_h})")
+
+        result = user32.MoveWindow(wintypes.HWND(hwnd), int(x), int(y), int(w), int(h), True)
         if not result:
+            err = ctypes.get_last_error()
+            print(f"[MoveWindow] FAILED hwnd={hwnd} error={err}")
             raise ctypes.WinError()
+
+        # 诊断：移动后的窗口大小
+        after_rect = wintypes.RECT()
+        user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(after_rect))
+        after_w = after_rect.right - after_rect.left
+        after_h = after_rect.bottom - after_rect.top
+        print(f"[MoveWindow] after=({after_rect.left},{after_rect.top} {after_w}x{after_h}) result={result}")
+
         # 同步更新overlay窗口位置（card decorator）
         try:
             from front.card_window import get_card_window_decorator
@@ -1194,11 +1213,14 @@ class DisplayManager:
     def _on_navigation_start(self, state):
         """Handle navigation start event - zoom map window to nav mode."""
         pkg = state.app_package
+        print(f"[Navigation] _on_navigation_start called: pkg={pkg}, navigating_app={self._navigating_app}")
         if not pkg or pkg not in MAP_APPS:
+            print(f"[Navigation] _on_navigation_start: pkg invalid, skipping")
             return
 
         # 如果已经在导航同一个app，忽略
         if self._navigating_app == pkg:
+            print(f"[Navigation] _on_navigation_start: already navigating {pkg}, skipping")
             return
 
         # 如果正在导航另一个app，先恢复它
@@ -1226,18 +1248,25 @@ class DisplayManager:
             self._navigating_app = None
 
     def _switch_app_to_nav_mode(self, app_package, retry_count=0):
-        """Switch an app window to navigation mode (large centered)."""
+        """Switch an app window to navigation mode.
+
+        设计原则：直接从 config 的 nav_geometry 读取固定尺寸，不做任何
+        save/restore。重复调用也安全（值不变），不会出现"恢复时尺寸被覆盖"
+        的问题。
+        """
+        print(f"[Navigation] _switch_app_to_nav_mode ENTER: pkg={app_package}, retry={retry_count}")
         cfg = self.load_config()
         app_cfg = cfg.get("app_displays", {}).get(app_package, {})
         nav_geom = app_cfg.get("nav_geometry")
+        print(f"[Navigation] _switch_app_to_nav_mode: app_cfg keys={list(app_cfg.keys())}, nav_geom={nav_geom}")
         if not nav_geom:
             print(f"[Navigation] No nav_geometry config for {app_package}, skipping")
             return
 
         hwnd = self._get_app_hwnd(app_package)
+        print(f"[Navigation] _switch_app_to_nav_mode: hwnd={hwnd}")
         if not hwnd:
             if retry_count < 10:
-                # 延迟重试，等待窗口创建完成
                 def _retry():
                     time.sleep(1.0)
                     self._switch_app_to_nav_mode(app_package, retry_count + 1)
@@ -1245,36 +1274,25 @@ class DisplayManager:
                 print(f"[Navigation] Window not found for {app_package}, retry {retry_count+1}/10 in 1s...")
                 return
             else:
-                print(f"[Navigation] Window for {app_package} not found after retries, switching to nav mode later when window starts")
+                print(f"[Navigation] Window for {app_package} not found after retries")
                 return
 
         print(f"[Navigation] Found HWND {hwnd} for {app_package}, switching to nav mode...")
 
-        # 保存当前几何信息用于恢复
-        cur_rect = self._window_rect(hwnd)
-        if cur_rect:
-            cx, cy, cw, ch = cur_rect
-            self._app_saved_geometry[app_package] = {
-                "window_x": cx, "window_y": cy,
-                "window_width": cw, "window_height": ch
-            }
-            print(f"[Navigation] Saved current geometry: {cx},{cy} {cw}x{ch}")
-
-        # 切换到导航几何
+        # 直接从 config 读导航模式尺寸（固定值，重复调用无副作用）
         nx = nav_geom.get("window_x", 1027)
         ny = nav_geom.get("window_y", 543)
         nw = nav_geom.get("window_width", 2076)
         nh = nav_geom.get("window_height", 1193)
         nav_opacity = nav_geom.get("default_opacity", 1.0)
+        print(f"[Navigation] _switch_app_to_nav_mode: target geometry x={nx}, y={ny}, w={nw}, h={nh}, opacity={nav_opacity}")
 
         try:
             self._move_and_resize_hwnd(hwnd, nx, ny, nw, nh)
             if nav_opacity < 1.0:
                 self._apply_opacity_to_hwnd(hwnd, nav_opacity)
             else:
-                # 导航时完全不透明
                 self._apply_opacity_to_hwnd(hwnd, 1.0)
-            # 激活窗口到最前
             self._force_activate_window(hwnd)
             print(f"[Navigation] Switched {app_package} to nav mode: {nx},{ny} {nw}x{nh}")
         except Exception as e:
@@ -1283,27 +1301,24 @@ class DisplayManager:
             traceback.print_exc()
 
     def _restore_app_from_nav_mode(self, app_package):
-        """Restore an app window from navigation mode to normal size."""
+        """Restore an app window from navigation mode to normal size.
+
+        设计原则：直接从 config 外层读取普通模式尺寸（window_x/y/width/height），
+        不依赖任何运行时保存的几何信息。重复调用也安全。
+        """
         hwnd = self._get_app_hwnd(app_package)
         if not hwnd:
             print(f"[Navigation] Window not found for {app_package} during restore")
-            # 清除保存的几何
-            self._app_saved_geometry.pop(app_package, None)
             return
 
-        # 恢复到保存的几何或配置中的默认几何
-        saved = self._app_saved_geometry.pop(app_package, None)
         cfg = self.load_config()
         app_cfg = cfg.get("app_displays", {}).get(app_package, {})
 
-        if saved:
-            rx, ry, rw, rh = saved["window_x"], saved["window_y"], saved["window_width"], saved["window_height"]
-        else:
-            rx = app_cfg.get("window_x", 60)
-            ry = app_cfg.get("window_y", 60)
-            rw = app_cfg.get("window_width", 960)
-            rh = app_cfg.get("window_height", 540)
-
+        # 直接从 config 外层读普通模式尺寸（右上角小窗口）
+        rx = app_cfg.get("window_x", 60)
+        ry = app_cfg.get("window_y", 60)
+        rw = app_cfg.get("window_width", 960)
+        rh = app_cfg.get("window_height", 540)
         normal_opacity = app_cfg.get("default_opacity", 1.0)
 
         try:

@@ -57,6 +57,12 @@ MAP_APPS: Dict[str, Dict] = {
     },
 }
 
+# 导航结束关键词：通知中出现这些词 → 判定为导航已结束
+NAVIGATION_END_KEYWORDS = [
+    "导航结束", "结束导航", "已到达", "到达目的地", "抵达",
+    "已结束", "导航完成", "全程", "本次导航",
+]
+
 
 class NavigationMonitor:
     """导航状态监听器"""
@@ -74,7 +80,7 @@ class NavigationMonitor:
         self._on_end_callbacks: List[Callable[[NavigationState], None]] = []
         self._on_update_callbacks: List[Callable[[NavigationState], None]] = []
         self._lock = threading.Lock()
-        self._debug = False  # 仅在排障时改为 True 打印通知/Activity 细节
+        self._debug = False  # 已修复导航检测，关闭调试日志减少开销
 
     def _log(self, msg: str):
         """真正的导航状态/错误信息，默认就输出"""
@@ -197,6 +203,9 @@ class NavigationMonitor:
         """
         从dumpsys notification输出中检测导航通知。
         返回: (package, app_name, title, text) 或 None
+
+        重要：导航结束后的通知（如"导航结束，全程10公里"）必须返回 None，
+        否则 consecutive_miss 永远达不到 3，_on_navigation_end 永不触发。
         """
         # 按StatusBarNotification分割（比NotificationRecord更可靠）
         records = re.split(r'StatusBarNotification\(|NotificationRecord\(', output)
@@ -226,6 +235,13 @@ class NavigationMonitor:
             if self._debug and combined_text.strip():
                 self._debug_log(f"  Notif from {pkg}: ongoing={is_ongoing}, title='{title[:30]}', text='{text[:50]}'")
 
+            # ★ 导航结束关键词优先检测：命中则立即判定为"非导航中"
+            #    例如 "导航结束"、"已到达目的地"、"全程10公里" 等通知。
+            for end_kw in NAVIGATION_END_KEYWORDS:
+                if end_kw in combined_text:
+                    self._debug_log(f"  Navigation END keyword '{end_kw}' found in {pkg} notification → not navigating")
+                    return None  # 关键：返回 None，让 poll_loop 累计 consecutive_miss
+
             # 如果不要求ongoing，或者确实是ongoing
             if app_cfg["require_ongoing"] and not is_ongoing:
                 # 特殊情况：有些导航通知可能ongoing检测失败，但文本明显是导航
@@ -236,14 +252,20 @@ class NavigationMonitor:
             all_keywords = app_cfg["title_keywords"] + app_cfg["text_keywords"]
             hit_count = sum(1 for kw in all_keywords if kw in combined_text)
 
-            # 明确的导航特征：包含"导航中"或"开始导航"，或者同时包含"剩余"+"公里/米"
+            # 明确的导航特征：
+            #   1) 包含"导航中"、"正在导航"或"开始导航"
+            #   2) 同时包含"剩余"+"公里/米"（必须有"剩余"，排除"全程X公里"这种结束通知）
+            #   3) 命中>=3个关键词 且 包含"导航"/"公里"/"米后"（收紧阈值，
+            #      避免"导航结束，全程10公里"这种 hit_count=2 的结束通知被误判）
             is_navi = False
-            if "导航中" in combined_text or "开始导航" in combined_text:
+            if "导航中" in combined_text or "正在导航" in combined_text or "开始导航" in combined_text:
                 is_navi = True
             elif ("剩余" in combined_text and ("公里" in combined_text or "米" in combined_text)):
                 is_navi = True
-            elif hit_count >= 2 and ("导航" in combined_text or "公里" in combined_text or "米后" in combined_text):
-                is_navi = True
+            elif hit_count >= 3 and ("导航" in combined_text or "公里" in combined_text or "米后" in combined_text):
+                # 额外保护：如果包含结束关键词，仍不算导航中
+                if not any(end_kw in combined_text for end_kw in NAVIGATION_END_KEYWORDS):
+                    is_navi = True
 
             if is_navi:
                 self._log(f"  -> NAVIGATION DETECTED via notification for {pkg}!")
@@ -253,31 +275,70 @@ class NavigationMonitor:
     def _check_navigation_activity(self, pkg: str, activity: str) -> bool:
         """
         检测当前Activity是否是导航界面。
+
+        判定优先级：
+          1. 先检查导航关键词——命中即判定为导航中（即使 Activity 名含 "map"，
+             如 .navi.DriveRouteMapActivity，也是导航界面）。
+          2. 未命中导航关键词时，再检查排除关键词——命中则排除（如主界面 MainMapActivity）。
+          3. 否则判定为非导航。
         """
         if not pkg or pkg not in MAP_APPS:
             return False
 
         app_cfg = MAP_APPS[pkg]
-        act_lower = activity.lower()
-        act_exact = activity
+        # 只取类名部分（最后一个 . 之后），避免包名 "autonavi" 中的 "navi" 误匹配
+        # 例如 com.autonavi.map.activity.SplashActivity → SplashActivity
+        class_name = activity.rsplit(".", 1)[-1] if "." in activity else activity
+        act_lower = class_name.lower()
 
-        # 检查排除关键词
-        for ex_kw in app_cfg.get("activity_exclude", []):
-            if ex_kw in act_exact:
-                return False
-
-        # 检查导航关键词
+        # 1. 先检查导航关键词（命中即导航中）
         for kw in app_cfg.get("activity_keywords", []):
-            if kw in activity:
-                self._debug_log(f"Activity '{activity}' matches nav keyword '{kw}'")
+            if kw in class_name:
+                self._debug_log(f"Activity class '{class_name}' matches nav keyword '{kw}' → navigating")
                 return True
 
-        # 额外检查：Activity名中包含navi（导航通用关键词）
-        if "navi" in act_lower and "main" not in act_lower and "home" not in act_lower:
-            self._debug_log(f"Activity '{activity}' matches generic nav keyword")
+        # 额外检查：类名中包含navi（导航通用关键词）
+        if "navi" in act_lower and "main" not in act_lower and "home" not in act_lower and "splash" not in act_lower:
+            self._debug_log(f"Activity class '{class_name}' matches generic nav keyword → navigating")
             return True
 
+        # 2. 未命中导航关键词时，检查排除关键词
+        for ex_kw in app_cfg.get("activity_exclude", []):
+            if ex_kw in class_name:
+                self._debug_log(f"Activity class '{class_name}' excluded by keyword '{ex_kw}' → not navigating")
+                return False
+
+        # 3. 默认非导航
         return False
+
+    def _check_navigation_end_in_notifications(self, output: str) -> Optional[str]:
+        """
+        检查通知输出中是否有地图 app 的通知包含导航结束关键词。
+        返回: 命中结束关键词的 app_package，或 None。
+
+        用途：当 _check_navigation_notification 返回 None 时（可能是没有通知，
+        也可能是通知包含结束关键词），通过本方法区分"明确结束"与"无通知"。
+        如果明确检测到结束关键词，应立即判定导航结束，不等 3 次 miss。
+        """
+        records = re.split(r'StatusBarNotification\(|NotificationRecord\(', output)
+        for record in records[1:]:
+            pkg = None
+            for pat in [r'pkg=([^\s,)}]+)', r'package=([^\s,)}]+)', r'\|([^|]+)\|']:
+                m = re.search(pat, record)
+                if m:
+                    candidate = m.group(1).strip()
+                    if candidate in MAP_APPS:
+                        pkg = candidate
+                        break
+            if not pkg or pkg not in MAP_APPS:
+                continue
+            title, text, _ = self._extract_notification_fields(record)
+            combined = f"{title} {text}"
+            for end_kw in NAVIGATION_END_KEYWORDS:
+                if end_kw in combined:
+                    self._debug_log(f"  End keyword '{end_kw}' found in {pkg} notification: '{combined[:60]}'")
+                    return pkg
+        return None
 
     def _poll_loop(self):
         """后台轮询循环"""
@@ -286,6 +347,7 @@ class NavigationMonitor:
 
         while self._running:
             try:
+                self._debug_log(f"--- poll tick ---")
                 navi_by_notif = None
                 navi_by_activity = None
                 current_pkg = None
@@ -295,6 +357,8 @@ class NavigationMonitor:
 
                 # 方式1：检测前台Activity（辅助）
                 cur_pkg, cur_act = self._fetch_current_activity()
+                if cur_pkg:
+                    self._debug_log(f"  Current activity: pkg={cur_pkg}, act={cur_act}")
                 if cur_pkg and cur_pkg in MAP_APPS:
                     current_pkg = cur_pkg
                     current_act = cur_act
@@ -303,26 +367,36 @@ class NavigationMonitor:
 
                 # 方式2：检测导航通知（主）
                 notif_output = self._fetch_notifications_raw()
+                notif_end_pkg = None
                 if notif_output:
                     navi_by_notif = self._check_navigation_notification(notif_output)
                     if navi_by_notif:
                         notif_title = navi_by_notif[2]
                         notif_text = navi_by_notif[3]
+                    else:
+                        # 通知检测返回 None → 检查是否因为结束关键词
+                        notif_end_pkg = self._check_navigation_end_in_notifications(notif_output)
 
                 # 综合判定
                 navi_result = None
                 detect_source = ""
 
-                # 通知检测优先级更高（更准确）
-                if navi_by_notif:
+                # ★ 关键：如果通知明确检测到结束关键词，直接判定为非导航中，
+                #   不用 Activity 检测覆盖（导航结束后 app 可能仍在导航 Activity）
+                if notif_end_pkg:
+                    navi_result = None
+                    detect_source = "notification-end"
+                elif navi_by_notif:
                     navi_result = navi_by_notif
                     detect_source = "notification"
-                    # 如果Activity也检测到，标记为both
                     if navi_by_activity and navi_by_activity[0] == navi_by_notif[0]:
                         detect_source = "both"
+                # ★ 不再用 Activity 单独判定导航开始：
+                #   高德主界面/路线规划 Activity 名可能含 "route"/"navi"，
+                #   会导致"打开地图就放大"的误触发。
+                #   导航一定有 ongoing 通知，以通知为准，Activity 仅作辅助确认。
                 elif navi_by_activity:
-                    navi_result = navi_by_activity
-                    detect_source = "activity"
+                    self._debug_log(f"Activity-only navi hint for {current_pkg} (act={current_act}), ignored (require notification)")
 
                 with self._lock:
                     now = time.time()
@@ -353,8 +427,9 @@ class NavigationMonitor:
                         # 只有连续多次检测不到才判定为结束（防止单次检测失败误判）
                         if self._state.is_navigating:
                             consecutive_miss += 1
-                            self._debug_log(f"Navigation not detected, miss count={consecutive_miss}/3")
-                            if consecutive_miss >= 3:
+                            self._debug_log(f"Navigation not detected, miss count={consecutive_miss}/3 (source={detect_source})")
+                            # 如果是通知明确检测到结束关键词，立即结束，不等 3 次
+                            if notif_end_pkg or consecutive_miss >= 3:
                                 # 导航结束
                                 ended_state = NavigationState()
                                 ended_state.is_navigating = False

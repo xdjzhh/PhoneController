@@ -521,8 +521,8 @@ class ActionHandler:
 
     @staticmethod
     def _default_takeover(message: str) -> None:
-        """Default takeover callback using console input."""
-        input(f"{message}\nPress Enter after completing manual operation...")
+        """Default takeover callback - no longer blocks, just prints and returns."""
+        print(f"{message}\n(no manual wait, continuing to next screenshot)")
 
 
 def parse_action(response: str) -> dict[str, Any]:

@@ -407,6 +407,33 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                 except Exception as e:
                     print(f"[DockToolbar] Toggle thinking edit error: {e}", flush=True)
 
+        def _uu_desktop_index(self):
+            """UU 远程所在虚拟桌面编号（0-based，左→右）。
+            优先读 bootstrap 落盘的 .vd_state.json（单一真相源），缺失/异常时默认 2。"""
+            try:
+                root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                with open(os.path.join(root, '.vd_state.json'), 'r', encoding='utf-8') as f:
+                    st = json.load(f)
+                return int(st.get('uu_desktop', 2))
+            except Exception:
+                return 2
+
+        def _switch_to_uu_desktop(self):
+            """点击「电脑」按钮：直接切换到 UUdesk（GameViewer）所在虚拟桌面。
+            与 virtual_desktop.py switch 子命令同一套 pyvda 调用（0-based 索引）。"""
+            idx = self._uu_desktop_index()
+            try:
+                from pyvda import get_virtual_desktops
+                desktops = get_virtual_desktops()
+                if 0 <= idx < len(desktops):
+                    desktops[idx].go()
+                    print(f"[DockToolbar] 已切换到 UU 远程桌面 #{idx}", flush=True)
+                else:
+                    print(f"[DockToolbar] UU 桌面 #{idx} 越界（当前共 {len(desktops)} 个虚拟桌面），未切换。",
+                          flush=True)
+            except Exception as e:
+                print(f"[DockToolbar] 切换 UU 桌面失败: {e}", flush=True)
+
         def _do_fade(self):
             target = 0.92 if self._hovering else 0.0
             diff = target - self._opacity
@@ -623,6 +650,8 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                 self._pressed_icon = -1
                 if icon_idx == 0 and pressed == 0:
                     self._toggle_edit_mode()
+                elif icon_idx == 1 and pressed == 1:
+                    self._switch_to_uu_desktop()
                 self.update()
             event.accept()
 

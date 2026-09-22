@@ -43,7 +43,10 @@ py -3.10 virtual_desktop.py bootstrap --server-min-hwnds 7 --server-wait-ms 2500
    - **UU 已运行且窗口开着**：不重复启动，直接把窗口归位到桌面 2；
    - **UU 已运行但缩在系统托盘（最常见）**：自动再启动一次 exe 把旧实例的主窗口**唤出到桌面 2**（单例软件不会开第二个程序），日志可见 `✅ 远程客户端主窗口已唤出并归位到桌面 #2`；
 4. 启动常驻 watcher（每 1.5s 巡检）：AI 运行中**动态新开的 scrcpy 卡片**、从托盘里点开的 **UU 窗口**，都会在约 2 秒内自动搬回正确桌面；
-5. 切回桌面 0，并把本次会话的 PID 写入 `.vd_state.json`。
+5. 在桌面 2 放置**回程 Dock**（[front/uu_dock.py](file:///d:/TraeProj/Open-AutoGLM/front/uu_dock.py)，与桌面 1 的 AR Dock 同款、屏幕底部悬停唤出）：
+   - 左「设置」：占位按钮，**无功能**；
+   - 右「电脑」：点击直接切回手机控制界面（桌面 1）；
+6. 切回桌面 0，并把本次会话的 PID（含回程 Dock PID）写入 `.vd_state.json`。
 
 看到下面这行代表 100% 隔离成功：
 
@@ -75,7 +78,7 @@ py -3.10 virtual_desktop.py stop
 
 停止顺序：
 
-1. 先杀 watcher（防止清理过程中它来回搬窗口）；
+1. 先杀 watcher 和桌面 2 的回程 Dock（防止清理过程中窗口被来回搬动）；
 2. 向 server.py **发送 CTRL_C**：server 收到 `KeyboardInterrupt` 后走 `atexit`，逐个终止全部 scrcpy 子进程，**端口 8080 释放、无孤儿进程**；
 3. 12 秒内没退出才自动回退 `taskkill /PID /T /F` 强杀整棵进程树；
 4. 删除 `.vd_state.json`。
@@ -125,6 +128,7 @@ py -3.10 virtual_desktop.py stop
 | `--return-to` | `original` | 编排结束后回到哪个桌面：`original` 或 `0/1/2` |
 | `--force-new-uu` | 关 | UU 已运行时也强制重新启动它 |
 | `--no-watcher` | 关 | 不启动常驻 watcher（动态新窗口将无人归位，不建议） |
+| `--no-uu-dock` | 关 | 不在桌面 2 放置回程 Dock（front/uu_dock.py） |
 | `--server-no-window` | 关 | 隐藏 server 控制台（**注意：无控制台时 stop 无法发 CTRL_C，会改走强杀**） |
 
 ## 8. 虚拟桌面管理子命令（按需使用）

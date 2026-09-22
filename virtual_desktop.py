@@ -891,6 +891,9 @@ from datetime import datetime as _datetime
 
 _STATE_FILE = _SCRIPT_DIR / ".vd_state.json"
 _WATCHER_LOG = _SCRIPT_DIR / ".vd_watcher.log"
+# UU 桌面（#2）上的回程 Dock：front/uu_dock.py，只由 bootstrap 在 #2 启动
+_UU_DOCK_SCRIPT = _SCRIPT_DIR / "front" / "uu_dock.py"
+_UU_DOCK_LOG = _SCRIPT_DIR / ".vd_uudock.log"
 
 # 需要归位到"远程桌面"的客户端主进程名（小写）。必须按**进程名**全局识别，
 # 因为"早已运行"的 UU 不是 bootstrap 的子孙，按进程树枚举永远找不到它。
@@ -1041,11 +1044,14 @@ def do_watch(args) -> int:
     server_pid = int(st["server_pid"])
     server_desk = int(st.get("server_desktop", 1))
     uu_desk = int(st.get("uu_desktop", 2))
+    uu_dock_pid = st.get("uu_dock_pid")
     print(f"[watcher] 启动：server PID={server_pid}→#{server_desk}，"
-          f"远程客户端→#{uu_desk}，轮询间隔 {interval}s", flush=True)
+          f"远程客户端→#{uu_desk}，回程Dock PID={uu_dock_pid}→#{uu_desk}，"
+          f"轮询间隔 {interval}s", flush=True)
 
     fail_s: dict[int, int] = {}
     fail_u: dict[int, int] = {}
+    fail_d: dict[int, int] = {}
     missed = 0
     while True:
         if not _pid_alive(server_pid):
@@ -1059,6 +1065,10 @@ def do_watch(args) -> int:
                               server_desk, fail_s, "server")
         # UU 无论 server 死活都持续归位（用户可能在停服后仍使用远程桌面）
         _move_wrong_hwnds(_remote_pids(), uu_desk, fail_u, "uu")
+        # UU 桌面上的回程 Dock（front/uu_dock.py）始终钉在 #2
+        if uu_dock_pid and _pid_alive(uu_dock_pid):
+            _move_wrong_hwnds(_collect_descendant_pids(int(uu_dock_pid)),
+                              uu_desk, fail_d, "uu-dock")
         _time.sleep(interval)
 
 
@@ -1143,6 +1153,7 @@ def do_stop(args) -> int:
 
     watcher_pid = st.get("watcher_pid")
     server_pid = st.get("server_pid")
+    uu_dock_pid = st.get("uu_dock_pid")
 
     # 从这里起本进程忽略 CTRL_C：助手把 CTRL_C 广播到 server 所在控制台的
     # 进程组 0，若调用方恰好共享该控制台（单控制台宿主/同窗口调试），
@@ -1152,6 +1163,11 @@ def do_stop(args) -> int:
         if _pid_alive(watcher_pid):
             _taskkill_tree(int(watcher_pid))
             print(f"[stop] watcher PID={watcher_pid} 已停止。", flush=True)
+
+        # UU 桌面回程 Dock（纯 UI 助手进程，直接强杀无副作用）
+        if uu_dock_pid and _pid_alive(uu_dock_pid):
+            _taskkill_tree(int(uu_dock_pid))
+            print(f"[stop] UU 回程 Dock PID={uu_dock_pid} 已停止。", flush=True)
 
         if _pid_alive(server_pid):
             print(f"[stop] 向 server.py PID={server_pid} 发送 CTRL_C（优雅退出，最多等 12s）...", flush=True)
@@ -1219,6 +1235,10 @@ def do_status(args) -> int:
           f"{'🟢 运行中' if _pid_alive(st.get('server_pid')) else '⚪ 已退出'} → 桌面 #{st.get('server_desktop')}")
     print(f"  watcher       : PID={st.get('watcher_pid')} "
           f"{'🟢 运行中' if _pid_alive(st.get('watcher_pid')) else '⚪ 已退出'}")
+    dock_pid = st.get('uu_dock_pid')
+    if dock_pid:
+        print(f"  UU回程Dock    : PID={dock_pid} "
+              f"{'🟢 运行中' if _pid_alive(dock_pid) else '⚪ 已退出'} → 桌面 #{st.get('uu_desktop')}")
     print(f"  UU 远程       : {'早已运行(按进程名归位)' if st.get('uu_preexisting') else 'bootstrap 启动'} "
           f"→ 桌面 #{st.get('uu_desktop')}，PID={st.get('uu_pids')}")
     print(vd.info())
@@ -1379,6 +1399,31 @@ def do_bootstrap(args) -> int:
                 pollers_to_wait.append(uu_poller)
 
     # =====================================================================
+    # Step 3.5：桌面 #2 启动回程 Dock（front/uu_dock.py）
+    #   与桌面 #1 的 AR Dock 同款：设置(占位无功能) + 电脑(切回 server 桌面)。
+    #   必须先切到 #2 再 Popen，窗口初始桌面才是 #2；detached 独立进程，
+    #   PID 落 state，watcher 持续归位，stop 时强杀（纯 UI 助手无清理负担）。
+    # =====================================================================
+    uu_dock_pid = None
+    if not bool(getattr(args, "no_uu_dock", False)) and _UU_DOCK_SCRIPT.exists():
+        try:
+            vd.switch(2)
+            dock_fp = open(_UU_DOCK_LOG, "a", encoding="utf-8")
+            p_uudock = subprocess.Popen(
+                [sys.executable, str(_UU_DOCK_SCRIPT)],
+                cwd=str(_SCRIPT_DIR),
+                stdout=dock_fp, stderr=subprocess.STDOUT, close_fds=True,
+                creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            )
+            uu_dock_pid = p_uudock.pid
+            print(f"\n[bootstrap] 🖥️  UU 桌面回程 Dock 已在 #2 启动 PID={uu_dock_pid}"
+                  f"（设置=占位，电脑=切回手机控制桌面；日志 .vd_uudock.log）")
+        except Exception as e:
+            print(f"[bootstrap] ⚠️  UU 回程 Dock 启动失败（不影响主链路）: {e!r}")
+    elif not _UU_DOCK_SCRIPT.exists():
+        print(f"[bootstrap] ⚠️  未找到 {_UU_DOCK_SCRIPT}，跳过 UU 回程 Dock。")
+
+    # =====================================================================
     # Step 4：切回用户原桌面（桌面 0）
     # =====================================================================
     back_to = _parse_return_to(getattr(args, "return_to", _DEFAULT_RETURN_TO), original_idx)
@@ -1511,6 +1556,7 @@ def do_bootstrap(args) -> int:
             "uu_pids": sorted(uu_record_pids),
             "uu_desktop": 2,
             "uu_preexisting": uu_preexisting,
+            "uu_dock_pid": uu_dock_pid,
             "watcher_pid": None,
         }
         _save_state(state)  # watcher 启动即读，必须先落盘
@@ -1613,6 +1659,8 @@ def main() -> int:
                         help="即使检测到 UU 远程已在运行，也强制重新 Popen（默认跳过，由 watcher 归位旧实例）")
     p_boot.add_argument("--no-watcher", action="store_true",
                         help="不启动常驻归位 watcher（动态新开的 scrcpy 卡片/托盘点开的 UU 将无人归位）")
+    p_boot.add_argument("--no-uu-dock", action="store_true",
+                        help="不在桌面 #2 启动回程 Dock（front/uu_dock.py：电脑按钮切回手机控制桌面）")
 
     # watcher（内部命令，由 bootstrap 以 detached 方式自启，也可手动运行排障）
     p_watch = sub.add_parser("watch", help=argparse.SUPPRESS)

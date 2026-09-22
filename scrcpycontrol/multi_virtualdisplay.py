@@ -33,6 +33,66 @@ from front.card_window import (
 from front.window_config import WindowConfig
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 进程级 scrcpy 启动握手互斥锁
+#
+# 根因：scrcpy 默认走 reverse tunnel，设备端 abstract socket 名固定为
+# "localabstract:scrcpy"，而 `adb reverse` 映射是【整机全局】状态。两个
+# scrcpy 实例并发启动时（一个还在 push server / 等待 server 连接，另一个
+# 就执行了 adb reverse），后到的 reverse 映射会覆盖前者，先启动者的 server
+# 连上错误的 client → client 端打印 "Aborted" /
+# "ERROR: Server connection failed" 硬失败；同时并发 adb push 到同一个
+# /data/local/tmp/scrcpy-server 文件也可能互相破坏。
+#
+# 策略（来自既有故障经验）：只串行化「Popen → adb push → adb reverse →
+# app_process → server 连接建立」这段共享 ADB 资源窗口；握手成功后立即放
+# 锁，窗口装饰 / app 拉起 / 监控等其余阶段继续并行。禁止用固定 sleep 充当
+# 唯一手段——必须以 server 实际握手信号为准。
+_SCRCPY_BOOT_LOCK = threading.Lock()
+_SCRCPY_HANDSHAKE_TIMEOUT = 45
+
+# 握手窗口内出现这些行 = 启动链路硬失败（区别于退出阶段的 "Stream closed"）
+_BOOT_FAILURE_MARKERS = (
+    "server connection failed",
+    "aborted",
+    "could not find any adb device",
+    "device not found",
+    "adb: error",
+    "failed to push",
+)
+
+
+def _is_boot_failure_line(line):
+    low = (line or "").lower()
+    return any(marker in low for marker in _BOOT_FAILURE_MARKERS)
+
+
+def _teardown_failed_process(process, window_title):
+    """启动失败路径：等进程退出、抽取关键输出、兜底 kill。返回输出尾部文本。"""
+    tail = ""
+    try:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            raw = process.stdout.read()
+            if raw:
+                tail = raw.decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    except Exception as e:
+        print(f"[{window_title}] Teardown error after boot failure: {e}")
+    return tail
+
+
 class MainDisplay:
     """
     Main display that mirrors the physical phone screen.
@@ -70,6 +130,10 @@ class MainDisplay:
         self.stop_event = threading.Event()
         self._hwnd = None
         self._style_thread = None
+        # 握手状态：server 连接建立前，scrcpy 启动全程持有进程级互斥锁
+        self._server_ready = threading.Event()
+        self._boot_error = None
+        self._handshake_done = False
 
     def _find_scrcpy(self):
         """Find scrcpy executable in PATH or common install locations."""
@@ -115,6 +179,8 @@ class MainDisplay:
         cmd.extend(["--max-fps", str(cfg.max_fps)])
         cmd.extend(["--video-bit-rate", cfg.bitrate])
         cmd.extend(["--video-codec", cfg.video_codec])
+        if cfg.video_buffer_ms:
+            cmd.extend(["--video-buffer", str(cfg.video_buffer_ms)])
 
         # Behavior flags
         if cfg.keep_active:
@@ -136,11 +202,48 @@ class MainDisplay:
         cmd.extend(["--port", str(port)])
         return cmd
 
+    def _wait_handshake(self):
+        """
+        在 _SCRCPY_BOOT_LOCK 内同步等待 scrcpy server 握手完成。
+
+        成功标记（由 _read_output 解析到该行时 set event）：
+          主屏：'[server] INFO: Device: ...'（server 已连上本 client 并交换
+                options，此后 adb reverse 映射即使被别的实例覆盖也与本实例无关）
+        失败标记：'Server connection failed' / 'Aborted' 等硬失败行，
+                或 scrcpy 进程提前退出。
+        超时：进程仍存活但迟迟没有标记 → 保守放行（仅打印告警），避免在极端
+                慢设备上误杀一个其实正常的实例。
+        """
+        start_time = time.time()
+        while time.time() - start_time < _SCRCPY_HANDSHAKE_TIMEOUT:
+            if self._boot_error is not None:
+                return False
+            if self.process.poll() is not None:
+                if self._boot_error is None:
+                    self._boot_error = f"scrcpy exited early (code={self.process.returncode})"
+                return False
+            if self._server_ready.is_set():
+                self._handshake_done = True
+                return True
+            time.sleep(0.3)
+
+        print(f"[{self.window_title}] WARNING: handshake marker not seen within "
+              f"{_SCRCPY_HANDSHAKE_TIMEOUT}s (process still alive, continuing optimistically)")
+        self._handshake_done = True
+        return True
+
     def start(self, port=8887):
-        """Start the main scrcpy display process and apply card styling."""
+        """
+        Start the main scrcpy display process and apply card styling.
+
+        Returns:
+            True if the scrcpy server handshake succeeded, False on hard
+            startup failure (caller MUST check this instead of only reading
+            .running).
+        """
         if self.running:
             print(f"[{self.window_title}] Already running")
-            return
+            return True
 
         cmd = self._build_command(port)
         print(f"[{self.window_title}] Starting: {' '.join(cmd)}")
@@ -148,44 +251,60 @@ class MainDisplay:
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
 
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-            env=env
-        )
-
-        self.running = True
-        self.stop_event.clear()
-        print(f"[{self.window_title}] Main display started (PID: {self.process.pid})")
-
-        # Check for immediate startup failure
-        time.sleep(1.5)
-        if self.process.poll() is not None:
-            self.running = False
-            exit_code = self.process.returncode
-            output = ""
+        # 关键区：push server → adb reverse → app_process → server 连上本
+        # client。此窗口内整机只允许一个 scrcpy 实例处于该阶段。
+        with _SCRCPY_BOOT_LOCK:
             try:
-                output = self.process.stdout.read().decode('utf-8', errors='replace')
-            except:
-                pass
-            print(f"[{self.window_title}] FAILED to start (exit code: {exit_code})")
-            if output:
-                print(f"[{self.window_title}] Output:\n{output[:1000]}")
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=0,
+                    env=env
+                )
+            except Exception as e:
+                print(f"[{self.window_title}] FAILED to launch scrcpy: {e}")
+                self.process = None
+                self.running = False
+                return False
+
+            self.running = True
+            self.stop_event.clear()
+            self._server_ready.clear()
+            self._boot_error = None
+            self._handshake_done = False
+            print(f"[{self.window_title}] Main display started (PID: {self.process.pid})")
+
+            # 输出线程必须在等待标记前就启动，否则会漏掉 server 的早期日志
+            self.output_thread = threading.Thread(
+                target=self._read_output, daemon=True
+            )
+            self.output_thread.start()
+
+            handshake_ok = self._wait_handshake()
+
+        if not handshake_ok:
+            print(f"[{self.window_title}] ❌ FAILED to start: {self._boot_error}")
+            tail = _teardown_failed_process(self.process, self.window_title)
+            if tail:
+                # 只打印与失败强相关的行，避免多线程输出里关键信息被淹没
+                key_lines = [ln for ln in tail.splitlines()
+                             if ln.strip() and (_is_boot_failure_line(ln)
+                                               or 'server' in ln.lower()
+                                               or 'error' in ln.lower()
+                                               or 'pushed' in ln.lower())]
+                snippet = "\n".join(key_lines[-12:]) if key_lines else tail[-800:]
+                print(f"[{self.window_title}] scrcpy output tail:\n{snippet}")
             self.process = None
-            return
+            self.running = False
+            return False
 
-        # Start background threads
-        self.output_thread = threading.Thread(
-            target=self._read_output, daemon=True
-        )
-        self.output_thread.start()
-
+        # 握手已完成 → 窗口装饰等非关键工作并行进行
         self._style_thread = threading.Thread(
             target=self._apply_card_style_delayed, daemon=True
         )
         self._style_thread.start()
+        return True
 
     def _read_output(self):
         """Read and print scrcpy stdout/stderr in a background thread."""
@@ -204,9 +323,23 @@ class MainDisplay:
 
                 if decoded_line:
                     print(f"[{self.window_title}] {decoded_line}")
+                    self._scan_handshake_line(decoded_line)
         except Exception as e:
             if self.running and not self.stop_event.is_set():
                 print(f"[{self.window_title}] Output reader error: {e}")
+
+    def _scan_handshake_line(self, decoded_line):
+        """从 scrcpy 输出行中识别握手成功 / 硬失败标记（仅握手窗口内生效）。"""
+        if self._handshake_done:
+            return
+        low = decoded_line.lower()
+        # 主屏成功标记：[server] INFO: Device: <model> (Android x)
+        if "[server]" in low and "device:" in low:
+            self._server_ready.set()
+            return
+        if _is_boot_failure_line(decoded_line):
+            self._boot_error = decoded_line
+            self._server_ready.set()
 
     def _find_window_by_title(self, title):
         """Find scrcpy window HWND by title using Win32 EnumWindows."""
@@ -372,6 +505,10 @@ class AppVirtualDisplay:
         self._style_thread = None
         self.output_thread = None
         self.app_thread = None
+        # 握手状态：server 建连并创建虚拟屏前，scrcpy 启动全程持有进程级互斥锁
+        self._server_ready = threading.Event()
+        self._boot_error = None
+        self._handshake_done = False
 
     def _find_scrcpy(self):
         """Find scrcpy executable in PATH or common install locations."""
@@ -435,6 +572,8 @@ class AppVirtualDisplay:
         cmd.extend(["--max-fps", str(cfg.max_fps)])
         cmd.extend(["--video-bit-rate", cfg.bitrate])
         cmd.extend(["--video-codec", cfg.video_codec])
+        if cfg.video_buffer_ms:
+            cmd.extend(["--video-buffer", str(cfg.video_buffer_ms)])
 
         # Behavior flags
         if cfg.no_vd_system_decorations:
@@ -459,11 +598,46 @@ class AppVirtualDisplay:
 
         return cmd
 
+    def _wait_handshake(self):
+        """
+        在 _SCRCPY_BOOT_LOCK 内同步等待 scrcpy server 握手 + 虚拟屏创建完成。
+
+        成功标记：'[server] INFO: New display: WxH/dpi (id=N)'
+        （该行出现时 server 已连上本 client、VirtualDisplay 已创建，且
+        android_display_id 已解析——这是后续 am start --display 的前置条件）
+        失败标记：'Server connection failed' / 'Aborted' 等硬失败行，
+        或 scrcpy 进程提前退出。
+        """
+        start_time = time.time()
+        while time.time() - start_time < _SCRCPY_HANDSHAKE_TIMEOUT:
+            if self._boot_error is not None:
+                return False
+            if self.process.poll() is not None:
+                if self._boot_error is None:
+                    self._boot_error = f"scrcpy exited early (code={self.process.returncode})"
+                return False
+            if self._server_ready.is_set():
+                self._handshake_done = True
+                return True
+            time.sleep(0.3)
+
+        print(f"[{self.window_title}] WARNING: 'New display:' marker not seen within "
+              f"{_SCRCPY_HANDSHAKE_TIMEOUT}s (process still alive, continuing optimistically)")
+        self._handshake_done = True
+        return True
+
     def start(self):
-        """Start the app virtual display: launch scrcpy, apply style, launch app."""
+        """
+        Start the app virtual display: launch scrcpy, apply style, launch app.
+
+        Returns:
+            True if the scrcpy server handshake succeeded and the Android
+            virtual display ID was parsed, False on hard startup failure.
+            Callers MUST check the return value (not only .running).
+        """
         if self.running:
             print(f"[{self.window_title}] Already running")
-            return
+            return True
 
         cmd = self._build_command()
         print(f"[{self.window_title}] Starting: {' '.join(cmd)}")
@@ -471,39 +645,55 @@ class AppVirtualDisplay:
         env = os.environ.copy()
         env['PYTHONIOENCODING'] = 'utf-8'
 
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-            env=env
-        )
-
-        self.running = True
-        print(f"[{self.window_title}] Virtual display started (PID: {self.process.pid})")
-
-        # Check for immediate startup failure
-        time.sleep(1.5)
-        if self.process.poll() is not None:
-            self.running = False
-            exit_code = self.process.returncode
-            output = ""
+        # 关键区：push server → adb reverse → app_process → server 连接 →
+        # VirtualDisplay 创建。此窗口内整机只允许一个 scrcpy 实例处于该阶段，
+        # 否则后启动者的 adb reverse（设备端 abstract socket 名固定）会顶掉
+        # 本实例的映射 → "Aborted / Server connection failed"。
+        with _SCRCPY_BOOT_LOCK:
             try:
-                output = self.process.stdout.read().decode('utf-8', errors='replace')
-            except:
-                pass
-            print(f"[{self.window_title}] FAILED to start (exit code: {exit_code})")
-            if output:
-                print(f"[{self.window_title}] Output:\n{output[:1500]}")
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=0,
+                    env=env
+                )
+            except Exception as e:
+                print(f"[{self.window_title}] FAILED to launch scrcpy: {e}")
+                self.process = None
+                self.running = False
+                return False
+
+            self.running = True
+            self._server_ready.clear()
+            self._boot_error = None
+            self._handshake_done = False
+            print(f"[{self.window_title}] Virtual display started (PID: {self.process.pid})")
+
+            # 输出线程必须先启动，'New display:' 行由它解析并唤醒握手等待
+            self.output_thread = threading.Thread(
+                target=self._read_output, daemon=True
+            )
+            self.output_thread.start()
+
+            handshake_ok = self._wait_handshake()
+
+        if not handshake_ok:
+            print(f"[{self.window_title}] ❌ FAILED to start: {self._boot_error}")
+            tail = _teardown_failed_process(self.process, self.window_title)
+            if tail:
+                key_lines = [ln for ln in tail.splitlines()
+                             if ln.strip() and (_is_boot_failure_line(ln)
+                                               or 'new display' in ln.lower()
+                                               or 'server' in ln.lower()
+                                               or 'pushed' in ln.lower())]
+                snippet = "\n".join(key_lines[-12:]) if key_lines else tail[-800:]
+                print(f"[{self.window_title}] scrcpy output tail:\n{snippet}")
             self.process = None
-            return
+            self.running = False
+            return False
 
-        # Start background threads
-        self.output_thread = threading.Thread(
-            target=self._read_output, daemon=True
-        )
-        self.output_thread.start()
-
+        # 握手完成 → 窗口装饰 / app 拉起 / 监控全部并行
         self._style_thread = threading.Thread(
             target=self._apply_card_style_delayed, daemon=True
         )
@@ -525,6 +715,7 @@ class AppVirtualDisplay:
         # Monitor if the app closes, auto-stop the display (skip for special modes)
         if self.app_package and getattr(self.config, 'special_mode', None) is None:
             self._start_app_monitor()
+        return True
 
     def _read_output(self):
         """Read scrcpy output and parse the Android virtual display ID from logs."""
@@ -546,11 +737,18 @@ class AppVirtualDisplay:
 
                     # Parse Android display ID from scrcpy log:
                     # "[server] INFO: New display: 720x720/480 (id=4)"
+                    # 该行同时也是握手成功标记（server 已建连、VD 已创建）
                     if "New display:" in decoded_line and "id=" in decoded_line:
                         match = re.search(r'id=(\d+)', decoded_line)
                         if match:
                             self.android_display_id = int(match.group(1))
                             print(f"[{self.window_title}] Parsed Android display ID: {self.android_display_id}")
+                            if not self._handshake_done:
+                                self._server_ready.set()
+                    elif not self._handshake_done and _is_boot_failure_line(decoded_line):
+                        # Aborted / Server connection failed 等硬失败 → 唤醒握手等待
+                        self._boot_error = decoded_line
+                        self._server_ready.set()
         except Exception as e:
             if self.running:
                 print(f"[{self.window_title}] Output reader error: {e}")
@@ -651,6 +849,40 @@ class AppVirtualDisplay:
         user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
         return result[0]
 
+    @staticmethod
+    def _parse_scrcpy_display_id_from_dump(dumpsys_result):
+        """
+        从 `dumpsys display` 输出中定位 scrcpy 创建的虚拟屏 ID。
+
+        旧实现 re.search(r'Display Id=(\\d+).*VirtualDisplay', DOTALL) 是
+        贪婪匹配：当虚拟屏根本没创建成功时，它会从物理屏的 'Display Id=0'
+        一路匹配到 dump 后文任意一处 'VirtualDisplay' 字样 → 错误返回 0 →
+        app 被 am start 到物理屏（日志里 "Fallback: Found display ID 0"
+        的根因）。这里按 'Display Id=' 切块逐段判断：
+          · 永远排除 display 0（物理屏）
+          · 只接受块内带 scrcpy / virtualdisplay / virtual 标识的段
+          · 多实例时取最大 ID（最新创建）
+        找不到返回 None——调用方必须放弃启动，绝不允许落到 display 0。
+        """
+        if not dumpsys_result:
+            return None
+        candidates = []
+        for block in re.split(r'(?=^Display Id=)', dumpsys_result,
+                             flags=re.MULTILINE):
+            m = re.match(r'Display Id=(\d+)', block)
+            if not m:
+                continue
+            did = int(m.group(1))
+            if did == 0:
+                continue
+            low = block.lower()
+            if ('scrcpy' in low or 'virtualdisplay' in low
+                    or 'virtual:' in low or 'uniqueid=virtual' in low):
+                candidates.append(did)
+        if not candidates:
+            return None
+        return max(candidates)
+
     def _show_notification_panel(self):
         """
         Show the Android notification shade on this virtual display.
@@ -677,12 +909,13 @@ class AppVirtualDisplay:
 
             if self.android_display_id is None:
                 dumpsys_result = device.shell("dumpsys display")
-                match = re.search(r'Display Id=(\d+).*VirtualDisplay', dumpsys_result, re.DOTALL)
-                if match:
-                    self.android_display_id = int(match.group(1))
-                    print(f"[{self.window_title}] Fallback: Found display ID {self.android_display_id}")
+                fallback_id = self._parse_scrcpy_display_id_from_dump(dumpsys_result)
+                if fallback_id is not None:
+                    self.android_display_id = fallback_id
+                    print(f"[{self.window_title}] Fallback: Found scrcpy virtual display ID {self.android_display_id}")
                 else:
-                    print(f"[{self.window_title}] Error: Could not determine display ID")
+                    print(f"[{self.window_title}] Error: Could not determine virtual display ID "
+                          f"(no scrcpy VirtualDisplay in dumpsys; NOT falling back to display 0)")
                     return
 
             display_id = self.android_display_id
@@ -805,12 +1038,16 @@ class AppVirtualDisplay:
             if self.android_display_id is None:
                 print(f"[{self.window_title}] Warning: Could not parse Android display ID, using fallback")
                 dumpsys_result = device.shell("dumpsys display")
-                match = re.search(r'Display Id=(\d+).*VirtualDisplay', dumpsys_result, re.DOTALL)
-                if match:
-                    self.android_display_id = int(match.group(1))
-                    print(f"[{self.window_title}] Fallback: Found display ID {self.android_display_id}")
+                fallback_id = self._parse_scrcpy_display_id_from_dump(dumpsys_result)
+                if fallback_id is not None:
+                    self.android_display_id = fallback_id
+                    print(f"[{self.window_title}] Fallback: Found scrcpy virtual display ID {self.android_display_id}")
                 else:
-                    print(f"[{self.window_title}] Error: Could not determine display ID")
+                    # 绝不能像旧实现那样错误回退到 display 0——那会把 app
+                    # 直接拉到物理屏上（高德地图事故的第二环）。
+                    print(f"[{self.window_title}] Error: Could not determine virtual display ID "
+                          f"(no scrcpy VirtualDisplay in dumpsys; aborting app launch, "
+                          f"NOT falling back to display 0)")
                     return
 
             display_id = self.android_display_id
@@ -1079,7 +1316,7 @@ class MultiVirtualDisplay:
         print("All virtual displays stopped")
 
     def _cleanup_server(self):
-        """Remove scrcpy-server.jar from the device to avoid stale state."""
+        """Remove the pushed scrcpy server binary from the device to avoid stale state."""
         try:
             if self.device_serial:
                 device = adbutils.adb.device(self.device_serial)
@@ -1089,8 +1326,10 @@ class MultiVirtualDisplay:
                     return
                 device = devices[0]
 
-            device.shell("rm -f /data/local/tmp/scrcpy-server.jar")
-            print("Cleaned up scrcpy-server.jar")
+            # scrcpy v4.x 推送的是无后缀二进制 scrcpy-server；旧版本是 .jar
+            device.shell("rm -f /data/local/tmp/scrcpy-server "
+                         "/data/local/tmp/scrcpy-server.jar")
+            print("Cleaned up scrcpy-server binary on device")
         except Exception as e:
             print(f"Cleanup warning: {e}")
 

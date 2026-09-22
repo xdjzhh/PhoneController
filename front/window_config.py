@@ -59,6 +59,9 @@ class WindowConfig:
     max_fps: int = 60
     bitrate: str = "8M"
     video_codec: str = "h264"
+    # 客户端显示前的抖动缓冲（毫秒）。无线链路建议视频类卡片设 80~150，
+    # 以延迟换流畅；交互主屏保持 None（不追加参数，scrcpy 默认 0）。
+    video_buffer_ms: Optional[int] = None
     keep_active: bool = True
     turn_screen_off: bool = True
     stay_awake: bool = True
@@ -112,6 +115,7 @@ class WindowConfig:
             max_fps=cfg.get("max_fps", 60),
             bitrate=cfg.get("bitrate", "8M"),
             video_codec=cfg.get("video_codec", "h264"),
+            video_buffer_ms=cfg.get("video_buffer_ms"),
             keep_active=cfg.get("keep_active", True),
             turn_screen_off=cfg.get("turn_screen_off", True if is_main else False),
             stay_awake=cfg.get("stay_awake", True),

@@ -880,6 +880,352 @@ def _parse_return_to(return_to_arg: str, original_idx: int) -> int:
         raise ValueError(f"--return-to 必须是 'original' 或整数编号，收到：{return_to_arg}") from e
 
 
+# ---------------------------------------------------------------------------
+# 状态文件 / 进程工具 / 常驻归位 watcher / stop
+#   bootstrap 把 server.py / UU / watcher 的 PID 落盘到 .vd_state.json，
+#   `python virtual_desktop.py stop` 凭此优雅终止整条链路（CTRL_C →
+#   server.py 的 atexit stop_all 清理全部 scrcpy），无状态文件也不工作。
+# ---------------------------------------------------------------------------
+import json as _json
+from datetime import datetime as _datetime
+
+_STATE_FILE = _SCRIPT_DIR / ".vd_state.json"
+_WATCHER_LOG = _SCRIPT_DIR / ".vd_watcher.log"
+
+# 需要归位到"远程桌面"的客户端主进程名（小写）。必须按**进程名**全局识别，
+# 因为"早已运行"的 UU 不是 bootstrap 的子孙，按进程树枚举永远找不到它。
+_REMOTE_PROCESS_NAMES = {
+    "gameviewer.exe", "uuremote.exe", "uu-remote.exe",
+    "sunloginclient.exe", "todesk.exe",
+}
+# --kill-uu 时只关主程序，保留后台服务（避免误杀 UU 的更新/守护服务）
+_REMOTE_SERVICE_NAMES = {
+    "gameviewerservice.exe", "gameviewerserver.exe", "gameviewerhealthd.exe",
+}
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+
+_kernel32.OpenProcess.argtypes = [_wintypes.DWORD, _wintypes.BOOL, _wintypes.DWORD]
+_kernel32.OpenProcess.restype = _wintypes.HANDLE
+_kernel32.GetExitCodeProcess.argtypes = [_wintypes.HANDLE, _ctypes.POINTER(_wintypes.DWORD)]
+_kernel32.GetExitCodeProcess.restype = _wintypes.BOOL
+_kernel32.AttachConsole.argtypes = [_wintypes.DWORD]
+_kernel32.AttachConsole.restype = _wintypes.BOOL
+_kernel32.FreeConsole.argtypes = []
+_kernel32.FreeConsole.restype = _wintypes.BOOL
+_kernel32.GenerateConsoleCtrlEvent.argtypes = [_wintypes.DWORD, _wintypes.DWORD]
+_kernel32.GenerateConsoleCtrlEvent.restype = _wintypes.BOOL
+# PHANDLER_ROUTINE 此处只传 NULL（=切换"本进程忽略 CTRL 事件"属性），无需原型
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    if not pid or int(pid) <= 0:
+        return False
+    h = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        return False
+    try:
+        code = _wintypes.DWORD()
+        if not _kernel32.GetExitCodeProcess(h, _ctypes.byref(code)):
+            return False
+        return int(code.value) == _STILL_ACTIVE
+    finally:
+        _kernel32.CloseHandle(h)
+
+
+def _find_pids_by_names(name_set: set[str]) -> dict[str, list[int]]:
+    """进程名（小写）→ PID 列表。用于识别"非本脚本启动、早已运行"的 UU。"""
+    wanted = {n.lower() for n in name_set}
+    result: dict[str, list[int]] = {}
+    snapshot = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snapshot == _wintypes.HANDLE(-1).value:
+        return result
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = _ctypes.sizeof(_PROCESSENTRY32W)
+        if not _kernel32.Process32FirstW(snapshot, _ctypes.byref(entry)):
+            return result
+        while True:
+            nm = entry.szExeFile.lower()
+            if nm in wanted:
+                result.setdefault(nm, []).append(int(entry.th32ProcessID))
+            entry.dwSize = _ctypes.sizeof(_PROCESSENTRY32W)
+            if not _kernel32.Process32NextW(snapshot, _ctypes.byref(entry)):
+                break
+    finally:
+        _kernel32.CloseHandle(snapshot)
+    return result
+
+
+def _remote_pids() -> set[int]:
+    """所有远程客户端进程及其子孙 PID（托盘态服务无窗口，枚举到也无害）。"""
+    pids: set[int] = set()
+    for pid_list in _find_pids_by_names(_REMOTE_PROCESS_NAMES).values():
+        for pid in pid_list:
+            pids |= _collect_descendant_pids(pid)
+    return pids
+
+
+def _save_state(state: dict) -> None:
+    tmp = _STATE_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(state, f, ensure_ascii=False, indent=2)
+    _os.replace(tmp, _STATE_FILE)
+
+
+def _load_state() -> Optional[dict]:
+    try:
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def _clear_state() -> None:
+    try:
+        _STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _move_wrong_hwnds(pids: set[int], target_idx: int,
+                      fail_counts: dict[int, int], tag: str) -> int:
+    """一轮归位：pids 进程树中所有可见顶层窗，**每轮重新查真实桌面**，
+    凡不在 target_idx 的立刻迁走。返回本轮迁移窗口数。
+    注意：不能用"曾经正确"的 HWND 缓存跳过——窗口随时可能被用户拖拽/其他
+    程序/系统操作移出目标桌面，缓存会导致移走后再也搬不回来。"""
+    moved = 0
+    for hwnd in _enum_top_level_hwnds_for_pids(pids):
+        real = _get_hwnd_desktop_index(hwnd)
+        if real == target_idx:
+            fail_counts.pop(hwnd, None)
+            continue
+        ok, how = _pyvda_move_hwnd(hwnd, target_idx)
+        title = _get_window_title(hwnd, 40)
+        if ok:
+            fail_counts.pop(hwnd, None)
+            moved += 1
+            print(f"[watcher:{tag}] ✅ '{title}' #{real}→#{target_idx} ({how})", flush=True)
+        else:
+            fail_counts[hwnd] = fail_counts.get(hwnd, 0) + 1
+            if fail_counts[hwnd] == 3:
+                print(f"[watcher:{tag}] ⚠️ '{title}' 连续 3 次迁移失败: {how}", flush=True)
+    return moved
+
+
+def do_watch(args) -> int:
+    """常驻归位守护（独立 detached 进程）：
+      · server.py 子孙进程的窗口（含 AI 运行中**动态新开**的抖音/微信等 scrcpy
+        卡片）一旦不在 server 桌面，立刻迁回；
+      · 远程客户端（UU/向日葵/ToDesk，**含早已运行的实例**）的窗口归到 UU 桌面；
+      · server.py 连续 3 轮确认退出后本守护自动退出。
+    日志追加写入 .vd_watcher.log。"""
+    state_file = _pathlib.Path(getattr(args, "state_file", None) or _STATE_FILE)
+    interval = max(0.5, float(getattr(args, "interval", 1.5)))
+    # 独立进程必须在本线程先初始化 COM，pyvda 的 COM 调用才能工作
+    try:
+        _ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+    except Exception:
+        try:
+            _ctypes.windll.ole32.CoInitialize(None)
+        except Exception:
+            pass
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            st = _json.load(f)
+    except Exception as e:
+        print(f"[watcher] 无法读取状态文件 {state_file}: {e!r}", flush=True)
+        return 1
+
+    server_pid = int(st["server_pid"])
+    server_desk = int(st.get("server_desktop", 1))
+    uu_desk = int(st.get("uu_desktop", 2))
+    print(f"[watcher] 启动：server PID={server_pid}→#{server_desk}，"
+          f"远程客户端→#{uu_desk}，轮询间隔 {interval}s", flush=True)
+
+    fail_s: dict[int, int] = {}
+    fail_u: dict[int, int] = {}
+    missed = 0
+    while True:
+        if not _pid_alive(server_pid):
+            missed += 1
+            if missed >= 3:
+                print("[watcher] server.py 已退出，watcher 结束。", flush=True)
+                return 0
+        else:
+            missed = 0
+            _move_wrong_hwnds(_collect_descendant_pids(server_pid),
+                              server_desk, fail_s, "server")
+        # UU 无论 server 死活都持续归位（用户可能在停服后仍使用远程桌面）
+        _move_wrong_hwnds(_remote_pids(), uu_desk, fail_u, "uu")
+        _time.sleep(interval)
+
+
+def do_signal_pid(args) -> int:
+    """【内部】一次性信号助手：AttachConsole 到目标控制台并广播 CTRL_C 后退出。
+    必须以 CREATE_NEW_PROCESS_GROUP 启动：助手自己的进程组=其 PID≠0，
+    而 CTRL_C 只能投递给进程组 0，所以助手发出的信号永远不会杀死自己。
+    返回码：0=已发送；2=AttachConsole 失败（目标无控制台）；3=发送失败。"""
+    pid = int(args.pid)
+    try:
+        _kernel32.FreeConsole()
+    except Exception:
+        pass
+    if not _kernel32.AttachConsole(pid):
+        return 2
+    try:
+        _kernel32.SetConsoleCtrlHandler(None, True)
+        ok = bool(_kernel32.GenerateConsoleCtrlEvent(0, 0))
+        _time.sleep(0.3)
+    finally:
+        try:
+            _kernel32.FreeConsole()
+        except Exception:
+            pass
+        _kernel32.SetConsoleCtrlHandler(None, False)
+    return 0 if ok else 3
+
+
+def _send_ctrl_c_and_wait(pid: int, timeout_s: float = 12.0) -> bool:
+    """派生独立进程组的信号助手给 pid 的控制台发 CTRL_C，然后等待其优雅退出。
+    不在 stop 主进程里直接发——Python 自带 CTRL handler，自屏蔽时序不可靠，
+    会把 stop 自己也打断（state 来不及清理）。
+    返回 True=进程已退出。目标无控制台（--server-no-window）→ False，调用方回退强杀。"""
+    try:
+        helper = subprocess.run(
+            [sys.executable, str(_SCRIPT_DIR / "virtual_desktop.py"),
+             "signal-pid", "--pid", str(pid)],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x00000200,  # CREATE_NEW_PROCESS_GROUP：与目标控制台组 0 隔离
+        )
+    except Exception:
+        return False
+    if helper.returncode != 0:
+        return False
+    deadline = _time.time() + timeout_s
+    while _time.time() < deadline:
+        if not _pid_alive(pid):
+            return True
+        _time.sleep(0.3)
+    return not _pid_alive(pid)
+
+
+def _wait_pid_exit(pid: int, timeout_s: float) -> bool:
+    deadline = _time.time() + timeout_s
+    while _time.time() < deadline:
+        if not _pid_alive(pid):
+            return True
+        _time.sleep(0.3)
+    return not _pid_alive(pid)
+
+
+def _taskkill_tree(pid: int) -> None:
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                   capture_output=True)
+
+
+def do_stop(args) -> int:
+    """停止 bootstrap 启动的整条链路：
+       1) 停常驻 watcher（强杀，无副作用，防止清理期间它来回搬窗）；
+       2) CTRL_C 优雅停 server.py（KeyboardInterrupt → finally + atexit
+          stop_all，逐个终止 scrcpy）；失败/无控制台才 taskkill /T /F；
+       3) 默认不动 UU（用户可能继续用），--kill-uu 才关主程序；
+       4) --remove-desktops 顺带删除 1/2 号桌面（窗口合并回左邻）。"""
+    st = _load_state()
+    if not st:
+        forced = getattr(args, "server_pid", None)
+        if not forced:
+            print(f"[stop] 未找到状态文件 {_STATE_FILE.name}，没有由 bootstrap 管理的活动会话。")
+            return 1
+        print(f"[stop] 无状态文件，使用命令行指定的 server PID={forced}。")
+        st = {"server_pid": int(forced)}
+
+    watcher_pid = st.get("watcher_pid")
+    server_pid = st.get("server_pid")
+
+    # 从这里起本进程忽略 CTRL_C：助手把 CTRL_C 广播到 server 所在控制台的
+    # 进程组 0，若调用方恰好共享该控制台（单控制台宿主/同窗口调试），
+    # 不屏蔽的话 stop 自己会被 KeyboardInterrupt 打断，state 来不及清理。
+    _kernel32.SetConsoleCtrlHandler(None, True)
+    try:
+        if _pid_alive(watcher_pid):
+            _taskkill_tree(int(watcher_pid))
+            print(f"[stop] watcher PID={watcher_pid} 已停止。", flush=True)
+
+        if _pid_alive(server_pid):
+            print(f"[stop] 向 server.py PID={server_pid} 发送 CTRL_C（优雅退出，最多等 12s）...", flush=True)
+            try:
+                graceful = _send_ctrl_c_and_wait(int(server_pid))
+            except KeyboardInterrupt:
+                # 双保险：屏蔽仍被穿透时，信号其实已经由助手发出，
+                # 只需继续等 server 自己走完 atexit。
+                print("[stop] （本进程收到同源 CTRL_C，已忽略，继续等待 server 退出…）", flush=True)
+                graceful = _wait_pid_exit(int(server_pid), 8.0)
+            if graceful:
+                print("[stop] ✅ server.py 已优雅退出（scrcpy 由 atexit stop_all 清理）。", flush=True)
+            else:
+                print("[stop] ⚠️ CTRL_C 未送达或超时，回退 taskkill /PID /T /F（连 scrcpy 进程树一起清）...", flush=True)
+                _taskkill_tree(int(server_pid))
+                _time.sleep(1.5)
+                if _pid_alive(server_pid):
+                    print(f"[stop] ❌ PID={server_pid} 仍存活，请在任务管理器中手动结束。")
+        else:
+            print(f"[stop] server.py PID={server_pid} 已不在运行，补杀可能残留的 scrcpy...")
+            for pid_list in (
+                _find_pids_by_names({"scrcpy.exe"}).values()
+            ):
+                for pid in pid_list:
+                    _taskkill_tree(pid)
+
+        if getattr(args, "kill_uu", False):
+            killed = False
+            for name, pids in _find_pids_by_names(
+                    _REMOTE_PROCESS_NAMES | _REMOTE_SERVICE_NAMES).items():
+                if name in _REMOTE_SERVICE_NAMES:
+                    continue
+                for pid in pids:
+                    subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                   capture_output=True)
+                    print(f"[stop] 已关闭远程客户端 {name} PID={pid}")
+                    killed = True
+            if not killed:
+                print("[stop] 没有发现运行中的远程客户端主程序。")
+
+        if getattr(args, "remove_desktops", False):
+            vd = VirtualDesktops()
+            for idx in (2, 1):  # 必须逆序删除
+                if idx < vd.count():
+                    vd.remove(idx)
+
+        if not getattr(args, "keep_state", False):
+            _clear_state()
+            print(f"[stop] 已清理状态文件 {_STATE_FILE.name}。")
+    finally:
+        _kernel32.SetConsoleCtrlHandler(None, False)
+    return 0
+
+
+def do_status(args) -> int:
+    st = _load_state()
+    vd = VirtualDesktops()
+    if not st:
+        print(f"无活动 bootstrap 会话（{_STATE_FILE.name} 不存在）。")
+        print(vd.info())
+        return 1
+    print(f"活动 bootstrap 会话（{_STATE_FILE.name}）：")
+    print(f"  启动时间      : {st.get('started_at')}")
+    print(f"  server.py     : PID={st.get('server_pid')} "
+          f"{'🟢 运行中' if _pid_alive(st.get('server_pid')) else '⚪ 已退出'} → 桌面 #{st.get('server_desktop')}")
+    print(f"  watcher       : PID={st.get('watcher_pid')} "
+          f"{'🟢 运行中' if _pid_alive(st.get('watcher_pid')) else '⚪ 已退出'}")
+    print(f"  UU 远程       : {'早已运行(按进程名归位)' if st.get('uu_preexisting') else 'bootstrap 启动'} "
+          f"→ 桌面 #{st.get('uu_desktop')}，PID={st.get('uu_pids')}")
+    print(vd.info())
+    return 0
+
+
+
 def do_bootstrap(args) -> int:
     r"""
     编排主流程（本轮重写后 **默认走强隔离 switch_wait_switchback**，彻底解决
@@ -968,22 +1314,69 @@ def do_bootstrap(args) -> int:
             pollers_to_wait.append(srv_poller)
 
     # =====================================================================
-    # Step 3：#2 启 UU远程（切桌面 #2 → Popen → 条件等 HWND ≥1 个 → 不提前切走）
+    # Step 3：#2 UU远程
+    #   关键：若客户端**已经在运行**，Popen 只会把旧实例的窗口唤醒到当前
+    #   桌面（单例应用，新进程立即退出），旧窗口既不属于新进程树、托盘隐藏
+    #   时还枚举不到。此时跳过启动，记录 PID，由常驻 watcher 按进程名归位。
     # =====================================================================
     print("\n=== Step 3 / 3 ：桌面 #2 → UU远程 (GameViewer) ===")
-    p_uu, uu_poller, uu_mode_used = vd.launch_on_desktop(
-        2, uu_cmd,
-        wait_window_ms=uu_wait_ms,
-        label=f"{_pathlib.Path(uu_exe).name} → #2",
-        no_window=False,
-        mode=launch_mode,
-        min_hwnd_count=uu_min_hw,
-    )
-    if p_uu is None:
-        print("[bootstrap] ⚠️  UU远程启动失败（server 不影响）。")
+    existing_uu = _find_pids_by_names(_REMOTE_PROCESS_NAMES)
+    uu_record_pids: set[int] = set()
+    for _pl in existing_uu.values():
+        for _pid in _pl:
+            uu_record_pids |= _collect_descendant_pids(_pid)
+    uu_preexisting = bool(uu_record_pids) and not bool(getattr(args, "force_new_uu", False))
+    if uu_preexisting:
+        p_uu, uu_poller = None, None
+        visible_hwnds = _enum_top_level_hwnds_for_pids(uu_record_pids)
+        if visible_hwnds:
+            # 情况 A：主窗口已经显示（可能在错误的桌面）→ 立即归位，watcher 兜底
+            uu_mode_used = "preexisting+watcher"
+            print(f"[bootstrap] ℹ️  检测到远程客户端已在运行且主窗口已显示：{existing_uu}")
+            print("           现有窗口立即归位到 #2，后续由 watcher 持续巡检。")
+            _move_wrong_hwnds(uu_record_pids, 2, {}, "uu-init")
+        else:
+            # 情况 B：进程在跑但主窗口缩在系统托盘（0 个可见顶层窗）。
+            #   单例软件再启动一次 exe = 给旧实例发"唤出主窗口"信号（新启动器
+            #   进程随即退出，窗口属于旧 PID 树，所以不能用 launch_on_desktop
+            #   按新 PID 等窗口）。先切到 #2 再 Popen，被唤出的主窗口直接生于 #2。
+            uu_mode_used = "preexisting-wakeup+watcher"
+            print(f"[bootstrap] ℹ️  检测到远程客户端已在运行但主窗口隐藏在系统托盘：{existing_uu}")
+            print("           单例应用：切到 #2 后再启动一次 exe = 唤出旧实例主窗口（不会开第二个程序）...")
+            vd.switch(2)
+            try:
+                subprocess.Popen(uu_cmd)
+            except Exception as e:
+                print(f"[bootstrap] ⚠️  唤醒远程客户端失败：{e}；可稍后手动从托盘点开，watcher 会自动归位。")
+            else:
+                wake_deadline = _time.time() + max(3.0, uu_wait_ms / 1000.0)
+                while _time.time() < wake_deadline:
+                    _time.sleep(0.5)
+                    uu_record_pids = _remote_pids()  # 唤醒可能拉起新的子孙进程
+                    if _enum_top_level_hwnds_for_pids(uu_record_pids):
+                        break
+                _move_wrong_hwnds(uu_record_pids, 2, {}, "uu-init")
+                n_vis = len(_enum_top_level_hwnds_for_pids(uu_record_pids))
+                if n_vis:
+                    print(f"[bootstrap] ✅ 远程客户端主窗口已唤出并归位到桌面 #2（可见窗口 {n_vis} 个）。")
+                else:
+                    print("[bootstrap] ⚠️  未在等待窗口内唤出主窗口；请手动从系统托盘点开，"
+                          "watcher 会在 ≤2s 内迁到 #2。")
     else:
-        if uu_poller is not None:
-            pollers_to_wait.append(uu_poller)
+        p_uu, uu_poller, uu_mode_used = vd.launch_on_desktop(
+            2, uu_cmd,
+            wait_window_ms=uu_wait_ms,
+            label=f"{_pathlib.Path(uu_exe).name} → #2",
+            no_window=False,
+            mode=launch_mode,
+            min_hwnd_count=uu_min_hw,
+        )
+        if p_uu is None:
+            print("[bootstrap] ⚠️  UU远程启动失败（server 不影响）。")
+        else:
+            uu_record_pids = _collect_descendant_pids(p_uu.pid)
+            if uu_poller is not None:
+                pollers_to_wait.append(uu_poller)
 
     # =====================================================================
     # Step 4：切回用户原桌面（桌面 0）
@@ -1020,12 +1413,16 @@ def do_bootstrap(args) -> int:
     print(f"  脚本结束当前桌面: #{vd.current_index()}")
     print("-" * 80)
 
-    def _audit_one(heading: str, root_pid: Optional[int], expected_idx: int):
+    def _audit_one(heading: str, root_pid: Optional[int], expected_idx: int,
+                   explicit_pids: Optional[set[int]] = None):
         print(f"\n{heading} （期望全部落在 desktop#{expected_idx}）：")
-        if not root_pid:
+        if explicit_pids is not None:
+            pids = explicit_pids
+        elif not root_pid:
             print("    进程未启动，跳过。")
             return (0, 0)
-        pids = _collect_descendant_pids(root_pid)
+        else:
+            pids = _collect_descendant_pids(root_pid)
         hwnds = _enum_top_level_hwnds_for_pids(pids)
         correct, wrong = 0, 0
         if not hwnds:
@@ -1070,29 +1467,73 @@ def do_bootstrap(args) -> int:
     a, b = _audit_one("桌面 1 / server.py 的子孙窗口",
                       p_server.pid if p_server else None, 1)
     total_ok += a; total_ng += b
-    a, b = _audit_one("桌面 2 / UU远程 的子孙窗口",
-                      p_uu.pid if p_uu else None, 2)
+    a, b = _audit_one(
+        "桌面 2 / UU远程 的窗口" + ("（已运行实例，按进程名识别）" if uu_preexisting else "（本脚本启动）"),
+        None, 2, explicit_pids=uu_record_pids,
+    )
     total_ok += a; total_ng += b
 
     print()
     print("-" * 80)
     srv_state = ("OK  PID=" + str(p_server.pid)) if p_server else "FAILED"
-    uu_state  = ("OK  PID=" + str(p_uu.pid))     if p_uu     else "FAILED"
+    if uu_preexisting:
+        uu_state = "PRE-EXISTING  PIDs=" + ",".join(str(p) for p in sorted(uu_record_pids))
+    else:
+        uu_state = ("OK  PID=" + str(p_uu.pid)) if p_uu else "FAILED"
     print(f"  桌面 1 / server.py           → {srv_state}  |  cwd = {server_py.parent}")
     print(f"  桌面 2 / UU远程 GameViewer   → {uu_state}   |  exe = {uu_exe}")
     if total_ng == 0:
         print(f"\n  🎯 100% 隔离成功：共 {total_ok} 个窗口全部在正确的桌面 #1/#2，桌面 0 干净。")
     else:
         print(
-            f"\n  ⚠️  仍有 {total_ng} 个窗口不在正确桌面。\n"
+            f"\n  ⚠️  仍有 {total_ng} 个窗口不在正确桌面（watcher 会在运行期间持续补迁）。\n"
             f"     建议：\n"
             f"       · 如果是 scrcpy 还没出完：把 --server-wait-ms 加到 25000；\n"
             f"       · 如果是 Qt notification_panel：把 --server-min-hwnds 调到 3；\n"
-            f"       · 如果出现在桌面 0：检查是否为 --return-to=0 后（此时 active desktop=0）\n"
-            f"         新弹出来的（sweeper poller 会在 10s 时间窗口内迁走），只要 sweeper 日志里\n"
-            f"         最后打印 ✅ 就没问题。"
+            f"       · 动态新开的卡片/托盘点开的 UU：常驻 watcher 每 1.5s 巡检归位。"
         )
     print("=" * 80)
+
+    # =====================================================================
+    # Step 7：状态落盘 + 启动常驻归位 watcher
+    #   watcher 解决 bootstrap 进程退出后无人管的两类窗口：
+    #     a) server 运行期间 AI 动态新开的 scrcpy 卡片（旧 sweeper 只活十几秒）；
+    #     b) 已运行的 UU 托盘窗口，用户点开后才出现。
+    #   stop 子命令凭状态文件先杀 watcher，再 CTRL_C 优雅停 server。
+    # =====================================================================
+    watcher_pid = None
+    if p_server is not None:
+        state = {
+            "started_at": _datetime.now().isoformat(timespec="seconds"),
+            "project_root": str(_SCRIPT_DIR),
+            "server_pid": p_server.pid,
+            "server_desktop": 1,
+            "uu_pids": sorted(uu_record_pids),
+            "uu_desktop": 2,
+            "uu_preexisting": uu_preexisting,
+            "watcher_pid": None,
+        }
+        _save_state(state)  # watcher 启动即读，必须先落盘
+        if not bool(getattr(args, "no_watcher", False)):
+            try:
+                log_fp = open(_WATCHER_LOG, "a", encoding="utf-8")
+                wcmd = [
+                    sys.executable, str(_SCRIPT_DIR / "virtual_desktop.py"), "watch",
+                    "--state-file", str(_STATE_FILE), "--interval", "1.5",
+                ]
+                wp = subprocess.Popen(
+                    wcmd, cwd=str(_SCRIPT_DIR),
+                    stdout=log_fp, stderr=subprocess.STDOUT, close_fds=True,
+                    creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+                )
+                watcher_pid = wp.pid
+                print(f"[bootstrap] 🛰️  常驻归位 watcher 已启动 PID={watcher_pid}（日志 .vd_watcher.log）")
+            except Exception as e:
+                print(f"[bootstrap] ⚠️  watcher 启动失败（不影响 server）: {e!r}")
+        state["watcher_pid"] = watcher_pid
+        _save_state(state)
+        print(f"[bootstrap] 💾 会话状态已写入 {_STATE_FILE.name}；"
+              f"停止整条链路请执行：python virtual_desktop.py stop")
 
     return 0 if (p_server is not None or p_uu is not None) else 1
 
@@ -1168,15 +1609,52 @@ def main() -> int:
     # 收尾
     p_boot.add_argument("--return-to", default=_DEFAULT_RETURN_TO,
                         help="编排完后切到几号桌面：'original'=回到脚本执行前用户所在桌面（默认）；或 0/1/2 等整数")
+    p_boot.add_argument("--force-new-uu", action="store_true",
+                        help="即使检测到 UU 远程已在运行，也强制重新 Popen（默认跳过，由 watcher 归位旧实例）")
+    p_boot.add_argument("--no-watcher", action="store_true",
+                        help="不启动常驻归位 watcher（动态新开的 scrcpy 卡片/托盘点开的 UU 将无人归位）")
+
+    # watcher（内部命令，由 bootstrap 以 detached 方式自启，也可手动运行排障）
+    p_watch = sub.add_parser("watch", help=argparse.SUPPRESS)
+    p_watch.add_argument("--state-file", default=None)
+    p_watch.add_argument("--interval", type=float, default=1.5)
+
+    # signal-pid（内部命令：stop 的一次性 CTRL_C 信号助手）
+    p_sig = sub.add_parser("signal-pid", help=argparse.SUPPRESS)
+    p_sig.add_argument("--pid", type=int, required=True)
+
+    # stop：优雅停止 bootstrap 启动的整条链路
+    p_stop = sub.add_parser(
+        "stop",
+        help="停止 bootstrap 启动的 server.py（CTRL_C 优雅退出→atexit 清理全部 scrcpy；超时自动 taskkill /T /F 兜底）",
+    )
+    p_stop.add_argument("--server-pid", type=int, default=None,
+                        help="无 .vd_state.json 时直接指定 server.py 的 PID")
+    p_stop.add_argument("--kill-uu", action="store_true",
+                        help="同时关闭 UU 远程主程序（默认保留，用户可能继续使用）")
+    p_stop.add_argument("--remove-desktops", action="store_true",
+                        help="停止后逆序删除 2、1 号虚拟桌面（窗口合并回桌面 0）")
+    p_stop.add_argument("--keep-state", action="store_true",
+                        help="停止后保留 .vd_state.json（默认删除）")
+
+    sub.add_parser("status", help="查看 bootstrap 会话（server/watcher/UU 存活状态与桌面编号）")
 
     args = parser.parse_args()
-    # 虚拟桌面相关命令都需要 vd；bootstrap 命令自己在 do_bootstrap 里实例化 vd
+    # 虚拟桌面相关命令都需要 vd；bootstrap/watch/stop/status 在各自 do_* 里实例化
     if args.cmd == "bootstrap":
         try:
             return do_bootstrap(args)
         except (FileNotFoundError, ValueError) as e:
             print(f"[bootstrap] ❌ {e}")
             return 1
+    if args.cmd == "watch":
+        return do_watch(args)
+    if args.cmd == "signal-pid":
+        return do_signal_pid(args)
+    if args.cmd == "stop":
+        return do_stop(args)
+    if args.cmd == "status":
+        return do_status(args)
 
     vd = VirtualDesktops()
 

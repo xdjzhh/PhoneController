@@ -518,6 +518,10 @@ class DisplayManager:
 
             mvd = self._get_multi_display()
 
+            display = None
+            # 并发 adb reverse 竞态在互斥锁下已不应再发生；仅对设备侧瞬时
+            # ADB 抖动（push 中断 / app_process 启动慢）保留一次自动重试。
+            max_attempts = 2
             try:
                 print(f"[DisplayManager] ========== 创建虚拟屏参数 ==========")
                 print(f"[DisplayManager] app_package           : {app_package}")
@@ -525,54 +529,70 @@ class DisplayManager:
                 print(f"[DisplayManager] new_display (安卓)    : {nd_desc}")
                 print(f"[DisplayManager] =================================================")
 
-                display = AppVirtualDisplay(
-                    app_package=app_package,
-                    config=win_config,
-                    display_id=mvd._alloc_display_id(),
-                    scrcpy_path=self.scrcpy_path,
-                    device_serial=self.device_serial,
-                    base_port=mvd.base_port,
-                    display_manager=self,
-                )
+                for attempt in range(1, max_attempts + 1):
+                    allocated_id = mvd._alloc_display_id()
+                    display = AppVirtualDisplay(
+                        app_package=app_package,
+                        config=win_config,
+                        display_id=allocated_id,
+                        scrcpy_path=self.scrcpy_path,
+                        device_serial=self.device_serial,
+                        base_port=mvd.base_port,
+                        display_manager=self,
+                    )
 
-                mvd.displays.append(display)
-                self._app_display_map[app_package] = display
+                    print(f"[DisplayManager] Starting virtual display for {app_package} "
+                          f"(attempt {attempt}/{max_attempts}, local display_id={allocated_id})...")
+                    # start() 内部会在进程级互斥锁保护下同步完成
+                    # push → adb reverse → server 连接 → New display 创建，
+                    # 返回 True 时 android_display_id 必已解析。
+                    ok = display.start()
 
-                print(f"[DisplayManager] Starting virtual display for {app_package}...")
-                display.start()
-                time.sleep(2)
+                    if ok and display.running:
+                        # 成功后才登记，避免失败实例残留在 map/displays 中
+                        mvd.displays.append(display)
+                        self._app_display_map[app_package] = display
 
-                if display.running:
-                    self.activate_app_window(app_package)
-                    # 如果该app是地图app且当前正在导航中，自动切换到导航模式
-                    if self._nav_monitor and app_package in MAP_APPS:
-                        nav_state = self._nav_monitor.get_state()
-                        if nav_state.is_navigating and nav_state.app_package == app_package:
-                            # 延迟一点时间等待窗口完全创建
-                            def _delayed_switch():
-                                time.sleep(1.5)
-                                self._switch_app_to_nav_mode(app_package)
-                                self._navigating_app = app_package
-                            threading.Thread(target=_delayed_switch, daemon=True).start()
-                    return {
-                        "success": True,
-                        "message": "App virtual display started",
-                        "display_type": "virtual",
-                        "app_package": app_package,
-                        "window_title": display.window_title,
-                        "display_id": display.display_id,
-                        "android_display_id": getattr(display, "android_display_id", None),
-                    }
-                else:
-                    failed_id = display.display_id
+                        # 给 scrcpy 窗口一点创建时间再激活（样式线程自身会继续重试）
+                        time.sleep(1)
+                        self.activate_app_window(app_package)
+                        # 如果该app是地图app且当前正在导航中，自动切换到导航模式
+                        if self._nav_monitor and app_package in MAP_APPS:
+                            nav_state = self._nav_monitor.get_state()
+                            if nav_state.is_navigating and nav_state.app_package == app_package:
+                                # 延迟一点时间等待窗口完全创建
+                                def _delayed_switch():
+                                    time.sleep(1.5)
+                                    self._switch_app_to_nav_mode(app_package)
+                                    self._navigating_app = app_package
+                                threading.Thread(target=_delayed_switch, daemon=True).start()
+                        return {
+                            "success": True,
+                            "message": "App virtual display started",
+                            "display_type": "virtual",
+                            "app_package": app_package,
+                            "window_title": display.window_title,
+                            "display_id": display.display_id,
+                            "android_display_id": getattr(display, "android_display_id", None),
+                        }
+
+                    # ── 启动硬失败：回收本次分配的 display_id/端口，准备重试 ──
+                    boot_error = getattr(display, "_boot_error", None) \
+                        or "App virtual display failed to start"
                     if display in mvd.displays:
                         mvd.displays.remove(display)
-                    mvd._free_display_id(failed_id)  # 启动失败，归还id
-                    if app_package in self._app_display_map:
-                        del self._app_display_map[app_package]
+                    mvd._free_display_id(allocated_id)
+                    display = None
+
+                    if attempt < max_attempts:
+                        print(f"[DisplayManager] Virtual display for {app_package} failed "
+                              f"({boot_error}); retrying once after 2s...")
+                        time.sleep(2)
+                        continue
+
                     return {
                         "success": False,
-                        "error": "App virtual display failed to start",
+                        "error": boot_error,
                     }
 
             except Exception as e:
@@ -581,7 +601,7 @@ class DisplayManager:
                 traceback.print_exc()
                 # 异常情况下也归还id
                 try:
-                    if 'display' in dir() and display is not None:
+                    if display is not None:
                         fid = display.display_id
                         if display in mvd.displays:
                             mvd.displays.remove(display)

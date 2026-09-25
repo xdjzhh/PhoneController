@@ -3,24 +3,28 @@
 virtual_desktop.py  —  Windows 10 / 11 虚拟桌面管理脚本（零额外配置）
 
 需求规格（严格按用户两条要求实现）：
-  1. ensure(N=3)：检查当前虚拟桌面总数，若 < N  → 自动补充创建直到 = N；若 ≥ N → 不做任何动作。
+  1. ensure(N=2)：检查当前虚拟桌面总数，若 < N  → 自动补充创建直到 = N；若 ≥ N → 不做任何动作。
   2. switch(idx)：虚拟桌面从左→右严格编号为 0,1,2,...,N-1，可准确切换到指定编号的桌面。
+
+桌面布局（本项目固定 2 个桌面）：
+  · 桌面 #0 = 用户主桌面，bootstrap 后直接显示手机桌面布局（server.py + 全部 scrcpy 卡片）；
+  · 桌面 #1 = 新建的第 2 个桌面，放 UU 远程 GameViewer + 回程 Dock。
 
 实现：优先使用 pyvda（已在多个 Windows 项目验证）。若未装 → 自动 `pip install pyvda`
       （pyvda 是纯 Python 包，自动处理 Win10 1903 / Win11 之间 VirtualDesktop COM IID 的 GUID
        差异，避免自己手写 IServiceProvider + IVirtualDesktopManagerInternal 两套接口。）
 
 CLI 用法（都可直接双击或命令行调用）：
-  python virtual_desktop.py ensure --count 3       # 保证至少 3 个虚拟桌面（不足自动创建）
+  python virtual_desktop.py ensure --count 2       # 保证至少 2 个虚拟桌面（不足自动创建）
   python virtual_desktop.py switch --index 1       # 切换到编号 1 的桌面（左数第 2 个）
   python virtual_desktop.py list                   # 打印总数 + 当前所在桌面编号
   python virtual_desktop.py create                 # 立即新建 1 个虚拟桌面（追加到最右端）
-  python virtual_desktop.py remove --index 2       # 删除指定编号的桌面（窗口自动合并到前一个）
+  python virtual_desktop.py remove --index 1       # 删除指定编号的桌面（窗口自动合并到前一个）
 
 Python 模块用法：
   from virtual_desktop import VirtualDesktops
   vd = VirtualDesktops()
-  vd.ensure(count=3)
+  vd.ensure(count=2)
   vd.switch(1)
   print(vd.count(), vd.current_index())
 """
@@ -111,7 +115,7 @@ class VirtualDesktops:
         return 0
 
     # ---------- 规格 1：ensure(count=N) ----------
-    def ensure(self, count: int = 3) -> int:
+    def ensure(self, count: int = 2) -> int:
         """
         保证至少有 `count` 个虚拟桌面。
           - 已有数 < count → 自动创建补充到 count，返回本次新建个数
@@ -204,8 +208,8 @@ class VirtualDesktops:
             f"当前所在桌面编号：{cur}（严格 0-based，左→右顺序）",
             f"可用编号范围：[0, {total - 1}]",
         ]
-        if total < 3:
-            lines.append(f"⚠️ 不足 3 个，请执行：python virtual_desktop.py ensure --count 3")
+        if total < 2:
+            lines.append(f"⚠️ 不足 2 个，请执行：python virtual_desktop.py ensure --count 2")
         return "\n".join(lines)
 
     def launch_on_desktop(self, index: int, command: list[str], *,
@@ -361,7 +365,8 @@ class VirtualDesktops:
 
 
 # ---------------------------------------------------------------------------
-# 一键编排 bootstrap：ensure(3) → #1 启 server.py → #2 启 UU远程 → 切回原桌面
+# 一键编排 bootstrap：ensure(2) → #0 启 server.py（手机布局就在主桌面）
+#                       → #1 启 UU远程 → 切回原桌面
 # ---------------------------------------------------------------------------
 import os as _os
 import pathlib as _pathlib
@@ -396,9 +401,9 @@ _UU_REMOTE_CANDIDATES: list[str] = [
 # Win32 辅助（纯 ctypes，零 pip 依赖）：
 #   枚举进程树（子孙 PID）、枚举所有属于这些 PID 的顶层 HWND、
 #   把 HWND 通过 pyvda 移动到目标虚拟桌面。
-# 目的：实现「后台初始化，用户显示桌面保持在桌面 0」，
-#       在桌面 0 Popen 进程后，持续轮询把 HWND 一个个"事后迁移"到目标桌面，
-#       完美解决"server Qt+scrcpy 启动慢 → 切去桌面 2 时窗口还在创建 → 散到两个桌面"的问题。
+# 目的：把 HWND 一个个"事后迁移"到目标虚拟桌面（move_after 降级模式用）。
+#       强隔离模式下直接在目标桌面 Popen；注意本项目手机布局就放在主桌面 #0，
+#       UU 远程放 #1，只有切去 #1 启 UU 时窗口才可能在切换间隙散到两个桌面。
 # ---------------------------------------------------------------------------
 import ctypes as _ctypes
 from ctypes import wintypes as _wintypes
@@ -891,7 +896,7 @@ from datetime import datetime as _datetime
 
 _STATE_FILE = _SCRIPT_DIR / ".vd_state.json"
 _WATCHER_LOG = _SCRIPT_DIR / ".vd_watcher.log"
-# UU 桌面（#2）上的回程 Dock：front/uu_dock.py，只由 bootstrap 在 #2 启动
+# UU 桌面（#1）上的回程 Dock：front/uu_dock.py，只由 bootstrap 在 #1 启动
 _UU_DOCK_SCRIPT = _SCRIPT_DIR / "front" / "uu_dock.py"
 _UU_DOCK_LOG = _SCRIPT_DIR / ".vd_uudock.log"
 
@@ -993,13 +998,20 @@ def _clear_state() -> None:
 
 
 def _move_wrong_hwnds(pids: set[int], target_idx: int,
-                      fail_counts: dict[int, int], tag: str) -> int:
+                      fail_counts: dict[int, int], tag: str,
+                      skip_titles: Optional[set[str]] = None) -> int:
     """一轮归位：pids 进程树中所有可见顶层窗，**每轮重新查真实桌面**，
     凡不在 target_idx 的立刻迁走。返回本轮迁移窗口数。
     注意：不能用"曾经正确"的 HWND 缓存跳过——窗口随时可能被用户拖拽/其他
-    程序/系统操作移出目标桌面，缓存会导致移走后再也搬不回来。"""
+    程序/系统操作移出目标桌面，缓存会导致移走后再也搬不回来。
+    skip_titles：命中这些精确标题的窗口跳过（手机主屏 main_display 由
+    「手机」Dock 按钮按用户意愿在两个桌面间嵌入，watcher 不得回迁）。"""
+    skip_titles = skip_titles or set()
     moved = 0
     for hwnd in _enum_top_level_hwnds_for_pids(pids):
+        if skip_titles and _get_window_title(hwnd, 80) in skip_titles:
+            fail_counts.pop(hwnd, None)
+            continue
         real = _get_hwnd_desktop_index(hwnd)
         if real == target_idx:
             fail_counts.pop(hwnd, None)
@@ -1042,12 +1054,29 @@ def do_watch(args) -> int:
         return 1
 
     server_pid = int(st["server_pid"])
-    server_desk = int(st.get("server_desktop", 1))
-    uu_desk = int(st.get("uu_desktop", 2))
+    server_desk = int(st.get("server_desktop", 0))
+    uu_desk = int(st.get("uu_desktop", 1))
     uu_dock_pid = st.get("uu_dock_pid")
+
+    # 手机主屏（main_display）标题：它由 Dock「手机」按钮按用户意愿在两个
+    # 桌面间嵌入，watcher 必须放行，不能按普通 server 窗口回迁。
+    main_display_title = "手机桌面"
+    proj_root = st.get("project_root")
+    if proj_root:
+        cfg_path = _pathlib.Path(proj_root) / "scrcpycontrol" / "display_config.json"
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                t = _json.load(f).get("main_display", {}).get("window_title")
+                if t:
+                    main_display_title = str(t)
+        except Exception:
+            pass
+    skip_server_titles = {main_display_title}
+
     print(f"[watcher] 启动：server PID={server_pid}→#{server_desk}，"
           f"远程客户端→#{uu_desk}，回程Dock PID={uu_dock_pid}→#{uu_desk}，"
-          f"轮询间隔 {interval}s", flush=True)
+          f"轮询间隔 {interval}s，手机主屏 {main_display_title!r} 跟随用户不回迁",
+          flush=True)
 
     fail_s: dict[int, int] = {}
     fail_u: dict[int, int] = {}
@@ -1062,10 +1091,11 @@ def do_watch(args) -> int:
         else:
             missed = 0
             _move_wrong_hwnds(_collect_descendant_pids(server_pid),
-                              server_desk, fail_s, "server")
+                              server_desk, fail_s, "server",
+                              skip_titles=skip_server_titles)
         # UU 无论 server 死活都持续归位（用户可能在停服后仍使用远程桌面）
         _move_wrong_hwnds(_remote_pids(), uu_desk, fail_u, "uu")
-        # UU 桌面上的回程 Dock（front/uu_dock.py）始终钉在 #2
+        # UU 桌面上的回程 Dock（front/uu_dock.py）始终钉在 #1
         if uu_dock_pid and _pid_alive(uu_dock_pid):
             _move_wrong_hwnds(_collect_descendant_pids(int(uu_dock_pid)),
                               uu_desk, fail_d, "uu-dock")
@@ -1141,7 +1171,7 @@ def do_stop(args) -> int:
        2) CTRL_C 优雅停 server.py（KeyboardInterrupt → finally + atexit
           stop_all，逐个终止 scrcpy）；失败/无控制台才 taskkill /T /F；
        3) 默认不动 UU（用户可能继续用），--kill-uu 才关主程序；
-       4) --remove-desktops 顺带删除 1/2 号桌面（窗口合并回左邻）。"""
+       4) --remove-desktops 顺带删除 #1 号 UU 桌面（窗口合并回主桌面 #0）。"""
     st = _load_state()
     if not st:
         forced = getattr(args, "server_pid", None)
@@ -1210,7 +1240,8 @@ def do_stop(args) -> int:
 
         if getattr(args, "remove_desktops", False):
             vd = VirtualDesktops()
-            for idx in (2, 1):  # 必须逆序删除
+            # 布局只有 2 个桌面：#0 主桌面（手机布局）不能删，只删 UU 所在的 #1
+            for idx in (1,):
                 if idx < vd.count():
                     vd.remove(idx)
 
@@ -1248,15 +1279,18 @@ def do_status(args) -> int:
 
 def do_bootstrap(args) -> int:
     r"""
-    编排主流程（本轮重写后 **默认走强隔离 switch_wait_switchback**，彻底解决
-    「server 窗口还在桌面 0 / UU 窗口还在桌面 0 / 两个桌面散落」的隔离失败问题）：
+    编排主流程（**默认走强隔离 switch_wait_switchback**，彻底解决
+    「UU 窗口还在主桌面 / 两个桌面散落」的隔离失败问题）：
 
-      1) ensure 至少 3 个桌面 → 保证 0/1/2 三个编号都存在；
-      2) **切到 #1 → Popen server.py → 轮询条件等待 ≥2 个顶层 HWND 真正出现**
-                  → 仍停留在 #1，**绝不提前切走**（→ server + scrcpy 的初始桌面就是 #1）；
-      3) **切到 #2 → Popen GameViewer(UUdesk) → 条件等待 ≥1 个顶层 HWND 出现**
-                  → 仍停留在 #2；
-      4) **切回 return_to（默认 = original = 桌面 0）**
+      布局：桌面 #0 = 用户主桌面（手机桌面布局：server.py + 全部 scrcpy 卡片）；
+            桌面 #1 = 新建桌面（UU 远程 + 回程 Dock）。
+
+      1) ensure 至少 2 个桌面 → 保证 0/1 两个编号都存在；
+      2) **切到 #0 → Popen server.py → 轮询条件等待 ≥2 个顶层 HWND 真正出现**
+                  → 仍停留在 #0，**绝不提前切走**（→ server + scrcpy 的初始桌面就是 #0）；
+      3) **切到 #1 → Popen GameViewer(UUdesk) → 条件等待 ≥1 个顶层 HWND 出现**
+                  → 仍停留在 #1；
+      4) **切回 return_to（默认 = original，通常就是主桌面 #0 = 手机布局）**
       5) 并行 join 两个 sweeper poller（额外 8~10s 扫尾那些"16s 后才冒出来的 scrcpy"）
       6) **最终审计报告**：枚举 server 和 uu 的所有子孙 PID 的 HWND，逐条打印
          「窗口标题 / 真实 desktop id（= #?）」—— 肉眼可一眼验证隔离正确与否。
@@ -1269,17 +1303,18 @@ def do_bootstrap(args) -> int:
     print(f"[bootstrap] launch_mode = {launch_mode}")
     print(
         "[bootstrap] 🛡️  默认强隔离模式（switch_wait_switchback）：\n"
-        "           切 #1 启 server → 条件等窗口出现 → 再切 #2 启 UU → 等窗口出现 → 再切回 #0。\n"
+        "           #0 启 server（手机布局就在主桌面）→ 条件等窗口出现 →\n"
+        "           再切 #1 启 UU → 等窗口出现 → 再切回原桌面（通常 #0）。\n"
         "           Windows 在 Popen 时把进程初始线程 desktop affiliation 绑定在当前活跃桌面，\n"
         "           所以只要 HWND 真正 CreateWindowEx 时我们还没切走，100% 落在对应桌面，\n"
         "           根本不需要事后 MoveWindowToDesktop（那条链路不稳定）。\n"
-        "           视觉代价：用户桌面会短暂经过 0 → 1 → 2 → 0 的切换（约 30s，取决于\n"
+        "           视觉代价：用户桌面会短暂经过 0 → 1 → 0 的切换（约 30s，取决于\n"
         "           scrcpy 起来速度，期间你如果在旁边看会看到桌面在切，这是必须的）。\n"
     )
     print("-" * 64)
 
-    # Step 1: 保证有 3 个桌面（0,1,2）
-    vd.ensure(count=3)
+    # Step 1: 保证有 2 个桌面（0=主桌面/手机布局，1=UU 远程）
+    vd.ensure(count=2)
 
     # —— Step 2 命令组装：server.py ——
     py = _locate_python(getattr(args, "python", None))
@@ -1315,14 +1350,15 @@ def do_bootstrap(args) -> int:
     uu_mode_used  = srv_mode_used
 
     # =====================================================================
-    # Step 2：#1 启 server.py（切桌面 → 条件等 HWND ≥2 个 → 不提前切走）
+    # Step 2：#0（主桌面）启 server.py（切桌面 → 条件等 HWND ≥N 个 → 不提前切走）
+    #   手机桌面布局直接显示在用户主桌面 #0 上。
     # =====================================================================
-    print("\n=== Step 2 / 3 ：桌面 #1 → server.py ===")
+    print("\n=== Step 2 / 3 ：桌面 #0（主桌面）→ server.py ===")
     p_server, srv_poller, srv_mode_used = vd.launch_on_desktop(
-        1, server_cmd,
+        0, server_cmd,
         cwd=str(server_py.parent),
         wait_window_ms=server_wait_ms,
-        label=f"{server_py.name} → #1",
+        label=f"{server_py.name} → #0",
         no_window=server_no_win,
         mode=launch_mode,
         min_hwnd_count=server_min_hw,
@@ -1334,12 +1370,12 @@ def do_bootstrap(args) -> int:
             pollers_to_wait.append(srv_poller)
 
     # =====================================================================
-    # Step 3：#2 UU远程
+    # Step 3：#1 UU远程（新建的第 2 个虚拟桌面）
     #   关键：若客户端**已经在运行**，Popen 只会把旧实例的窗口唤醒到当前
     #   桌面（单例应用，新进程立即退出），旧窗口既不属于新进程树、托盘隐藏
     #   时还枚举不到。此时跳过启动，记录 PID，由常驻 watcher 按进程名归位。
     # =====================================================================
-    print("\n=== Step 3 / 3 ：桌面 #2 → UU远程 (GameViewer) ===")
+    print("\n=== Step 3 / 3 ：桌面 #1 → UU远程 (GameViewer) ===")
     existing_uu = _find_pids_by_names(_REMOTE_PROCESS_NAMES)
     uu_record_pids: set[int] = set()
     for _pl in existing_uu.values():
@@ -1353,17 +1389,17 @@ def do_bootstrap(args) -> int:
             # 情况 A：主窗口已经显示（可能在错误的桌面）→ 立即归位，watcher 兜底
             uu_mode_used = "preexisting+watcher"
             print(f"[bootstrap] ℹ️  检测到远程客户端已在运行且主窗口已显示：{existing_uu}")
-            print("           现有窗口立即归位到 #2，后续由 watcher 持续巡检。")
-            _move_wrong_hwnds(uu_record_pids, 2, {}, "uu-init")
+            print("           现有窗口立即归位到 #1，后续由 watcher 持续巡检。")
+            _move_wrong_hwnds(uu_record_pids, 1, {}, "uu-init")
         else:
             # 情况 B：进程在跑但主窗口缩在系统托盘（0 个可见顶层窗）。
             #   单例软件再启动一次 exe = 给旧实例发"唤出主窗口"信号（新启动器
             #   进程随即退出，窗口属于旧 PID 树，所以不能用 launch_on_desktop
-            #   按新 PID 等窗口）。先切到 #2 再 Popen，被唤出的主窗口直接生于 #2。
+            #   按新 PID 等窗口）。先切到 #1 再 Popen，被唤出的主窗口直接生于 #1。
             uu_mode_used = "preexisting-wakeup+watcher"
             print(f"[bootstrap] ℹ️  检测到远程客户端已在运行但主窗口隐藏在系统托盘：{existing_uu}")
-            print("           单例应用：切到 #2 后再启动一次 exe = 唤出旧实例主窗口（不会开第二个程序）...")
-            vd.switch(2)
+            print("           单例应用：切到 #1 后再启动一次 exe = 唤出旧实例主窗口（不会开第二个程序）...")
+            vd.switch(1)
             try:
                 subprocess.Popen(uu_cmd)
             except Exception as e:
@@ -1375,18 +1411,18 @@ def do_bootstrap(args) -> int:
                     uu_record_pids = _remote_pids()  # 唤醒可能拉起新的子孙进程
                     if _enum_top_level_hwnds_for_pids(uu_record_pids):
                         break
-                _move_wrong_hwnds(uu_record_pids, 2, {}, "uu-init")
+                _move_wrong_hwnds(uu_record_pids, 1, {}, "uu-init")
                 n_vis = len(_enum_top_level_hwnds_for_pids(uu_record_pids))
                 if n_vis:
-                    print(f"[bootstrap] ✅ 远程客户端主窗口已唤出并归位到桌面 #2（可见窗口 {n_vis} 个）。")
+                    print(f"[bootstrap] ✅ 远程客户端主窗口已唤出并归位到桌面 #1（可见窗口 {n_vis} 个）。")
                 else:
                     print("[bootstrap] ⚠️  未在等待窗口内唤出主窗口；请手动从系统托盘点开，"
-                          "watcher 会在 ≤2s 内迁到 #2。")
+                          "watcher 会在 ≤2s 内迁到 #1。")
     else:
         p_uu, uu_poller, uu_mode_used = vd.launch_on_desktop(
-            2, uu_cmd,
+            1, uu_cmd,
             wait_window_ms=uu_wait_ms,
-            label=f"{_pathlib.Path(uu_exe).name} → #2",
+            label=f"{_pathlib.Path(uu_exe).name} → #1",
             no_window=False,
             mode=launch_mode,
             min_hwnd_count=uu_min_hw,
@@ -1399,15 +1435,15 @@ def do_bootstrap(args) -> int:
                 pollers_to_wait.append(uu_poller)
 
     # =====================================================================
-    # Step 3.5：桌面 #2 启动回程 Dock（front/uu_dock.py）
-    #   与桌面 #1 的 AR Dock 同款：设置(占位无功能) + 电脑(切回 server 桌面)。
-    #   必须先切到 #2 再 Popen，窗口初始桌面才是 #2；detached 独立进程，
+    # Step 3.5：桌面 #1 启动回程 Dock（front/uu_dock.py）
+    #   与桌面 #0 的 AR Dock 同款：设置(占位无功能) + 电脑(切回 server 桌面)。
+    #   必须先切到 #1 再 Popen，窗口初始桌面才是 #1；detached 独立进程，
     #   PID 落 state，watcher 持续归位，stop 时强杀（纯 UI 助手无清理负担）。
     # =====================================================================
     uu_dock_pid = None
     if not bool(getattr(args, "no_uu_dock", False)) and _UU_DOCK_SCRIPT.exists():
         try:
-            vd.switch(2)
+            vd.switch(1)
             dock_fp = open(_UU_DOCK_LOG, "a", encoding="utf-8")
             p_uudock = subprocess.Popen(
                 [sys.executable, str(_UU_DOCK_SCRIPT)],
@@ -1416,15 +1452,16 @@ def do_bootstrap(args) -> int:
                 creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
             )
             uu_dock_pid = p_uudock.pid
-            print(f"\n[bootstrap] 🖥️  UU 桌面回程 Dock 已在 #2 启动 PID={uu_dock_pid}"
-                  f"（设置=占位，电脑=切回手机控制桌面；日志 .vd_uudock.log）")
+            print(f"\n[bootstrap] 🖥️  UU 桌面回程 Dock 已在 #1 启动 PID={uu_dock_pid}"
+                  f"（设置=占位，电脑=切回手机控制桌面 #0；日志 .vd_uudock.log）")
         except Exception as e:
             print(f"[bootstrap] ⚠️  UU 回程 Dock 启动失败（不影响主链路）: {e!r}")
     elif not _UU_DOCK_SCRIPT.exists():
         print(f"[bootstrap] ⚠️  未找到 {_UU_DOCK_SCRIPT}，跳过 UU 回程 Dock。")
 
     # =====================================================================
-    # Step 4：切回用户原桌面（桌面 0）
+    # Step 4：切回脚本执行前桌面（默认 original；通常就是主桌面 #0，
+    #         手机桌面布局在那里显示，bootstrap 结束即可直接使用）
     # =====================================================================
     back_to = _parse_return_to(getattr(args, "return_to", _DEFAULT_RETURN_TO), original_idx)
     if back_to != vd.current_index():
@@ -1447,7 +1484,7 @@ def do_bootstrap(args) -> int:
 
     # =====================================================================
     # Step 6：最终审计报告 —— 逐条打印两个 PID 树的 HWND + 真实桌面编号
-    #         用户一眼就能知道 server 的窗口是不是真的都在 #1，UU 是不是真的都在 #2
+    #         用户一眼就能知道 server 的窗口是不是真的都在 #0，UU 是不是真的都在 #1
     # =====================================================================
     print()
     print("=" * 80)
@@ -1509,12 +1546,12 @@ def do_bootstrap(args) -> int:
         return correct, wrong
 
     total_ok, total_ng = 0, 0
-    a, b = _audit_one("桌面 1 / server.py 的子孙窗口",
-                      p_server.pid if p_server else None, 1)
+    a, b = _audit_one("桌面 0 / server.py 的子孙窗口（手机布局）",
+                      p_server.pid if p_server else None, 0)
     total_ok += a; total_ng += b
     a, b = _audit_one(
-        "桌面 2 / UU远程 的窗口" + ("（已运行实例，按进程名识别）" if uu_preexisting else "（本脚本启动）"),
-        None, 2, explicit_pids=uu_record_pids,
+        "桌面 1 / UU远程 的窗口" + ("（已运行实例，按进程名识别）" if uu_preexisting else "（本脚本启动）"),
+        None, 1, explicit_pids=uu_record_pids,
     )
     total_ok += a; total_ng += b
 
@@ -1525,10 +1562,10 @@ def do_bootstrap(args) -> int:
         uu_state = "PRE-EXISTING  PIDs=" + ",".join(str(p) for p in sorted(uu_record_pids))
     else:
         uu_state = ("OK  PID=" + str(p_uu.pid)) if p_uu else "FAILED"
-    print(f"  桌面 1 / server.py           → {srv_state}  |  cwd = {server_py.parent}")
-    print(f"  桌面 2 / UU远程 GameViewer   → {uu_state}   |  exe = {uu_exe}")
+    print(f"  桌面 0 / server.py（手机布局）→ {srv_state}  |  cwd = {server_py.parent}")
+    print(f"  桌面 1 / UU远程 GameViewer   → {uu_state}   |  exe = {uu_exe}")
     if total_ng == 0:
-        print(f"\n  🎯 100% 隔离成功：共 {total_ok} 个窗口全部在正确的桌面 #1/#2，桌面 0 干净。")
+        print(f"\n  🎯 100% 隔离成功：共 {total_ok} 个窗口全部在正确的桌面 #0/#1。")
     else:
         print(
             f"\n  ⚠️  仍有 {total_ng} 个窗口不在正确桌面（watcher 会在运行期间持续补迁）。\n"
@@ -1552,9 +1589,9 @@ def do_bootstrap(args) -> int:
             "started_at": _datetime.now().isoformat(timespec="seconds"),
             "project_root": str(_SCRIPT_DIR),
             "server_pid": p_server.pid,
-            "server_desktop": 1,
+            "server_desktop": 0,
             "uu_pids": sorted(uu_record_pids),
-            "uu_desktop": 2,
+            "uu_desktop": 1,
             "uu_preexisting": uu_preexisting,
             "uu_dock_pid": uu_dock_pid,
             "watcher_pid": None,
@@ -1591,12 +1628,12 @@ def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Windows 10/11 虚拟桌面管理 + 一键编排：ensure(≥3) → #1启server → #2启UU远程"
+        description="Windows 10/11 虚拟桌面管理 + 一键编排：ensure(2) → #0启server(手机布局在主桌面) → #1启UU远程"
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_ensure = sub.add_parser("ensure", help="确保虚拟桌面数量 ≥ N（不足自动创建，超过则无动作）")
-    p_ensure.add_argument("--count", type=int, default=3, help="最少个数（默认=3）")
+    p_ensure.add_argument("--count", type=int, default=2, help="最少个数（默认=2：主桌面 + UU 桌面）")
 
     p_switch = sub.add_parser("switch", help="切换到指定编号（0-based，左→右）的桌面")
     p_switch.add_argument("--index", type=int, required=True, help="桌面编号 0 / 1 / 2 ...")
@@ -1610,8 +1647,8 @@ def main() -> int:
     # 一键编排 bootstrap（用户本次新增需求）
     p_boot = sub.add_parser(
         "bootstrap",
-        help="按用户要求的固定顺序启动：ensure(≥3) → 桌面1启server.py → 桌面2启UU远程 → 切回原桌面\n"
-             "（**默认强隔离 switch_wait_switchback**：先切桌面再启动 + 条件等窗口，100% 不会散落在桌面 0）",
+        help="固定顺序启动：ensure(2) → 主桌面0启server.py(手机布局) → 新桌面1启UU远程 → 切回原桌面\n"
+             "（**默认强隔离 switch_wait_switchback**：先切桌面再启动 + 条件等窗口，100% 不会散落到错误桌面）",
     )
     # ===== 模式 =====
     p_boot.add_argument("--launch-mode",
@@ -1627,11 +1664,11 @@ def main() -> int:
     p_boot.add_argument("--project-root",
                         help=f"项目根目录（默认=脚本同目录：{_DEFAULT_PROJECT_ROOT}）")
     p_boot.add_argument("--server-script", default=_DEFAULT_SERVER_SCRIPT,
-                        help=f"要在桌面 1 启动的脚本名（默认={_DEFAULT_SERVER_SCRIPT}）")
+                        help=f"要在主桌面 #0 启动的脚本名（默认={_DEFAULT_SERVER_SCRIPT}）")
     p_boot.add_argument("--server-no-window", action="store_true",
                         help="隐藏 server.py 的控制台黑框（CREATE_NO_WINDOW）")
     p_boot.add_argument("--server-wait-ms", type=int, default=18000,
-                        help="switch_wait_switchback 模式：server 在桌面1 条件等待的最长窗口（默认 18000ms，\n"
+                        help="switch_wait_switchback 模式：server 在主桌面0 条件等待的最长窗口（默认 18000ms，\n"
                              "足以等 Qt backdrop 出来 + 多 stagger 2s 的 scrcpy 卡片；app 卡片特别多可调到 25000）。\n"
                              "同时作为 poller 扫尾和 move_after 的时间窗口上限。")
     p_boot.add_argument("--server-min-hwnds", type=int, default=2,
@@ -1648,19 +1685,19 @@ def main() -> int:
     p_boot.add_argument("--uu-remote-args", default="",
                         help="传给远程客户端的额外参数（如向日葵的 -silent）")
     p_boot.add_argument("--uu-wait-ms", type=int, default=10000,
-                        help="switch_wait_switchback 模式：UU远程 在桌面2 条件等待的最长窗口（默认 10000ms）。\n"
+                        help="switch_wait_switchback 模式：UU远程 在桌面1 条件等待的最长窗口（默认 10000ms）。\n"
                              "也是 poller / move_after 的时间窗口上限。")
     p_boot.add_argument("--uu-min-hwnds", type=int, default=1,
                         help="switch_wait_switchback 模式 UU远程 提前离开的条件：出现 >= 多少个顶层 HWND（默认=1）")
     # 收尾
     p_boot.add_argument("--return-to", default=_DEFAULT_RETURN_TO,
-                        help="编排完后切到几号桌面：'original'=回到脚本执行前用户所在桌面（默认）；或 0/1/2 等整数")
+                        help="编排完后切到几号桌面：'original'=回到脚本执行前用户所在桌面（默认，通常即主桌面 #0）；或 0/1 等整数")
     p_boot.add_argument("--force-new-uu", action="store_true",
                         help="即使检测到 UU 远程已在运行，也强制重新 Popen（默认跳过，由 watcher 归位旧实例）")
     p_boot.add_argument("--no-watcher", action="store_true",
                         help="不启动常驻归位 watcher（动态新开的 scrcpy 卡片/托盘点开的 UU 将无人归位）")
     p_boot.add_argument("--no-uu-dock", action="store_true",
-                        help="不在桌面 #2 启动回程 Dock（front/uu_dock.py：电脑按钮切回手机控制桌面）")
+                        help="不在桌面 #1 启动回程 Dock（front/uu_dock.py：电脑按钮切回主桌面的手机控制界面）")
 
     # watcher（内部命令，由 bootstrap 以 detached 方式自启，也可手动运行排障）
     p_watch = sub.add_parser("watch", help=argparse.SUPPRESS)
@@ -1681,7 +1718,7 @@ def main() -> int:
     p_stop.add_argument("--kill-uu", action="store_true",
                         help="同时关闭 UU 远程主程序（默认保留，用户可能继续使用）")
     p_stop.add_argument("--remove-desktops", action="store_true",
-                        help="停止后逆序删除 2、1 号虚拟桌面（窗口合并回桌面 0）")
+                        help="停止后删除 #1 号 UU 桌面（窗口合并回主桌面 #0；主桌面本身不删）")
     p_stop.add_argument("--keep-state", action="store_true",
                         help="停止后保留 .vd_state.json（默认删除）")
 

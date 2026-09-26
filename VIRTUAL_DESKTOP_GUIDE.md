@@ -246,7 +246,7 @@ bootstrap（只控制 server 与手机连接）：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--phoneaddress` | — | 无 USB 设备时循环 `adb connect` 的地址（含端口），5min 超时，如 `192.168.43.1:5555` |
+| `--phoneaddress` | — | 无 USB 设备时 `adb connect` 的地址，如 `192.168.43.1:5555`（可不写端口，默认 5555）；仅检测一次，失败会弹出手机连接窗口 |
 | `--server-wait-ms` | 18000 | 等 server 窗口出现的最长时间（ms）；卡片多建议 25000 |
 | `--server-min-hwnds` | 2 | 至少出现几个顶层窗口才结束等待；本机完整界面建议 `7` |
 | `--python` | 当前解释器 | 指定启动 server.py 的 Python，如 `C:\Python310\python.exe` |
@@ -280,7 +280,7 @@ py -3.10 virtual_desktop.py remove --index 1   # 删除指定桌面（窗口合�
 
 - **状态文件**：`.vd_state.json`（项目根）记录 server_pid / watcher_pid / server_desktop 及 uu-open 回填的 uu_active / uu_desktop / uu_pids / uu_dock_pid，stop 和 status 都靠它；`.vd_backdrop.pid` 是主桌面 toolbar 子进程的自报 PID（stop 精确补刀用，stop 结束自动删除）；异常残留可直接删除这两个文件后重新 bootstrap（stop 无 state 时会自动进入孤儿清扫模式）。
 - **日志文件**：`.vd_watcher.log`（归位巡检，server 连续 3 轮确认退出后 watcher 自动结束）、`.vd_uu.log`（uu-open 创建/切换全过程）、`.vd_uudock.log`（回程 Dock）。
-- **bootstrap 卡在「检查手机 ADB 连接」**：设计行为，每 3s 重试、5min 超时；插 USB 或在手机上确认无线调试授权后会自动继续，无需中断。
+- **bootstrap 启动时弹出「连接手机」窗口（macOS 登录风）**：说明单次 ADB 检测未发现可用手机。窗口中部提示「请 USB 有线连接，并检查授权」。两种连接方式：① 插好 ADB 数据线并在手机弹窗授权，直接点「登入」（地址留空即仅重试 USB）；② 填写手机局域网 IP——可直接在整串输入框写 `192.168.x.x`（默认 5555）或 `IP:端口`，也可用下方的 **4 个数字框 + 「.」+ 「:」+ 端口框**分段输入（两种输入双向同步，四段全空=仅 USB）。数字框下方有**计算器风数字九宫格**：点数字填入当前高亮的数字框（蓝框），IP 段输满 3 位自动跳到下一段，「.」=下一段（到端口为止），「⌫」删除（当前段清空后再按一次退回上一段）；未提供地址时前两段默认 `192.168`，光标落在第三段。**连接失败窗口不关闭**：只显示一句红色短提示，完整错误收在「详细信息 ▸」下拉里（点击展开/收起，同时打印到控制台），可反复重试；点「取消启动」或按 Esc 中止 bootstrap（不启动 server）。不再有旧版的后台每 3s 循环、5 分钟超时。
 - **UU 桌面看不到 UU**：GameViewer 关窗默认只缩托盘、进程不退。托盘态没有可见窗口，`uu-open` 会自动再启动一次 exe 唤出旧实例；会话运行中手动关了 UU 窗，从托盘双击图标重新点开即可，watcher 会在 ≤2s 内搬回 UU 桌面。
 - **再点「电脑」没有重新启动 UU**：这是预期行为——UU 桌面与进程都在时只切换桌面（单例软件重复启动无意义）。
 - **启动 bootstrap 时原桌面闪一下「桌面1」浮窗**：不是建桌/切桌逻辑被触发。pyvda 的 `go()`（COM `SwitchDesktop`）即使目标就是当前桌面，也会触发 Windows 的桌面切换浮窗；懒创建模型下 server 就在当前桌面启动，但 `launch_on_desktop` 强隔离分支仍无条件执行了一次 `switch(当前桌面)`。已修复为「当前桌面 = 目标桌面时跳过 `go()`」（[virtual_desktop.py](file:///d:/TraeProj/Open-AutoGLM/virtual_desktop.py#L189-L197) 的 `switch()` 与 [uu_dock.py](file:///d:/TraeProj/Open-AutoGLM/front/uu_dock.py#L66-L74) 均有此守卫），不影响真实切换。

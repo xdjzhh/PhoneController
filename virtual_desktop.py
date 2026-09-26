@@ -9,6 +9,7 @@ virtual_desktop.py  —  Windows 10 / 11 虚拟桌面管理脚本（零额外配
 桌面布局（2026-09-26 起改为「懒创建」模型，bootstrap 不再创建任何虚拟桌面）：
   · 当前桌面（通常 #0）= 唯一桌面，bootstrap 只在这里启 server.py + 全部 scrcpy
     手机桌面卡片，不新建桌面、不启动 UU；
+    手机桌面卡片，不新建桌面、不启动 UU；
   · UU 桌面（通常 #1，编号=创建时桌面总数-1）= 用户点主桌面 Dock「电脑」按钮时
     才由 `uu-open` 子命令按需创建，并在其中启动 UU GameViewer + 回程 Dock；
     若该桌面与 UU 均已存在，再次点击只切桌面、不重复创建/启动。
@@ -1049,6 +1050,481 @@ def _ensure_phone_connected(phoneaddress: Optional[str], *,
 
 
 # ---------------------------------------------------------------------------
+# 手机连接窗口（macOS 登录风）：bootstrap 首次检测手机不可达时弹出。
+#   · 输入手机局域网 IP（可不带端口，默认 5555）或留空仅重试 USB；
+#   · 连接在后台线程执行（adb connect 最长十余秒），界面不卡死；
+#   · 失败保持窗口并就地显示 + 控制台打印错误；成功/取消才关闭。
+# PySide6 懒导入：只有真正弹窗时才加载，watch/stop 等子命令零开销。
+# ---------------------------------------------------------------------------
+def _prompt_phone_connection_gui(
+    initial_address: Optional[str] = None,
+    initial_error: str = "",
+) -> tuple[bool, str]:
+    """弹出手机连接窗口，返回 (是否连接成功, 描述信息)。
+    用户取消/关窗 → (False, '已取消')。无 PySide6 时降级为控制台输入。"""
+    try:
+        from PySide6.QtCore import Qt, QEvent, QObject, Signal
+        from PySide6.QtGui import QColor, QIntValidator
+        from PySide6.QtWidgets import (
+            QApplication, QDialog, QFrame, QGraphicsDropShadowEffect,
+            QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+            QVBoxLayout,
+        )
+    except ImportError:
+        # 无 GUI 运行时（极端环境）：控制台降级，行为与窗口一致——不循环、可重试、可取消。
+        print("[bootstrap] ⚠️ 未安装 PySide6，无法弹出连接窗口，改用控制台输入（不自动循环）。")
+        addr = initial_address or ""
+        while True:
+            raw = input(
+                "请输入手机局域网 IP（不带端口默认 5555；直接回车=仅重试 USB；q=取消启动）: "
+            ).strip()
+            if raw.lower() in ("q", "quit", "exit"):
+                return False, "用户取消手机连接"
+            addr = raw or None
+            ok, msg = _ensure_phone_connected(addr, verbose=True)
+            if ok:
+                return True, msg
+            print(f"[bootstrap] ❌ 连接失败，窗口模式下会保持窗口；可插好 USB/授权后重试：{msg}")
+
+    class _Bridge(QObject):
+        done = Signal(bool, str)
+
+    class _PhoneLoginDialog(QDialog):
+        """无边框圆角卡片 + 半透明悬浮，交互仿 macOS 登录窗。"""
+
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.setObjectName("phoneLogin")
+            self.setWindowTitle("连接手机 · AutoGLM")
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+                                | Qt.Dialog | Qt.WindowTitleHint)
+            self.setAttribute(Qt.WA_TranslucentBackground)
+            self.setFixedSize(400, 660)
+            self._drag_pos = None
+            self.success_msg = ""
+            self._syncing = False
+            self.pad_buttons: list[QPushButton] = []
+
+            root = QVBoxLayout(self)
+            root.setContentsMargins(16, 16, 16, 16)
+
+            card = QFrame()
+            card.setObjectName("card")
+            card.setFixedSize(368, 628)
+            shadow = QGraphicsDropShadowEffect(card)
+            shadow.setBlurRadius(32)
+            shadow.setOffset(0, 10)
+            shadow.setColor(QColor(0, 0, 0, 70))
+            card.setGraphicsEffect(shadow)
+            root.addWidget(card)
+
+            lay = QVBoxLayout(card)
+            lay.setContentsMargins(30, 26, 30, 24)
+            lay.setSpacing(0)
+
+            self.avatar = QLabel("📱")
+            self.avatar.setFixedSize(72, 72)
+            self.avatar.setAlignment(Qt.AlignCenter)
+            self.avatar.setStyleSheet(
+                "border-radius: 36px;"
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
+                " stop:0 #5aa9ff, stop:1 #0071e3);"
+                "font-size: 36px;"
+            )
+            lay.addWidget(self.avatar, 0, Qt.AlignHCenter)
+            lay.addSpacing(14)
+
+            title = QLabel("连接手机")
+            title.setObjectName("title")
+            title.setAlignment(Qt.AlignHCenter)
+            lay.addWidget(title)
+            lay.addSpacing(4)
+
+            subtitle = QLabel("AutoGLM · ADB")
+            subtitle.setObjectName("subtitle")
+            subtitle.setAlignment(Qt.AlignHCenter)
+            lay.addWidget(subtitle)
+            lay.addSpacing(20)
+
+            self.addr_edit = QLineEdit()
+            self.addr_edit.setPlaceholderText("手机局域网 IP，如 192.168.1.100（默认端口 5555）")
+            self.addr_edit.setText(initial_address or "")
+            self.addr_edit.setFixedHeight(38)
+            self.addr_edit.returnPressed.connect(self._on_login)
+            self.addr_edit.textChanged.connect(self._sync_segments_from_text)
+            lay.addWidget(self.addr_edit)
+            lay.addSpacing(10)
+
+            # —— 分段数字输入：[0-255].[0-255].[0-255].[0-255] : [1-65535] ——
+            # 5 个普通 QLineEdit；当前段由整数 self._active_seg(0..4) 决定，
+            # 九宫格只改文本和这个索引，不依赖 Qt 焦点链。
+            seg_row = QHBoxLayout()
+            seg_row.setSpacing(4)
+            self.seg_boxes: list[QLineEdit] = []
+            for i in range(5):  # 0..3 = IP 四段，4 = 端口
+                box = QLineEdit()
+                box.setObjectName("seg")
+                box.setFixedHeight(34)
+                box.setAlignment(Qt.AlignCenter)
+                box.setProperty("active", "false")
+                if i < 4:
+                    box.setMaxLength(3)
+                    box.setFixedWidth(48)
+                    box.setValidator(QIntValidator(0, 255, box))
+                else:
+                    box.setMaxLength(5)
+                    box.setFixedWidth(66)
+                    box.setValidator(QIntValidator(1, 65535, box))
+                box.textChanged.connect(self._on_seg_edited)
+                self.seg_boxes.append(box)
+                seg_row.addWidget(box)
+                if i < 3:
+                    dot = QLabel(".")
+                    dot.setObjectName("sep")
+                    seg_row.addWidget(dot)
+                elif i == 3:
+                    colon = QLabel(":")
+                    colon.setObjectName("sep")
+                    seg_row.addWidget(colon)
+            seg_row.addStretch(1)
+            lay.addLayout(seg_row)
+            lay.addSpacing(10)
+
+            hint = QLabel("请 USB 有线连接，并检查授权")
+            hint.setObjectName("hint")
+            hint.setAlignment(Qt.AlignHCenter)
+            lay.addWidget(hint)
+            lay.addSpacing(10)
+
+            # —— 计算器风数字九宫格：点击数字填入当前聚焦的数字框 ——
+            # 1..9 / . 跳到下一段 / 0 / ⌫ 删除（空位时回退上一段）。
+            # 按钮全部 NoFocus：点击不抢走数字框焦点，始终知道"当前框"是谁。
+            grid = QGridLayout()
+            grid.setSpacing(6)
+            grid.setContentsMargins(0, 0, 0, 0)
+            pad_keys = [
+                ("1", 0, 0, False), ("2", 0, 1, False), ("3", 0, 2, False),
+                ("4", 1, 0, False), ("5", 1, 1, False), ("6", 1, 2, False),
+                ("7", 2, 0, False), ("8", 2, 1, False), ("9", 2, 2, False),
+                (".", 3, 0, True),  ("0", 3, 1, False), ("⌫", 3, 2, True),
+            ]
+            for key, r, c, is_func in pad_keys:
+                btn = QPushButton(key)
+                btn.setObjectName("padFunc" if is_func else "pad")
+                btn.setFixedHeight(38)
+                btn.setFocusPolicy(Qt.NoFocus)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.clicked.connect(lambda _checked=False, k=key: self._on_pad(k))
+                grid.addWidget(btn, r, c)
+                grid.setColumnStretch(c, 1)
+                self.pad_buttons.append(btn)
+            lay.addLayout(grid)
+            lay.addSpacing(8)
+
+            # —— 错误区：默认只有一句短提示；完整错误收进「详细信息」下拉 ——
+            self.err_label = QLabel("⚠ 连接失败，请 USB 有线连接，并检查授权")
+            self.err_label.setObjectName("err")
+            self.err_label.setWordWrap(True)
+            self.err_label.hide()
+            lay.addWidget(self.err_label)
+
+            self.detail_toggle = QPushButton("详细信息 ▸")
+            self.detail_toggle.setObjectName("detail")
+            self.detail_toggle.setCursor(Qt.PointingHandCursor)
+            self.detail_toggle.setCheckable(True)
+            self.detail_toggle.setFlat(True)
+            self.detail_toggle.hide()
+            self.detail_toggle.toggled.connect(self._toggle_detail)
+            toggle_row = QHBoxLayout()
+            toggle_row.setContentsMargins(0, 0, 0, 0)
+            toggle_row.addWidget(self.detail_toggle)
+            toggle_row.addStretch(1)
+            lay.addLayout(toggle_row)
+
+            self.detail_label = QLabel("")
+            self.detail_label.setObjectName("detailText")
+            self.detail_label.setWordWrap(True)
+            self.detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.detail_label.hide()
+            lay.addWidget(self.detail_label)
+            lay.addStretch(1)
+
+            self.login_btn = QPushButton("登  入")
+            self.login_btn.setObjectName("login")
+            self.login_btn.setFixedHeight(40)
+            self.login_btn.setCursor(Qt.PointingHandCursor)
+            self.login_btn.clicked.connect(self._on_login)
+            lay.addWidget(self.login_btn)
+            lay.addSpacing(8)
+
+            self.cancel_btn = QPushButton("取消启动")
+            self.cancel_btn.setObjectName("cancel")
+            self.cancel_btn.setCursor(Qt.PointingHandCursor)
+            self.cancel_btn.clicked.connect(self.reject)
+            lay.addWidget(self.cancel_btn)
+
+            self.setStyleSheet(
+                "QFrame#card { background: rgba(252,252,254,248); border-radius: 18px; }"
+                "QLabel#title { color: #1d1d1f; font-size: 20px; font-weight: 600; }"
+                "QLabel#subtitle { color: #8a8a8e; font-size: 12px; }"
+                "QLabel#hint { color: #6e6e73; font-size: 12px; }"
+                "QLabel#sep { color: #8a8a8e; font-size: 15px; font-weight: 600; }"
+                "QLabel#err { color: #d70015; font-size: 12px; }"
+                "QLabel#detailText { color: #6e6e73; font-size: 11px;"
+                "  background: #f5f5f7; border-radius: 8px; padding: 8px 10px; }"
+                "QLineEdit { background: #f5f5f7; border: 1px solid #d2d2d7;"
+                "  border-radius: 10px; padding: 6px 12px; font-size: 13px; color: #1d1d1f;"
+                "  selection-background-color: #0071e3; }"
+                "QLineEdit:focus { border: 1px solid #0071e3; background: #ffffff; }"
+                "QLineEdit#seg { background: #f5f5f7; border: 1px solid #d2d2d7;"
+                "  border-radius: 8px; padding: 2px 4px; font-size: 14px; color: #1d1d1f; }"
+                "QLineEdit#seg[active=\"true\"] { border: 1px solid #0071e3;"
+                "  background: #ffffff; }"
+                "QPushButton#detail { color: #0071e3; background: transparent;"
+                "  border: none; font-size: 11px; padding: 2px 0; text-align: left; }"
+                "QPushButton#detail:hover { color: #147ce5; }"
+                "QPushButton#pad { background: #e9e9ee; color: #1d1d1f;"
+                "  border: none; border-radius: 8px; font-size: 17px; font-weight: 500; }"
+                "QPushButton#pad:hover { background: #dedee4; }"
+                "QPushButton#pad:pressed { background: #d0d0d8; }"
+                "QPushButton#pad:disabled { background: #f2f2f5; color: #b8b8bf; }"
+                "QPushButton#padFunc { background: #d2d2d7; color: #1d1d1f;"
+                "  border: none; border-radius: 8px; font-size: 16px; font-weight: 600; }"
+                "QPushButton#padFunc:hover { background: #c7c7cd; }"
+                "QPushButton#padFunc:pressed { background: #bcbcc3; }"
+                "QPushButton#padFunc:disabled { background: #ececf0; color: #b8b8bf; }"
+                "QPushButton#login { background: #0071e3; color: #ffffff; border: none;"
+                "  border-radius: 10px; font-size: 14px; font-weight: 600; }"
+                "QPushButton#login:hover { background: #147ce5; }"
+                "QPushButton#login:disabled { background: #a9cbf2; }"
+                "QPushButton#cancel { color: #0071e3; background: transparent;"
+                "  border: none; font-size: 12px; }"
+                "QPushButton#cancel:hover { color: #147ce5; }"
+            )
+
+            # 当前活动段：0..3=IP 四段，4=端口。九宫格只认这个整数索引。
+            self._active_seg = 2
+            # 物理键盘/鼠标点到某个段时（FocusIn），同步活动段
+            for b in self.seg_boxes:
+                b.installEventFilter(self)
+
+            # 用初始地址回填分段框；未提供地址时前两段默认 192.168
+            if (initial_address or "").strip():
+                self._sync_segments_from_text(self.addr_edit.text())
+                # 活动段：第一个为空的 IP 段；四段都有值则端口
+                active = next(
+                    (i for i in range(4) if not self.seg_boxes[i].text()), 4
+                )
+            else:
+                self.seg_boxes[0].setText("192")
+                self.seg_boxes[1].setText("168")
+                self.seg_boxes[4].setText("5555")
+                active = 2
+            self._set_active(active)
+
+            if initial_error:
+                self._show_error(initial_error)
+
+            # 居中于当前屏幕
+            screen = QApplication.primaryScreen().availableGeometry()
+            self.move(
+                screen.center().x() - self.width() // 2,
+                screen.center().y() - self.height() // 2,
+            )
+
+            self._bridge = _Bridge()
+            self._bridge.done.connect(self._on_done)
+
+        # ---- 无边框窗口拖动 ----
+        def mousePressEvent(self, ev):
+            if ev.button() == Qt.LeftButton:
+                self._drag_pos = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                ev.accept()
+
+        def mouseMoveEvent(self, ev):
+            if self._drag_pos is not None and ev.buttons() & Qt.LeftButton:
+                self.move(ev.globalPosition().toPoint() - self._drag_pos)
+                ev.accept()
+
+        def mouseReleaseEvent(self, ev):
+            self._drag_pos = None
+
+        # ---- 活动段：整数索引 0..4（0-3=IP 段，4=端口），不碰 Qt 焦点链 ----
+        def eventFilter(self, obj, ev):
+            # 用户用鼠标点击/Tab 进入某个段时，顺带同步索引（只是辅助）
+            if ev.type() == QEvent.FocusIn and obj in self.seg_boxes:
+                self._set_active(self.seg_boxes.index(obj), focus=False)
+            return super().eventFilter(obj, ev)
+
+        def _set_active(self, idx: int, *, focus: bool = True) -> None:
+            if not focus and idx == self._active_seg:
+                return  # 无变化，避免重复 polish 引发事件连锁
+            self._active_seg = idx
+            for i, b in enumerate(self.seg_boxes):
+                want = "true" if i == idx else "false"
+                if b.property("active") != want:
+                    b.setProperty("active", want)
+                    b.style().unpolish(b)
+                    b.style().polish(b)
+            if focus:
+                self.seg_boxes[idx].setFocus()
+
+        # ---- 数字九宫格：只围绕 _active_seg 索引和框文本，无焦点推断 ----
+        def _on_pad(self, key: str) -> None:
+            if not self.login_btn.isEnabled():
+                return
+            idx = self._active_seg
+            box = self.seg_boxes[idx]
+            cur = box.text()
+
+            if key == ".":
+                self._set_active(min(idx + 1, 4))  # 下一段（.与:同义，端口为终点）
+                return
+
+            if key == "⌫":
+                if cur:
+                    box.setText(cur[:-1])  # textChanged 自动重建整串
+                elif idx > 0:
+                    self._set_active(idx - 1)  # 本段已空 → 退回上一段
+                return
+
+            # 数字 0-9：追加；前导 0 直接替换；超长/超范围忽略
+            new = key if cur in ("", "0") else cur + key
+            max_len = 3 if idx < 4 else 5
+            limit = 255 if idx < 4 else 65535
+            if len(new) > max_len or int(new) > limit:
+                return
+            box.setText(new)
+            box.setCursorPosition(len(new))
+            if idx < 4 and len(new) == 3:
+                self._set_active(idx + 1)  # IP 段满 3 位 → 下一段
+
+        # ---- 整串框 ↔ 分段框 双向同步（_syncing 防信号递归） ----
+        def _on_seg_edited(self, *_a) -> None:
+            if self._syncing:
+                return
+            raw_parts = [b.text() for b in self.seg_boxes[:4]]
+            if all(p == "" for p in raw_parts):
+                text = ""  # 四段全空 = 不填地址，仅重试 USB
+            else:
+                parts = [p or "0" for p in raw_parts]  # 空段按 0（仅整串归一化，不回写显示）
+                port = self.seg_boxes[4].text() or "5555"
+                text = f"{'.'.join(parts)}:{port}"
+            self._syncing = True
+            try:
+                if self.addr_edit.text() != text:
+                    self.addr_edit.setText(text)
+            finally:
+                self._syncing = False
+
+        def _sync_segments_from_text(self, raw: str) -> None:
+            """整串输入框 → 分段框。空串清空 IP 四段；非法输入保持分段现状。"""
+            if self._syncing:
+                return
+            raw = (raw or "").strip()
+            if not raw:
+                values = ["", "", "", "", self.seg_boxes[4].text()]
+            else:
+                addr, err = self._normalize_addr(raw)
+                if err or not addr:
+                    return  # 正在输入中的非法串不回写，避免打断
+                host, _, port_s = addr.rpartition(":")
+                values = host.split(".") + [port_s]
+            self._syncing = True
+            try:
+                for b, v in zip(self.seg_boxes, values):
+                    if b.text() != v:
+                        b.setText(v)
+            finally:
+                self._syncing = False
+
+        # ---- 错误区：短提示常驻，详情折叠 ----
+        def _show_error(self, msg: str) -> None:
+            self.detail_label.setText((msg or "").strip())
+            self.err_label.show()
+            self.detail_toggle.show()
+            # 每次新错误默认收起详情
+            self.detail_toggle.blockSignals(True)
+            self.detail_toggle.setChecked(False)
+            self.detail_toggle.blockSignals(False)
+            self.detail_toggle.setText("详细信息 ▸")
+            self.detail_label.hide()
+
+        def _hide_error(self) -> None:
+            self.err_label.hide()
+            self.detail_toggle.hide()
+            self.detail_label.hide()
+
+        def _toggle_detail(self, checked: bool) -> None:
+            self.detail_label.setVisible(checked)
+            self.detail_toggle.setText("详细信息 ▾" if checked else "详细信息 ▸")
+
+        @staticmethod
+        def _normalize_addr(raw: str) -> tuple[Optional[str], Optional[str]]:
+            """校验并归一化地址；返回 (addr, error)。留空 → (None, None) 表示仅重试 USB。"""
+            raw = raw.strip()
+            if not raw:
+                return None, None
+            if ":" in raw:
+                host, _, port_s = raw.partition(":")
+                if not port_s.isdigit() or not (1 <= int(port_s) <= 65535):
+                    return None, f"端口必须是 1-65535 的数字，收到：{port_s}"
+            else:
+                host, port_s = raw, "5555"
+            parts = host.split(".")
+            if len(parts) != 4 or not all(
+                p.isdigit() and 0 <= int(p) <= 255 for p in parts
+            ):
+                return None, f"IP 格式不正确，应为 192.168.x.x 形态，收到：{host}"
+            return f"{host}:{port_s}", None
+
+        def _set_busy(self, busy: bool) -> None:
+            self.login_btn.setEnabled(not busy)
+            self.addr_edit.setEnabled(not busy)
+            for box in self.seg_boxes:
+                box.setEnabled(not busy)
+            for btn in self.pad_buttons:
+                btn.setEnabled(not busy)
+            self.login_btn.setText("连接中…" if busy else "登  入")
+
+        def _on_login(self) -> None:
+            if not self.login_btn.isEnabled():
+                return
+            addr, err = self._normalize_addr(self.addr_edit.text())
+            if err:
+                self._show_error(err)
+                self.addr_edit.setFocus()
+                return
+            self._hide_error()
+            self._set_busy(True)
+            # adb connect 含轮询可能十余秒，放后台线程，经信号回主线程
+            t = _threading.Thread(
+                target=lambda: self._bridge.done.emit(
+                    *_ensure_phone_connected(addr, verbose=True)
+                ),
+                daemon=True,
+            )
+            t.start()
+
+        def _on_done(self, ok: bool, msg: str) -> None:
+            self._set_busy(False)
+            if ok:
+                self.success_msg = msg
+                self.accept()
+                return
+            print(f"[phone-login] ❌ 连接失败：{msg}")
+            self._show_error(msg)
+            self.addr_edit.setFocus()
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    dlg = _PhoneLoginDialog()
+    accepted = dlg.exec() == QDialog.Accepted
+    if accepted:
+        return True, dlg.success_msg
+    return False, "用户取消手机连接"
+
+
+# ---------------------------------------------------------------------------
 # 状态文件 / 进程工具 / 常驻归位 watcher / stop
 #   bootstrap 把 server.py / UU / watcher 的 PID 落盘到 .vd_state.json，
 #   `python virtual_desktop.py stop` 凭此优雅终止整条链路（CTRL_C →
@@ -1964,7 +2440,9 @@ def do_bootstrap(args) -> int:
             UU 桌面改为运行期由主桌面 Dock「电脑」按钮触发 `uu-open` 按需创建。
 
       1) 记录当前桌面编号（不切换、不新建）；
-      2) 循环确认手机 ADB 可达（每 3s 一次，最长 5min）；
+      2) 检测一次手机 ADB 可达性；不可达则弹出 macOS 登录风连接窗口
+         （输入手机局域网 IP 或插好 USB 后点「登入」重试；失败保持窗口
+         并显示/打印错误；取消则中止）——不再后台循环等待 5 分钟；
       3) 在当前桌面 Popen server.py，轮询条件等待 ≥N 个顶层 HWND 真正出现；
       4) join sweeper poller（8~10s 扫尾迟来的 scrcpy）；
       5) 审计报告：枚举 server 子孙 PID 的全部 HWND 与真实桌面归属；
@@ -1985,38 +2463,30 @@ def do_bootstrap(args) -> int:
     print("-" * 64)
 
     # Step 1.5: 启动 server.py 前确认手机 ADB 可达
-    #   每 3s 检测一次（有 USB 设备直接通过；否则用 --phoneaddress 执行 adb connect），
-    #   持续 5 分钟仍未连上才中止。
+    #   只检测一次（有 USB 设备直接通过；否则用 --phoneaddress 尝试 adb connect），
+    #   不可达则弹出 macOS 登录风连接窗口由用户交互处理，不再后台循环 5 分钟。
     phoneaddress = getattr(args, "phoneaddress", None)
-    phone_retry_s = 3
-    phone_timeout_s = 300
-    print(
-        f"[bootstrap] 检查手机 ADB 连接（每 {phone_retry_s}s 重试一次，"
-        f"最长等待 {phone_timeout_s}s；可插入 USB 或在手机上确认无线调试授权）..."
-    )
-    phone_ok, phone_msg = False, ""
-    phone_deadline = _time.monotonic() + phone_timeout_s
-    phone_attempt = 0
-    while True:
-        phone_attempt += 1
-        elapsed_s = int(_time.monotonic() - (phone_deadline - phone_timeout_s))
-        phone_ok, phone_msg = _ensure_phone_connected(phoneaddress, verbose=False)
-        if phone_ok:
-            print(f"[bootstrap] ✅ 第 {phone_attempt} 次检测（已等待 {elapsed_s}s）：{phone_msg}")
-            break
-        first_line = str(phone_msg).splitlines()[0]
-        remain_s = max(0, int(phone_deadline - _time.monotonic()))
+    if phoneaddress and ":" not in phoneaddress.strip():
+        phoneaddress = f"{phoneaddress.strip()}:5555"
+        print(f"[bootstrap] --phoneaddress 未带端口，使用无线 ADB 默认端口：{phoneaddress}")
+    print("[bootstrap] 检查手机 ADB 连接（单次检测；不可达会弹出连接窗口，不再后台循环等待）...")
+    phone_ok, phone_msg = _ensure_phone_connected(phoneaddress, verbose=False)
+    if phone_ok:
+        print(f"[bootstrap] ✅ {phone_msg}")
+    else:
+        first_line = str(phone_msg).splitlines()[0] if phone_msg else "手机未连接"
+        print(f"[bootstrap] ⚠️ 手机暂不可达：{first_line}")
         print(
-            f"[bootstrap] ⏳ 第 {phone_attempt} 次检测未连接（已等待 {elapsed_s}s，"
-            f"剩余 {remain_s}s）：{first_line}"
+            "[bootstrap] 打开手机连接窗口：可输入手机局域网 IP 点「登入」连接，\n"
+            "           也可插入 ADB 数据线并在手机上授权后点「登入」重试。"
         )
-        if _time.monotonic() >= phone_deadline:
-            print(
-                f"[bootstrap] ❌ 等待 {phone_timeout_s}s 手机仍未连接，"
-                f"中止 bootstrap（server.py 未启动，桌面已就绪）。最后原因：{first_line}"
-            )
+        phone_ok, phone_msg = _prompt_phone_connection_gui(
+            phoneaddress, initial_error=first_line
+        )
+        if not phone_ok:
+            print("[bootstrap] ❌ 已取消手机连接，中止 bootstrap（server.py 未启动）。")
             return 1
-        _time.sleep(phone_retry_s)
+        print(f"[bootstrap] ✅ {phone_msg}")
 
     # —— Step 2 命令组装：server.py ——
     py = _locate_python(getattr(args, "python", None))
@@ -2397,9 +2867,10 @@ def main() -> int:
     p_boot.add_argument("--port", type=int, help="传给 server.py 的 --port 参数")
     p_boot.add_argument("--device-id", help="传给 server.py 的 --device-id 参数")
     p_boot.add_argument("--phoneaddress", default=None,
-                        help="启动 server 前若无 ADB 有线(USB)设备，则对该地址（必须含端口）"
-                             "执行 `adb connect`，如 --phoneaddress 192.168.1.100:5555；"
-                             "该参数不会传给 server.py")
+                        help="启动 server 前若无 ADB 有线(USB)设备，则对该地址执行 "
+                             "`adb connect`，如 --phoneaddress 192.168.1.100:5555"
+                             "（可不写端口，默认 5555）；检测失败会弹出连接窗口让你"
+                             "重新输入/插 USB 重试；该参数不会传给 server.py")
     p_boot.add_argument("--no-watcher", action="store_true",
                         help="不启动常驻归位 watcher（动态新开的 scrcpy 卡片/uu-open 后托盘点开的 UU 将无人归位）")
 

@@ -495,6 +495,14 @@ def refresh_notifications():
 
 
 def main():
+    # ── 统一 adb 来源：优先使用 scrcpy 自带的 adb.exe，必须早于任何
+    #    adbutils / "adb" 子进程调用（adbutils 每次按 PATH 实时解析）──
+    try:
+        from scrcpycontrol.display_server import ensure_bundled_adb_on_path
+        ensure_bundled_adb_on_path()
+    except Exception as _adb_err:
+        print(f"[server] bundled adb setup skipped: {_adb_err}", flush=True)
+
     # ── Install console tee FIRST so every subsequent print/stderr message
     #    appears BOTH in terminal AND in thinking log card window ──
     try:

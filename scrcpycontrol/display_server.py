@@ -97,6 +97,35 @@ def find_scrcpy():
     raise FileNotFoundError("scrcpy not found.")
 
 
+def ensure_bundled_adb_on_path(scrcpy_path=None):
+    """让本进程优先使用 scrcpy.exe 同目录自带的 adb.exe（完整 platform-tools adb，
+    含 AdbWinApi.dll 等依赖），无需再单独安装 adb。
+
+    原理：把 scrcpy 目录 prepend 到 os.environ['PATH']——
+      · adbutils 0.14.x 的 get_adb_exe() 每次调用都按 PATH 实时解析；
+      · 项目里裸 "adb" 的 subprocess 子进程继承本环境，同样命中。
+    scrcpy.exe 自身本来就固定使用同目录 adb，故三条链路由此统一。
+    幂等；同目录无 adb.exe 时不动 PATH（回退系统原有解析）。
+    返回生效的 adb.exe 绝对路径；不可用时返回 None。
+    """
+    try:
+        exe = scrcpy_path or find_scrcpy()
+        scrcpy_dir = os.path.dirname(os.path.abspath(exe))
+        adb_exe = os.path.join(scrcpy_dir, "adb.exe")
+        if not os.path.isfile(adb_exe):
+            print(f"[adb] {scrcpy_dir} 下无 adb.exe，沿用系统 PATH 中的 adb", flush=True)
+            return None
+        cur = shutil.which("adb")
+        if cur and os.path.dirname(os.path.abspath(cur)).lower() == scrcpy_dir.lower():
+            return os.path.abspath(adb_exe)
+        os.environ["PATH"] = scrcpy_dir + os.pathsep + os.environ.get("PATH", "")
+        print(f"[adb] 已优先使用 scrcpy 自带 adb：{os.path.abspath(adb_exe)}", flush=True)
+        return os.path.abspath(adb_exe)
+    except Exception as e:
+        print(f"[adb] 启用 scrcpy 自带 adb 失败，沿用系统 adb：{e!r}", flush=True)
+        return None
+
+
 def read_output(process, title, stop_event, display_info=None):
     """Read and print scrcpy output, and parse Android display ID for app displays."""
     try:

@@ -4,6 +4,17 @@
 > 背景：项目从 Python 3.13 迁移到 Python 3.10（系统全局环境，两个项目共用）后，
 > `[ScreenMonitor] Turning off physical screen after unlock...` 步骤**完全失效**。
 > 本文件记录整个排查过程、踩过的坑、错误方案的取舍，以及最终落地的方案。
+>
+> **2026-09-26 订正**：经从 PyPI 重新下载 wheel 逐字节比对，新主机安装路径
+> （原 §5b）从「scrcpy-client 0.4.7 + 手工 patch」简化为
+> **「scrcpy-client 0.4.1，零 patch」**。三处关键事实更正：
+> 1. 0.4.1 的 wheel 上游原生就是 `_AdbStreamConnection` 新写法，元数据 pin
+>    `adbutils>=0.14.1,<0.15`，在 adbutils 0.14.1 下**本来就不需要 patch**；
+> 2. 本机从 Py3.13 复制来的 0.4.1 也从未被手工 patch（core.py 与 PyPI 官方 wheel
+>    SHA256 完全一致），旧文「Py3.13 里的是 patch 过的版本」系误判；
+> 3. 真正带旧 `AdbConnection` import、需要 patch 的是 **0.4.2+（含 0.4.7）**，
+>    它们反而 pin `adbutils>=1.0` 且捆绑更旧的 scrcpy-server 1.20（0.4.1 为 1.24）。
+>    安装时请**钉死 0.4.1**，见下文订正后的 §5b。
 
 ---
 
@@ -50,9 +61,9 @@ success, message = self._set_screen_power_mode(scrcpy.POWER_MODE_OFF)
 
 ---
 
-### 🔴 坑 B：PyPI 上的 `scrcpy-client 0.4.x` 本身已经**与当前项目环境不兼容**
+### 🔴 坑 B：直接按普通方式装 PyPI `scrcpy-client` 会失败（2026-09-26 订正：有一个例外版本 0.4.1）
 
-直接执行 `pip install scrcpy-client==0.4.7` 会遇到**两个子坑**，在 Python 3.10 下 100% 装不上：
+直接执行 `pip install scrcpy-client`（当时最新为 0.4.7）会遇到**两个子坑**，在 Python 3.10 下 100% 装不上/跑不起来。注意：**av<10 的坑对全部 0.4.x（含 0.4.1）都成立，必须 --no-deps；而 adbutils 不兼容的坑只对 0.4.2+ 成立，0.4.1 可直接用**（见坑 B-2）。
 
 #### 坑 B-1：`av<10,>=9` 的版本限制 + PyAV 9.x 源码编译失败
 scrcpy-client 0.4.x 的 metadata 写死依赖 `av<10.0.0,>=9.0.0`。
@@ -65,14 +76,21 @@ scrcpy-client 0.4.x 的 metadata 写死依赖 `av<10.0.0,>=9.0.0`。
   ```
   → **100% 编译失败，无解**（除非你手动去给 PyAV 9.2.0 加 noexcept 修饰并自己编 FFmpeg）
 
-#### 坑 B-2：`scrcpy/core.py` 使用了 `adbutils 0.13` 才有的 `AdbConnection`
-就算绕过编译问题把 scrcpy-client 0.4.7 装上了，启动时还是会报错：
+#### 🔴 坑 B-2：新版 `scrcpy-client`（0.4.2+，含 0.4.7）与本项目 adbutils 不兼容
+（2026-09-26 订正：**0.4.1 不在此列**，它是唯一与 adbutils 0.14.1 原生兼容的版本）
+
+直接执行 `pip install --no-deps scrcpy-client==0.4.7` 会发现它的 `scrcpy/core.py` 第 11 行仍是老写法：
 ```python
-# scrcpy/core.py 第 11 行（PyPI 原版 scrcpy-client 0.4.7）
+# scrcpy/core.py 第 11 行（PyPI scrcpy-client 0.4.7）
 from adbutils import AdbConnection, AdbDevice, AdbError, Network, adb
 # ImportError: cannot import name 'AdbConnection' from 'adbutils'
 ```
-因为本项目 `requirements.txt` 里用的是 `adbutils==0.14.1`，而 **adbutils 0.14+ 已经彻底移除了 `AdbConnection` 类**（换成了 `_AdbStreamConnection` 私有类，或者用别的 API）。
+因为本项目 `requirements.txt` 用的是 `adbutils==0.14.1`，而 **adbutils 0.14+ 已经移除了 `AdbConnection` 类**（换成了 `_AdbStreamConnection` 私有类）；0.4.7 元数据还 pin 了 `adbutils>=1.0.8,<2.0.0`，与项目依赖直接冲突。
+
+> ✅ **例外：0.4.1**。实测从 PyPI 下载的 0.4.1 官方 wheel，第 11 行原生就是
+> `from adbutils import AdbDevice, AdbError, Network, _AdbStreamConnection, adb`，
+> 元数据 pin `adbutils>=0.14.1,<0.15`——在本项目环境下**直接可 import，无需任何 patch**。
+> 因此最终方案钉死 0.4.1（见 §4.2 / §5b），不使用 0.4.2 及以上版本。
 
 ---
 
@@ -127,8 +145,8 @@ from adbutils import AdbConnection, AdbDevice, AdbError, Network, adb
 | 依赖 | 处理方式 | 为什么这么做 |
 |---|---|---|
 | **av (PyAV)** | ✅ 装官方预编译 wheel：<br>`pip install --user --only-binary :all: av==17.1.0` | 1. av 17.1.0 在 PyPI 上有**现成的 cp310-win_amd64 wheel**（28MB），不用编译任何 C 代码<br>2. 直接跳开 scrcpy-client 写死的 `av<10` 限制（我们手动 --no-deps，见下）<br>3. scrcpy-client 运行时只用了 `av.codec.CodecContext`，高版本 av 17 完全向后兼容 |
-| **scrcpy / scrcpy_ui / dist-info**<br>**方式 A（快速，需有 Py3.13 环境）** | ✅ 从 Py3.13 的 `Lib\site-packages` 直接复制 3 个目录：<br>`scrcpy/`、`scrcpy_client-0.4.1.dist-info/`、`scrcpy_ui/` | 1. **避开 adbutils 0.14.1 的坑**：Py3.13 里的 `scrcpy/core.py L11` 已经是 patch 过的版本：<br>   `from adbutils import AdbDevice, AdbError, Network, _AdbStreamConnection, adb`<br>   （用的是 `_AdbStreamConnection`，而非 PyPI 原版的不存在的 `AdbConnection`）<br>2. scrcpy 这个包是**纯 Python**，cp313 跟 cp310 的解释器对纯 Python 代码 100% 兼容<br>3. 不通过 pip 装，也就不会触发 pip 去校验 `av<10` 的依赖限制 |
-| **scrcpy / scrcpy_ui / dist-info**<br>**方式 B（自包含，推荐新主机，不依赖 Py3.13）** | ✅ `pip --no-deps` 装 PyPI 原版 scrcpy-client 0.4.7 + **运行 1 行 patch** 把 `scrcpy/core.py L11` 的 `AdbConnection` 替换成 `_AdbStreamConnection`。见「Section 5b 无 Py3.13 时的独立安装流程」 | 1. **不依赖任何其他 Python 版本**：全新机器只装 Py3.10 就能用<br>2. --no-deps 绕开 scrcpy-client 0.4.x 写死的 av<10 版本 pin，直接用我们已经装好的 av 17.1.0<br>3. patch 只有一行，完全可复现，可以写成自动化脚本（Section 5b 提供），几毫秒完成 |
+| **scrcpy / scrcpy_ui / dist-info**<br>**方式 A（快速，需有 Py3.13 环境）** | ✅ 从 Py3.13 的 `Lib\site-packages` 直接复制 3 个目录：<br>`scrcpy/`、`scrcpy_client-0.4.1.dist-info/`、`scrcpy_ui/` | 1. 0.4.1 的 `scrcpy/core.py L11` 上游原生就是新写法：<br>   `from adbutils import AdbDevice, AdbError, Network, _AdbStreamConnection, adb`<br>   （2026-09-26 订正：这不是谁手工 patch 的，0.4.1 官方 wheel 本就如此；已用 SHA256 与 PyPI wheel 逐字节比对确认）<br>2. scrcpy 这个包是**纯 Python**，cp313 跟 cp310 的解释器对纯 Python 代码 100% 兼容<br>3. 不通过 pip 装，也就不会触发 pip 去校验 `av<10` 的依赖限制 |
+| **scrcpy / scrcpy_ui / dist-info**<br>**方式 B（自包含，推荐新主机，不依赖 Py3.13）** | ✅ `pip --no-deps` 装 PyPI 官方 **scrcpy-client 0.4.1** 即可，**无需 patch**（2026-09-26 简化；旧文写的 0.4.7+patch 已废弃） | 1. **不依赖任何其他 Python 版本**：全新机器只装 Py3.10 就能用<br>2. --no-deps 绕开 scrcpy-client 元数据写死的 av<10 版本 pin，直接用已装好的 av 17.1.0<br>3. 0.4.1 原生兼容 adbutils 0.14.1（pin `adbutils>=0.14.1,<0.15`），装上即用；切勿用 0.4.2+（pin adbutils≥1.0、需手工 patch、捆绑 server 反而是更旧的 1.20；0.4.1 捆绑 1.24） |
 
 ### 4.3 取舍权衡（为什么不做其他选择）
 
@@ -150,7 +168,7 @@ from adbutils import AdbConnection, AdbDevice, AdbError, Network, adb
 C:\Users\DELL\AppData\Local\Programs\Python\Python310\python.exe -m pip install --user --only-binary :all: av==17.1.0
 ```
 
-**Step 2 — 从 Py3.13 复制已经 patch 好的 scrcpy 三件套（纯 Python）**
+**Step 2 — 从 Py3.13 复制 0.4.1 的 scrcpy 三件套（纯 Python，0.4.1 上游本就兼容 adbutils 0.14，无需 patch）**
 ```powershell
 $src = "C:\Users\DELL\AppData\Local\Programs\Python\Python313\Lib\site-packages"
 $dst = "C:\Users\DELL\AppData\Roaming\Python\Python310\site-packages"
@@ -177,86 +195,36 @@ NORMAL 2
 ## 5b. 环境复现脚本 — 不依赖 Py3.13 的独立安装流程（推荐）
 
 > 适用场景：**全新的机器** / **只装了 Python 3.10 没有 3.13** / **不想翻其他 Python 版本目录**。
-> 最终效果与方式 A（从 Py3.13 复制）**完全等价**，而且是更正规的「可复现部署路径」。
+> 最终效果与方式 A（从 Py3.13 复制 0.4.1）**完全等价**，而且是更正规的「可复现部署路径」。
+>
+> **2026-09-26 订正**：本节原来写的是「装 0.4.7 + 1 行手工 patch」，共 4 步。
+> 经实测 PyPI 官方 **0.4.1 wheel 原生兼容 adbutils 0.14.1，无需任何 patch**，
+> 现已简化为 3 步（旧的 patch 脚本对 0.4.1 不需要，也不应使用——它只适用于
+> 误装了 0.4.2+ 的情况，而本项目根本不应安装那些版本）。
 
 > 前提：Py3.10 已经装好 `adbutils==0.14.1`（requirements.txt 默认安装）。
+> 下面命令中的解释器路径请按新机实际用户名调整，或直接用 `py -3.10`。
 
 **Step 1 — 装 PyAV（预编译 wheel，永不编源码）**
 ```bat
-C:\Users\DELL\AppData\Local\Programs\Python\Python310\python.exe -m pip install --user --only-binary :all: av==17.1.0
+py -3.10 -m pip install --user --only-binary :all: av==17.1.0
 ```
 
-**Step 2 — 装 scrcpy-client（--no-deps 绕开 av<10 的限制）**
+**Step 2 — 装 scrcpy-client 0.4.1（--no-deps 绕开 av<10 的限制，无需 patch）**
 ```bat
-C:\Users\DELL\AppData\Local\Programs\Python\Python310\python.exe -m pip install --user --no-deps scrcpy-client==0.4.7
+py -3.10 -m pip install --user --no-deps scrcpy-client==0.4.1
 ```
-*说明：`--no-deps` 会让 pip 忽略 scrcpy-client 0.4.7 写死的 `av<10` 版本要求，直接使用已经装好的高版本 av 17.1.0（运行时完全兼容）。*
+*说明：*
+- *`--no-deps` 让 pip 忽略 scrcpy-client 元数据写死的 `av<10` 要求，直接使用 Step 1 装好的 av 17.1.0（运行时仅用 `av.codec.CodecContext`，完全兼容）；*
+- ***版本必须钉死 0.4.1**：它的 `scrcpy/core.py` 第 11 行上游原生就是
+  `from adbutils import AdbDevice, AdbError, Network, _AdbStreamConnection, adb`，
+  元数据 pin `adbutils>=0.14.1,<0.15`，在本项目 adbutils 0.14.1 下直接可 import；
+  0.4.2+（含 0.4.7）pin `adbutils>=1.0`、第 11 行仍是已删除的 `AdbConnection`，
+  必须手工 patch 才能跑，且捆绑的 scrcpy-server 反而是更旧的 1.20（0.4.1 为 1.24）。*
 
-**Step 3 — 给 scrcpy/core.py 打 1 行 adbutils 0.14+ 兼容 patch（必做！）**
-
-PyPI 上 scrcpy-client 0.4.7 的 `scrcpy/core.py L11` 还是老写法：
-```python
-# ❌ 原版（adbutils 0.14+ 已经移除了 AdbConnection）
-from adbutils import AdbConnection, AdbDevice, AdbError, Network, adb
-```
-
-我们需要改成新写法（只改这一行，其他都不动）：
-```python
-# ✅ patch 后（用 _AdbStreamConnection 替代）
-from adbutils import AdbDevice, AdbError, Network, _AdbStreamConnection, adb
-```
-
-可以用下面这个**自动化 patch 脚本**（复制到终端运行就行，**幂等的**——已 patch 过会自动跳过，不会重复改）：
+**Step 3 — 验证**
 ```bat
-C:\Users\DELL\AppData\Local\Programs\Python\Python310\python.exe -c "
-import os, site, glob
-# 1) 找 scrcpy/core.py：用户 site-packages 优先，其次全局 site-packages
-candidates = [site.getusersitepackages()] + site.getsitepackages()
-core_py = None
-for base in candidates:
-    p = os.path.join(base, 'scrcpy', 'core.py')
-    if os.path.exists(p):
-        core_py = p; break
-if not core_py:
-    # 兜底：所有 site-packages 中第一个出现 scrcpy/core.py 的
-    for base in candidates:
-        hits = glob.glob(os.path.join(base, 'scrcpy', 'core.py'))
-        if hits: core_py = hits[0]; break
-assert core_py, f'Cannot find scrcpy/core.py under any of {candidates}. Did you pip install scrcpy-client in Step 2?'
-print(f'[patch] scrcpy/core.py located at: {core_py}')
-
-# 2) 读文件
-with open(core_py, 'r', encoding='utf-8') as f:
-    content = f.read()
-
-OLD_LINE = 'from adbutils import AdbConnection, AdbDevice, AdbError, Network, adb'
-NEW_LINE = 'from adbutils import AdbDevice, AdbError, Network, _AdbStreamConnection, adb'
-
-if NEW_LINE in content:
-    print('[patch] SKIP: core.py is ALREADY patched (contains _AdbStreamConnection). No changes.')
-    exit(0)
-if OLD_LINE not in content:
-    print(f'[patch] WARN: scrcpy/core.py missing the expected old import line. Expected to find:\n  {OLD_LINE}\nPlease inspect manually.')
-    exit(2)
-
-# 3) 原子替换（一次 replace_all）
-content_new = content.replace(OLD_LINE, NEW_LINE, 1)
-tmp = core_py + '.tmp'
-with open(tmp, 'w', encoding='utf-8') as f:
-    f.write(content_new)
-os.replace(tmp, core_py)  # 原子写，防断电坏文件
-print('[patch] OK: scrcpy/core.py patched successfully.')
-"
-```
-
-脚本输出说明：
-- `[patch] SKIP: core.py is ALREADY patched ...` → 之前已经 patch 过，不用管
-- `[patch] OK: scrcpy/core.py patched successfully.` → 第一次 patch 成功
-- `[patch] WARN: scrcpy/core.py missing the expected old import line ...` → scrcpy 版本跟预期不一致，需要手动打开 `core.py` 看第 11 行
-
-**Step 4 — 验证**
-```bat
-C:\Users\DELL\AppData\Local\Programs\Python\Python310\python.exe -c "import av, scrcpy, adbutils; print('av', av.__version__); print('adbutils', adbutils.__version__); print('POWER_MODE_OFF =', scrcpy.POWER_MODE_OFF); print('POWER_MODE_NORMAL =', scrcpy.POWER_MODE_NORMAL); from scrcpy.core import Client; print('scrcpy.Client OK')"
+py -3.10 -c "import av, scrcpy, adbutils; from scrcpy.core import Client; print('av', av.__version__); print('adbutils', adbutils.__version__); print('POWER_MODE_OFF =', scrcpy.POWER_MODE_OFF); print('POWER_MODE_NORMAL =', scrcpy.POWER_MODE_NORMAL); print('scrcpy.Client OK')"
 ```
 预期输出：
 ```
@@ -267,19 +235,23 @@ POWER_MODE_NORMAL = 2
 scrcpy.Client OK
 ```
 
+> 若误装成 0.4.2+ 导致 `ImportError: cannot import name 'AdbConnection'`：
+> 先 `py -3.10 -m pip uninstall -y scrcpy-client`，再按 Step 2 重装 0.4.1，
+> 不要走手工 patch——降级 adbutils 或改包源码都会给后续部署埋坑。
+
 ---
 
 ## 6. 代码位置索引
 
 | 文件 | 关键位置 | 说明 |
 |---|---|---|
-| `scrcpycontrol/display_interface.py` | [L604-L634](file:///d:/TraeProj/Open-AutoGLM/scrcpycontrol/display_interface.py#L604-L634) | `_set_screen_power_mode` — 调 scrcpy.Client 的真正实现（建立控制通道发送 POWER_MODE 控制消息） |
-| `scrcpycontrol/display_interface.py` | [L637-L703](file:///d:/TraeProj/Open-AutoGLM/scrcpycontrol/display_interface.py#L637-L703) | `screen_off()` / `screen_on()` — 对外 API，**严格单实现 + 进程级容错** |
-| `scrcpycontrol/display_interface.py` | [L1536-L1549](file:///d:/TraeProj/Open-AutoGLM/scrcpycontrol/display_interface.py#L1536-L1549) | `ScreenMonitor` 线程里的调用点，解锁成功后调 `self.screen_off()`，打印 ✅ 成功或 ❌ 失败 |
-| `requirements.txt` | [L17-L39](file:///d:/TraeProj/Open-AutoGLM/requirements.txt#L17-L39) | av==17.1.0 写法 + scrcpy 复制步骤的注释说明 |
+| `scrcpycontrol/display_interface.py` | [L727-L767](file:///d:/TraeProj/Open-AutoGLM/scrcpycontrol/display_interface.py#L727-L767) | `_set_screen_power_mode` — 调 scrcpy.Client 的真正实现（建立控制通道发送 POWER_MODE 控制消息） |
+| `scrcpycontrol/display_interface.py` | [L770-L835](file:///d:/TraeProj/Open-AutoGLM/scrcpycontrol/display_interface.py#L770-L835) | `screen_off()` / `screen_on()` — 对外 API，**严格单实现 + 进程级容错** |
+| `scrcpycontrol/display_interface.py` | [L1541-L1553](file:///d:/TraeProj/Open-AutoGLM/scrcpycontrol/display_interface.py#L1541-L1553) | `ScreenMonitor` 线程里的调用点，解锁成功后调 `self.screen_off()`，打印 ✅ 成功或 ❌ 失败 |
+| `requirements.txt` | [L24-L50](file:///d:/TraeProj/Open-AutoGLM/requirements.txt#L24-L50) | av==17.1.0 + scrcpy-client 0.4.1 免 patch 安装步骤的注释说明 |
 
 ---
 
 ## 7. 一句话结论
 
-> **scrcpy-client 的 POWER_MODE_OFF 是唯一符合「只关背光不锁屏」要求的 API，放弃其他方案。依赖问题用「av 装高版本预编译 wheel + scrcpy 纯 Python 包直接从工作环境复制」的组合拳绕过 PyPI 的版本冲突和编译坑。**
+> **scrcpy-client 的 POWER_MODE_OFF 是唯一符合「只关背光不锁屏」要求的 API，放弃其他方案。依赖问题的标准解法（2026-09-26 订正）：`av` 装高版本预编译 wheel + `pip --no-deps scrcpy-client==0.4.1`（该版本原生兼容 adbutils 0.14.1，免 patch；切勿用 0.4.2+）；有现成 Py3.13 环境时也可直接复制 0.4.1 三件套。**

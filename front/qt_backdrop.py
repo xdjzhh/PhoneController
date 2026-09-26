@@ -58,6 +58,18 @@ def _run_backdrop_process(pipe_conn, config_path=None):
     if _proj_root not in sys.path:
         sys.path.insert(0, _proj_root)
 
+    # 落地本进程 PID，供 virtual_desktop.py stop 在 server 被强杀/daemon 回收
+    # 机制失效等场景下显式终止主桌面 toolbar（multiprocessing spawn 子进程的
+    # 命令行不含 'qt_backdrop'，无法靠命令行特征枚举，必须用 PID 文件）。
+    # 本进程若被 terminate() 强杀没机会删文件——stop 读后按存活校验，
+    # bootstrap 重启会覆盖，陈旧 PID 自然失效。
+    try:
+        with open(os.path.join(_proj_root, '.vd_backdrop.pid'), 'w',
+                  encoding='utf-8', newline='') as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
     # 声明 ConfigManager 身份：backdrop_manager 维护 notification_panel / thinking_log
     try:
         from scrcpycontrol.config_manager import ConfigManager, OWNER_BACKDROP_MANAGER
@@ -402,26 +414,37 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                 dock_window.set_settings_active(show)
 
             def _on_dock_computer():
-                """主桌面 #0「电脑」：切到 UU 远程桌面（.vd_state.json: uu_desktop）。"""
+                """主桌面 Dock「电脑」：detached 拉起 virtual_desktop.py uu-open，
+                创建/启动/切换的全部决策都交给 uu-open：
+                  · UU 桌面 + UU 已存在 → 只切换桌面（不重复创建/启动）；
+                  · 桌面不存在 → 新建虚拟桌面并启动 GameViewer + 回程 Dock。
+                不在 Qt 进程里直接调 pyvda：切桌/COM 轮询放到独立进程，不卡 UI。"""
+                import subprocess
                 try:
+                    proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    script = os.path.join(proj_root, 'virtual_desktop.py')
+                    log_path = os.path.join(proj_root, '.vd_uu.log')
+                    # 标准句柄会被复制给子进程，父进程 Popen 后即可关闭自己的副本，
+                    # 避免每次点按都在 Qt 长生命周期进程里泄漏一个文件句柄。
+                    log_fp = open(log_path, 'a', encoding='utf-8')
                     try:
-                        state_path = os.path.join(
-                            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            '.vd_state.json')
-                        with open(state_path, 'r', encoding='utf-8') as f:
-                            idx = int(json.load(f).get('uu_desktop', 1))
-                    except Exception:
-                        idx = 1
-                    from pyvda import get_virtual_desktops
-                    desktops = get_virtual_desktops()
-                    if 0 <= idx < len(desktops):
-                        desktops[idx].go()
-                        print(f"[DockToolbar] 已切换到 UU 远程桌面 #{idx}", flush=True)
-                    else:
-                        print(f"[DockToolbar] UU 桌面 #{idx} 越界（当前共 {len(desktops)} 个虚拟桌面），未切换。",
-                              flush=True)
+                        creationflags = (
+                            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                        )
+                        p = subprocess.Popen(
+                            [sys.executable, script, 'uu-open'],
+                            cwd=proj_root,
+                            stdout=log_fp, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, close_fds=True,
+                            creationflags=creationflags,
+                        )
+                    finally:
+                        log_fp.close()
+                    print(f"[DockToolbar] 已触发 uu-open（PID={p.pid}）：按需创建/切换 UU 远程桌面"
+                          f"（已存在则只切换），日志见 .vd_uu.log", flush=True)
                 except Exception as e:
-                    print(f"[DockToolbar] 切换 UU 桌面失败: {e}", flush=True)
+                    print(f"[DockToolbar] 触发 uu-open 失败: {e}", flush=True)
 
             def _on_dock_phone():
                 """主桌面 #0「手机」：把手机主屏（main_display）嵌入当前所在桌面。

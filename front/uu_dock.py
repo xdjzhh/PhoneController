@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-AR UU Dock —— UU 远程桌面（桌面 #1）上的回程 Dock。
+AR UU Dock —— UU 远程桌面（懒创建，通常是桌面 #1）上的回程 Dock。
 
-只由 virtual_desktop.py bootstrap 以 detached 方式在桌面 #1 启动，用户不会
-直接运行本文件。本文件只是 front/desktop_toolbar.py 公用组件的一个「配置实例」：
+由 virtual_desktop.py uu-open（主桌面 Dock「电脑」按钮触发）以 detached 方式
+在 UU 桌面启动，用户不会直接运行本文件。本文件只是 front/desktop_toolbar.py
+公用组件的一个「配置实例」：
 
     ┌─────────┬─────────┬─────────┐
     │  设置    │  手机   │  电脑   │
@@ -51,22 +52,57 @@ def _server_desktop_index() -> int:
 
 
 def _switch_to_phone_desktop() -> None:
-    """点击「电脑」：切回手机控制界面桌面（.vd_state.json: server_desktop）。"""
+    """点击「电脑」：切回手机控制界面桌面（.vd_state.json: server_desktop）。
+    go() 后校验当前桌面、失败重试，保证 UU 桌面↔手机桌面的来回切换可靠。"""
     idx = _server_desktop_index()
     try:
-        from pyvda import get_virtual_desktops
+        import time
+        from pyvda import VirtualDesktop, get_virtual_desktops
         desktops = get_virtual_desktops()
-        if 0 <= idx < len(desktops):
-            desktops[idx].go()
-            print(f"[UUDock] 已切换到手机控制桌面 #{idx}", flush=True)
-        else:
+        if not (0 <= idx < len(desktops)):
             print(f"[UUDock] 目标桌面 #{idx} 越界（当前共 {len(desktops)} 个），未切换。",
                   flush=True)
+            return
+        # 已在目标桌面时不要调 go()：SwitchDesktop 目标=当前桌面也会弹「桌面N」浮窗
+        cur_ids = [d.id for d in get_virtual_desktops()]
+        try:
+            if cur_ids.index(VirtualDesktop.current().id) == idx:
+                print(f"[UUDock] 当前已在手机控制桌面 #{idx}，无需切换（跳过 go()）。",
+                      flush=True)
+                return
+        except Exception:
+            pass
+        for attempt in range(4):
+            desktops[idx].go()
+            time.sleep(0.25)
+            cur_ids = [d.id for d in get_virtual_desktops()]
+            try:
+                cur_idx = cur_ids.index(VirtualDesktop.current().id)
+            except Exception:
+                cur_idx = idx
+            if cur_idx == idx:
+                if attempt > 0:
+                    print(f"[UUDock] 第 {attempt + 1} 次尝试后切到手机控制桌面 #{idx}",
+                          flush=True)
+                else:
+                    print(f"[UUDock] 已切换到手机控制桌面 #{idx}", flush=True)
+                return
+            print(f"[UUDock] go(#{idx}) 后当前仍为 #{cur_idx}，重试…", flush=True)
+        print(f"[UUDock] 4 次尝试后仍未切到手机控制桌面 #{idx}。", flush=True)
     except Exception as e:
         print(f"[UUDock] 切换手机控制桌面失败: {e}", flush=True)
 
 
 def main() -> int:
+    # detached + stdout 重定向到 .vd_uudock.log 时默认 GBK，强制 UTF-8 防止日志 emoji 崩溃
+    for _name in ("stdout", "stderr"):
+        _s = getattr(sys, _name, None)
+        if _s is not None:
+            try:
+                _s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     declare_dpi_awareness()
     app = QApplication.instance() or QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)

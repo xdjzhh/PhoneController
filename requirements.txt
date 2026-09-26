@@ -25,8 +25,12 @@ av==17.1.0
 #   (1) PyPI scrcpy-client 0.4.x metadata requires `av<10,>=9`, which forces
 #       a source build of PyAV 9.x that is BROKEN on Python 3.10 + modern
 #       Cython (noexcept mismatch in av/logging.pyx).
-#   (2) scrcpy/core.py imports `AdbConnection` from adbutils, but this class
-#       was REMOVED in adbutils 0.14+.  We need a 1-line post-install patch.
+#   (2) Pin 0.4.1 EXACTLY. Its wheel already uses the adbutils 0.14+ import
+#       (`_AdbStreamConnection`) and its metadata pins adbutils>=0.14.1,<0.15,
+#       so it imports on our adbutils==0.14.1 with NO post-install patch.
+#       Do NOT use 0.4.2+: they pin adbutils>=1.0 and ship the old
+#       `AdbConnection` import (removed in adbutils 0.14), requiring a manual
+#       patch; they also bundle the OLDER scrcpy-server 1.20 (0.4.1 has 1.24).
 #
 # --- OPTION A (fast, if a working Python 3.13 env exists nearby) ---
 # Copy three pure-Python folders from Py3.13's Lib/site-packages into
@@ -36,15 +40,14 @@ av==17.1.0
 #   - scrcpy_ui/
 #
 # --- OPTION B (self-contained, NO Py3.13 required, RECOMMENDED for new hosts) ---
-# Step B1: install scrcpy-client without deps (bypasses the broken av<10 pin):
-#   python -m pip install --user --no-deps scrcpy-client==0.4.7
-# Step B2: patch scrcpy/core.py import line 11 (replace dead AdbConnection
-#          with adbutils 0.14+ compatible _AdbStreamConnection).  Either run
-#          the auto-patch script in SCREEN_OFF_FALLBACK.md Section 5b, or
-#          manually change line 11 to:
-#   from adbutils import AdbDevice, AdbError, Network, _AdbStreamConnection, adb
-# Step B3: validate import works:
-#   python -c "import scrcpy, av; print(scrcpy.POWER_MODE_OFF, scrcpy.POWER_MODE_NORMAL)"
+# Step B1: install PyAV pre-built wheel first (never compile av from source):
+#   python -m pip install --user --only-binary :all: "av==17.1.0"
+# Step B2: install scrcpy-client 0.4.1 without deps (bypasses av<10 pin;
+#          no core.py patch needed for 0.4.1 on adbutils 0.14.1):
+#   python -m pip install --user --no-deps scrcpy-client==0.4.1
+# Step B3: validate imports + power-mode constants:
+#   python -c "import av,scrcpy,adbutils; from scrcpy.core import Client; print(av.__version__, adbutils.__version__, scrcpy.POWER_MODE_OFF, scrcpy.POWER_MODE_NORMAL)"
+#   expected: 17.1.0 0.14.1 0 2
 
 # ===== Server / Network =====
 Flask==3.1.3

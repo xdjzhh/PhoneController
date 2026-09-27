@@ -191,11 +191,11 @@ adb.exe  fork-server（5037）                     ← 全机共享（按策略�
 1. **先停 watcher**：否则它会在窗口消失/桌面删除的瞬间把窗口反复搬回去；
 2. **再停 UU 桌面 toolbar**：同理冻结所有搬窗动作；
 3. **CTRL_C 停 server**：让 finally/atexit 走完全套有序清理，超时才 `/T /F`；
-4. **三级兜底**（命令行 → backdrop PID 文件 → scrcpy 按名）：不信赖 daemon 自动回收与 atexit，只认真实存活；
+4. **三级兜底**（命令行 → backdrop PID 文件 → scrcpy 按名）：不信赖 daemon 自动回收与 atexit，只认真实存活；其中命令行正则与 `.vd_osktop.pid` **双保险终止右下角键盘图标宿主 `osk-icon`**（detached 独立进程），宿主被杀后再用 `Win+Ctrl+O` 快捷键**代为关闭系统 osk**（osk 高完整性无法 taskkill，快捷键是唯一通道，失败则告警提示手动关）；
 5. **关 UU**：`/T` 整棵 → 等 1.5s → 按命令行含 `GameViewer`/`UUdesk` 补杀成孤儿的 WebView2 → 检测主程序是否被后台服务重启并给出警告；
 6. **最后才删 UU 虚拟桌面**：必须等窗口所属进程都关闭，桌面变空再删（窗口合并到左侧邻居）；
 7. **最终核验闭环**：重新枚举四类残留并打印「✅ 零残留」或带 PID 的「❌ 残留清单」（权限不足时据此手动处理）；
-8. **清运行态文件**：`.vd_state.json`、`.vd_backdrop.pid`。
+8. **清运行态文件**：`.vd_state.json`、`.vd_backdrop.pid`、`.vd_osktop.pid`。
 
 #### E. 孤儿清扫模式（无 state 也能用）
 
@@ -280,7 +280,7 @@ py -3.10 virtual_desktop.py remove --index 1   # 删除指定桌面（窗口合�
 
 - **状态文件**：`.vd_state.json`（项目根）记录 server_pid / watcher_pid / server_desktop 及 uu-open 回填的 uu_active / uu_desktop / uu_pids / uu_dock_pid，stop 和 status 都靠它；`.vd_backdrop.pid` 是主桌面 toolbar 子进程的自报 PID（stop 精确补刀用，stop 结束自动删除）；异常残留可直接删除这两个文件后重新 bootstrap（stop 无 state 时会自动进入孤儿清扫模式）。
 - **日志文件**：`.vd_watcher.log`（归位巡检，server 连续 3 轮确认退出后 watcher 自动结束）、`.vd_uu.log`（uu-open 创建/切换全过程）、`.vd_uudock.log`（回程 Dock）。
-- **bootstrap 启动时弹出「连接手机」窗口（macOS 登录风）**：说明单次 ADB 检测未发现可用手机。窗口中部提示「请 USB 有线连接，并检查授权」。两种连接方式：① 插好 ADB 数据线并在手机弹窗授权，直接点「登入」（地址留空即仅重试 USB）；② 填写手机局域网 IP——可直接在整串输入框写 `192.168.x.x`（默认 5555）或 `IP:端口`，也可用下方的 **4 个数字框 + 「.」+ 「:」+ 端口框**分段输入（两种输入双向同步，四段全空=仅 USB）。数字框下方有**计算器风数字九宫格**：点数字填入当前高亮的数字框（蓝框），IP 段输满 3 位自动跳到下一段，「.」=下一段（到端口为止），「⌫」删除（当前段清空后再按一次退回上一段）；未提供地址时前两段默认 `192.168`，光标落在第三段。**连接失败窗口不关闭**：只显示一句红色短提示，完整错误收在「详细信息 ▸」下拉里（点击展开/收起，同时打印到控制台），可反复重试；点「取消启动」或按 Esc 中止 bootstrap（不启动 server）。不再有旧版的后台每 3s 循环、5 分钟超时。
+- **bootstrap 启动时弹出「连接手机」窗口（macOS 登录风）**：说明单次 ADB 检测未发现可用手机。检测顺序：① 有 USB 设备或 `--phoneaddress` 显式地址 → 单次检测直接通过；② 未显式给地址时，自动再试 `virtual_desktop_config.json` 中**上次登入成功的 IP**（控制台有日志），命中则不弹窗直接继续；③ 都不可达才弹窗，输入框**自动预填上次成功的 IP**，可直接点「登入」或改地址。**登入成功的地址原子写入项目根 `virtual_desktop_config.json`（`last_phone_address`）**；仅 USB（地址留空）登入成功不覆盖已保存 IP；该文件是用户配置，`stop` 不清理。窗口中部提示「请 USB 有线连接，并检查授权」。两种连接方式：① 插好 ADB 数据线并在手机弹窗授权，直接点「登入」（地址留空即仅重试 USB）；② 填写手机局域网 IP——可直接在整串输入框写 `192.168.x.x`（默认 5555）或 `IP:端口`，也可用下方的 **4 个数字框 + 「.」+ 「:」+ 端口框**分段输入（两种输入双向同步，四段全空=仅 USB）。未提供地址时前两段默认 `192.168`，光标落在第一个空段。输入请使用**物理键盘**或下面的系统屏幕键盘（旧版数字九宫格已移除）。**虚拟键盘（跟随会话生命周期）**：登录窗弹出时，程序即以 detached 独立进程（`osk-icon` 子命令，PID 落盘 `.vd_osktop.pid`）在屏幕**工作区最右下角（距任务栏和屏幕右边各 8px）**放一个**置顶悬浮键盘图标**（灰色=未开，蓝色=已开）。图标必须独立进程，否则 Qt 模态对话框会屏蔽同进程窗口的鼠标点击。单击用 `Win+Ctrl+O` 打开/关闭 Windows 系统屏幕键盘 `osk.exe`（可输入 IP，也可给系统 Wi-Fi 浮层里的密码框输入）；**长按 0.45s 可拖动图标到任意位置**（抓取光标、自动夹在屏幕工作区内不进任务栏），松手位置写入 `virtual_desktop_config.json` 的 `osk_icon_pos`（逻辑像素），下次启动/登入保持，分辨率或任务栏变化导致越界会自动夹回；图标不抢焦点，点完可直接继续输入。生命周期：**取消登录（「取消启动」/Esc/关窗）→ 立即杀掉图标宿主（图标消失）并代为关闭 osk；登入成功 → 宿主保留，bootstrap 幂等复用不重复拉起，图标跟随 server 周期；`stop` → 凭 PID 文件 taskkill /T /F（另有命令行特征兜底）杀宿主、用快捷键代关 osk、清除 PID 文件**（配置文件中的图标位置保留）。打开前程序会在 osk 关闭状态下写注册表 `HKCU\Software\Microsoft\Osk` 的 `WindowLeft/Top`（物理像素，自动扣除任务栏、按系统 DPI 缩放换算），使 osk 启动即位于**屏幕底部居中**。实测限制（Win11 25H2）：osk 以高完整性 + uiAccess 运行，普通进程对其窗口的 taskkill / PostMessage / SetWindowPos / SetWindowLong 一律 `error 5`（UIPI 拒绝），因此**无法隐藏 osk 标题栏、也无法直接移动/点击其窗口**（注册表 `Dock=1` 停靠模式该版本也忽略），唯一可控通道是系统开关快捷键 + 关闭状态下的注册表位置。**窗口左上角有一个设置齿轮按钮**：本程序不自建任何网络界面，点击通过 SendInput 发送 `Win+A` 唤起 Windows 右下角「快速设置 / 控制中心」原生浮层（Wi-Fi、蓝牙等磁贴都在里面，展开对应条目即可选网/配对，不跳转「设置」App；注意旧 `keybd_event` 注入的 Win 键会被 Win11 Shell 忽略，必须用 SendInput）。**连接失败窗口不关闭**：只显示一句红色短提示，完整错误收在「详细信息 ▸」下拉里（点击展开/收起，同时打印到控制台），可反复重试；点「取消启动」或按 Esc 中止 bootstrap（不启动 server，图标/osk 一并收回）。不再有旧版的后台每 3s 循环、5 分钟超时。
 - **UU 桌面看不到 UU**：GameViewer 关窗默认只缩托盘、进程不退。托盘态没有可见窗口，`uu-open` 会自动再启动一次 exe 唤出旧实例；会话运行中手动关了 UU 窗，从托盘双击图标重新点开即可，watcher 会在 ≤2s 内搬回 UU 桌面。
 - **再点「电脑」没有重新启动 UU**：这是预期行为——UU 桌面与进程都在时只切换桌面（单例软件重复启动无意义）。
 - **启动 bootstrap 时原桌面闪一下「桌面1」浮窗**：不是建桌/切桌逻辑被触发。pyvda 的 `go()`（COM `SwitchDesktop`）即使目标就是当前桌面，也会触发 Windows 的桌面切换浮窗；懒创建模型下 server 就在当前桌面启动，但 `launch_on_desktop` 强隔离分支仍无条件执行了一次 `switch(当前桌面)`。已修复为「当前桌面 = 目标桌面时跳过 `go()`」（[virtual_desktop.py](file:///d:/TraeProj/Open-AutoGLM/virtual_desktop.py#L189-L197) 的 `switch()` 与 [uu_dock.py](file:///d:/TraeProj/Open-AutoGLM/front/uu_dock.py#L66-L74) 均有此守卫），不影响真实切换。

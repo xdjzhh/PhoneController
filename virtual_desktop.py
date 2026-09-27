@@ -1050,6 +1050,381 @@ def _ensure_phone_connected(phoneaddress: Optional[str], *,
 
 
 # ---------------------------------------------------------------------------
+# 唤起 Windows 右下角「快速设置 / 控制中心」浮层：就是系统快捷键 Win+A
+# （Wi-Fi/蓝牙/音量等全部由系统提供，本程序不构建任何面板）。
+# 注意：旧 API keybd_event 注入的 Win 键在 Win11 会被 Shell 忽略，必须用
+# SendInput（与真实硬件输入同一通道）；浮层打开后按 Esc 可关。
+# ---------------------------------------------------------------------------
+def _send_hotkey(*vks: int) -> bool:
+    """用 SendInput 发送组合键（按下顺序入、逆序抬起）。
+
+    必须用 SendInput 而非 keybd_event：后者注入的 Win 键在 Win11 被 Shell
+    忽略；x64 下 INPUT 联合体必须含鼠标/硬件成员，结构体形如 40 字节。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+    ULONG_PTR = ctypes.c_size_t
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD),
+                    ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ULONG_PTR)]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                    ("wParamH", wintypes.WORD)]
+
+    class _UNION(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD),
+                    ("u", _UNION)]
+
+    seq = [(vk, False) for vk in vks] + [(vk, True) for vk in reversed(vks)]
+    arr = (_INPUT * len(seq))()
+    for i, (vk, up) in enumerate(seq):
+        arr[i].type = INPUT_KEYBOARD
+        arr[i].u.ki.wVk = vk
+        arr[i].u.ki.dwFlags = KEYEVENTF_KEYUP if up else 0
+    fn = ctypes.windll.user32.SendInput
+    return fn(len(seq), arr, ctypes.sizeof(_INPUT)) == len(seq)
+
+
+def _open_quick_settings() -> tuple[bool, str]:
+    """打开 Windows 快速设置浮层（Win+A，不自建面板）。"""
+    VK_LWIN, VK_A = 0x5B, 0x41
+    try:
+        if _send_hotkey(VK_LWIN, VK_A):
+            return True, "已打开 Windows 快速设置（Win+A）"
+        return False, "SendInput 未能发送 Win+A"
+    except Exception as e:
+        return False, f"无法打开快速设置：{e}"
+
+
+# ---------------------------------------------------------------------------
+# 系统屏幕键盘 osk.exe + 右下角悬浮键盘图标（Win+Ctrl+O 手动开关）。
+# 生命周期：登录窗期间窗内显示图标，取消登录→图标消失并代为关闭 osk；
+# 登入成功后 bootstrap detached 拉起常驻宿主 osk-icon，图标跟随 server
+# 周期——stop 杀宿主（.vd_osktop.pid + 命令行兜底）并代为关闭 osk。
+# 实测（Win11 25H2）限制：osk 以高完整性 + uiAccess 运行，普通进程对其窗口
+# 的 taskkill / PostMessage / SetWindowPos / SetWindowLong 全部 error 5
+# （UIPI 拒绝）——既不能移动它，也不能隐藏其标题栏、不能模拟点击其按钮；
+# 注册表 Dock=1 的停靠模式也被该版本忽略。唯一两条可控路径：
+#   1) Win+Ctrl+O 系统开关快捷键（SendInput 发送，正常生效）→ 开/关；
+#   2) 注册表 HKCU\\Software\\Microsoft\\Osk 的 WindowLeft/Top（osk 关闭
+#      状态下写入，下次启动时按物理像素读取）→ 底部居中定位。
+#    （WindowWidth/Height 是缩放前逻辑值，不能动，只写 Left/Top。）
+# ---------------------------------------------------------------------------
+_OSK_WINDOW_CLASS = "OSKMainClass"
+_OSK_REG_KEY = r"Software\Microsoft\Osk"
+# 常驻键盘小图标宿主（`virtual_desktop.py osk-icon`，detached）：跟随 server 生命周期
+_OSK_ICON_PID_FILE = _SCRIPT_DIR / ".vd_osktop.pid"
+_OSK_ICON_LOG = _SCRIPT_DIR / ".vd_osktop.log"
+VK_LWIN, VK_CONTROL, VK_O = 0x5B, 0x11, 0x4F
+
+
+def _find_osk_hwnd():
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        fn = ctypes.windll.user32.FindWindowW
+        fn.restype = wintypes.HWND
+        fn.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        return fn(_OSK_WINDOW_CLASS, None)
+    except Exception:
+        return None
+
+
+def _position_osk_bottom_center() -> None:
+    """osk 关闭状态下把其启动位置写到注册表：主屏幕底部居中（物理像素）。
+
+    WindowLeft/Top 按物理像素解释；osk 的物理尺寸≈注册表逻辑尺寸×系统缩放。
+    任务栏高度通过 SPI_GETWORKAREA（临时把当前线程切成逐显示器 DPI 感知）扣除。
+    """
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _OSK_REG_KEY) as k:
+            reg_w = winreg.QueryValueEx(k, "WindowWidth")[0]
+            reg_h = winreg.QueryValueEx(k, "WindowHeight")[0]
+    except Exception:
+        return
+
+    import ctypes
+
+    class _RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    old_ctx = None
+    try:  # 临时切到 PER_MONITOR_AWARE_V2 取物理工作区，用完还原
+        try:
+            old_ctx = ctypes.windll.user32.SetThreadDpiAwarenessContext(
+                ctypes.c_void_p(-4))
+        except Exception:
+            old_ctx = None
+        scale = 1.0
+        try:
+            scale = ctypes.windll.user32.GetDpiForSystem() / 96.0
+        except Exception:
+            pass
+        wa = _RECT()
+        SPI_GETWORKAREA = 0x0030
+        ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETWORKAREA, 0, ctypes.byref(wa), 0)
+        phys_w = int(reg_w * scale)
+        phys_h = int(reg_h * scale)
+        left = max(wa.left, wa.left + (wa.right - wa.left - phys_w) // 2)
+        top = max(wa.top, wa.bottom - phys_h)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _OSK_REG_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "WindowLeft", 0, winreg.REG_DWORD, int(left))
+            winreg.SetValueEx(k, "WindowTop", 0, winreg.REG_DWORD, int(top))
+    except Exception:
+        pass
+    finally:
+        if old_ctx:
+            try:
+                ctypes.windll.user32.SetThreadDpiAwarenessContext(old_ctx)
+            except Exception:
+                pass
+
+
+def _toggle_osk() -> None:
+    """手动开关 osk：开之前先把位置写到底部居中。offscreen 环境忽略。"""
+    if _os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        return
+    if not _find_osk_hwnd():
+        _position_osk_bottom_center()
+    _send_hotkey(VK_LWIN, VK_CONTROL, VK_O)
+
+
+def _close_osk_if_running(timeout_s: float = 2.5) -> bool:
+    """osk 若开着则用 Win+Ctrl+O 关闭并等待其窗口消失。
+
+    osk 高完整性无法 taskkill（UIPI error 5），唯一可靠通道是系统开关快捷键。
+    返回 True=已关闭/本就没开；False=快捷键发了但窗口仍在（需用户手动关）。
+    """
+    if _os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        return not _find_osk_hwnd()
+    if not _find_osk_hwnd():
+        return True
+    _send_hotkey(VK_LWIN, VK_CONTROL, VK_O)
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        if not _find_osk_hwnd():
+            return True
+        _time.sleep(0.25)
+    return not _find_osk_hwnd()
+
+
+def _spawn_osk_icon_host():
+    """detached 拉起右下角键盘图标常驻宿主（osk-icon 子命令）。
+
+    - 幂等：.vd_osktop.pid 指向的宿主仍存活则直接返回其 PID，不重复拉起；
+    - offscreen/无头环境不起常驻 UI 进程，返回 None；
+    - 启动失败仅告警返回 None（不影响主流程）。
+    宿主与 watcher 相同的 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP detached flags。
+    """
+    if _os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        return None
+    existing = _read_pid_file(_OSK_ICON_PID_FILE)
+    if existing is not None and _pid_alive(existing):
+        return existing
+    try:
+        log_fp = open(_OSK_ICON_LOG, "a", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(_SCRIPT_DIR / "virtual_desktop.py"), "osk-icon"],
+            cwd=str(_SCRIPT_DIR),
+            stdout=log_fp, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            close_fds=True, creationflags=0x08000000 | 0x00000200,
+        )
+    except Exception as e:
+        print(f"[osk-icon] ⚠️ 键盘图标宿主启动失败（不影响主流程）: {e!r}")
+        return None
+    return proc.pid
+
+
+def _stop_osk_icon_host() -> bool:
+    """终止键盘图标宿主（按 PID 文件 taskkill /T /F）。返回是否已确保无宿主。"""
+    pid = _read_pid_file(_OSK_ICON_PID_FILE)
+    if pid is None or not _pid_alive(pid):
+        return True
+    return bool(_taskkill_tree(pid, label="osk-icon"))
+
+
+def _osk_button_class():
+    """懒加载并返回右下角悬浮键盘图标类（PySide6 仅在真正显示 UI 时导入）。"""
+    from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
+    from PySide6.QtGui import QColor, QPainter, QPen
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    class _OskToggleButton(QWidget):
+        """屏幕右下角置顶的键盘小图标：单击开/关系统屏幕键盘（Win+Ctrl+O）。
+
+        - 无边框、半透明圆角、不抢焦点（点击后焦点仍停在输入框，可直接打字）；
+        - 1s 轮询 osk 窗口：蓝色=已打开（再点关闭），灰色=已关闭（再点打开）；
+        - osk 的开/关/定位全部由模块级 _toggle_osk() 走系统通道，本控件只负责 UI。
+        """
+
+        def __init__(self) -> None:
+            super().__init__(
+                None,
+                Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+                | Qt.WindowDoesNotAcceptFocus,
+            )
+            self.setAttribute(Qt.WA_TranslucentBackground)
+            self.setFocusPolicy(Qt.NoFocus)
+            self.setFixedSize(54, 54)
+            self.setCursor(Qt.PointingHandCursor)
+            self._open = bool(_find_osk_hwnd())
+            self._reposition()
+            self._timer = QTimer(self)
+            self._timer.setInterval(1000)
+            self._timer.timeout.connect(self._refresh_state)
+            self._timer.start()
+            self._refresh_state()
+            # 长按拖动：按下 450ms 不松 → 进入拖动模式，移动改位置、松手落盘；
+            # 450ms 内松手 = 普通单击（开/关 osk）
+            self._drag_armed = False
+            self._drag_offset = None
+            self._long_press_timer = QTimer(self)
+            self._long_press_timer.setSingleShot(True)
+            self._long_press_timer.setInterval(450)
+            self._long_press_timer.timeout.connect(self._arm_drag)
+
+        def _clamped_pos(self, x: int, y: int):
+            """把 (x,y) 夹在主屏幕工作区内（分辨率/任务栏变化后自动回拉）。"""
+            screen = QApplication.primaryScreen()
+            g = screen.availableGeometry() if screen else None
+            if g is not None:
+                x = max(g.left(), min(x, g.right() - self.width() + 1))
+                y = max(g.top(), min(y, g.bottom() - self.height() + 1))
+            return x, y
+
+        def _reposition(self) -> None:
+            screen = QApplication.primaryScreen()
+            g = screen.availableGeometry() if screen else None
+            if g is None:
+                return
+            # 默认：桌面工作区（任务栏之上）最右下角，留 8px 边距；
+            # 配置里有拖动后保存的位置则用它（夹取到工作区内）
+            x, y = g.right() - self.width() - 8, g.bottom() - self.height() - 8
+            saved = _load_config().get("osk_icon_pos")
+            if (isinstance(saved, list) and len(saved) == 2
+                    and all(isinstance(v, int) for v in saved)):
+                x, y = saved
+            self.move(*self._clamped_pos(x, y))
+
+        def _refresh_state(self) -> None:
+            self._open = bool(_find_osk_hwnd())
+            self.setToolTip(
+                ("点击关闭屏幕键盘" if self._open else "点击打开屏幕键盘")
+                + "；长按可拖动位置"
+            )
+            self.update()
+
+        def _arm_drag(self) -> None:
+            self._drag_armed = True
+            self.setCursor(Qt.ClosedHandCursor)
+
+        def mousePressEvent(self, event) -> None:  # type: ignore[override]
+            if event.button() == Qt.LeftButton:
+                self._drag_offset = (
+                    event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                )
+                self._long_press_timer.start()
+                event.accept()
+
+        def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+            if self._drag_armed and event.buttons() & Qt.LeftButton:
+                top_left = event.globalPosition().toPoint() - self._drag_offset
+                self.move(*self._clamped_pos(top_left.x(), top_left.y()))
+                event.accept()
+
+        def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+            if event.button() != Qt.LeftButton:
+                return
+            self._long_press_timer.stop()
+            if self._drag_armed:
+                # 长按拖动结束：落盘新位置（下次启动/登入保持），不触发开/关
+                self._drag_armed = False
+                self._drag_offset = None
+                self.setCursor(Qt.PointingHandCursor)
+                _update_config(osk_icon_pos=[self.x(), self.y()])
+            else:
+                # 短按 = 单击开/关 osk（在松手时判定，以区分长按拖动）
+                self._drag_offset = None
+                _toggle_osk()
+                QTimer.singleShot(700, self._refresh_state)  # 等系统动画/起进程
+            event.accept()
+
+        def paintEvent(self, event) -> None:  # type: ignore[override]
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            rect = QRectF(2, 2, self.width() - 4, self.height() - 4)
+            # 投影
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 38))
+            p.drawRoundedRect(rect.translated(0, 2), 15, 15)
+            # 底卡：开启=蓝，关闭=深灰
+            p.setBrush(QColor("#0A84FF") if self._open else QColor("#3a3a3d"))
+            p.drawRoundedRect(rect, 15, 15)
+            # 键盘图标：白色圆角底板 + 三排键
+            p.setBrush(QColor(255, 255, 255, 235))
+            kb = QRectF(12, 16, 30, 21)
+            p.drawRoundedRect(kb, 4, 4)
+            pen = QPen(QColor("#0A84FF") if self._open else QColor("#3a3a3d"), 1.6)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            x0, y0, w = 15.0, 19.0, 24.0
+            for row in range(3):  # 三排横线
+                y = y0 + 2.5 + row * 5.0
+                p.drawLine(QPointF(x0, y), QPointF(x0 + w, y))
+            n_cols = 5
+            for col in range(n_cols + 1):  # 纵向分格
+                x = x0 + col * (w / n_cols)
+                p.drawLine(QPointF(x, y0 + 2.5), QPointF(x, y0 + 12.5))
+            p.end()
+
+    return _OskToggleButton
+
+
+def _run_osk_icon_host() -> int:
+    """osk-icon 子命令入口：常驻右下角键盘图标，跟随 server 生命周期。
+
+    bootstrap 启动 server 后 detached 拉起；进程一启动先写 PID 文件，
+    stop 凭 PID 文件 + 命令行特征双保险终止，退出时自清 PID 文件。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    try:
+        _OSK_ICON_PID_FILE.write_text(str(_os.getpid()), encoding="utf-8")
+        app = QApplication.instance() or QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(True)
+        btn = _osk_button_class()()
+        btn.show()
+        return app.exec()
+    finally:
+        try:
+            _OSK_ICON_PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # 手机连接窗口（macOS 登录风）：bootstrap 首次检测手机不可达时弹出。
 #   · 输入手机局域网 IP（可不带端口，默认 5555）或留空仅重试 USB；
 #   · 连接在后台线程执行（adb connect 最长十余秒），界面不卡死；
@@ -1063,12 +1438,13 @@ def _prompt_phone_connection_gui(
     """弹出手机连接窗口，返回 (是否连接成功, 描述信息)。
     用户取消/关窗 → (False, '已取消')。无 PySide6 时降级为控制台输入。"""
     try:
-        from PySide6.QtCore import Qt, QEvent, QObject, Signal
-        from PySide6.QtGui import QColor, QIntValidator
+        from PySide6.QtCore import Qt, QObject, QPointF, QRectF, QSize, Signal
+        from PySide6.QtGui import (
+            QColor, QIcon, QIntValidator, QPainter, QPixmap,
+        )
         from PySide6.QtWidgets import (
             QApplication, QDialog, QFrame, QGraphicsDropShadowEffect,
-            QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-            QVBoxLayout,
+            QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout,
         )
     except ImportError:
         # 无 GUI 运行时（极端环境）：控制台降级，行为与窗口一致——不循环、可重试、可取消。
@@ -1086,6 +1462,29 @@ def _prompt_phone_connection_gui(
                 return True, msg
             print(f"[bootstrap] ❌ 连接失败，窗口模式下会保持窗口；可插好 USB/授权后重试：{msg}")
 
+    def _make_gear_icon() -> "QIcon":
+        """手绘 macOS 风设置齿轮单色矢量图标（48×48 超采样，无外部资源）。"""
+        pm = QPixmap(48, 48)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#3a3a3d"))
+        p.save()
+        p.translate(24, 24)
+        tooth_w = 7.0
+        for i in range(8):  # 8 个轮齿
+            p.save()
+            p.rotate(i * 45.0)
+            p.drawRoundedRect(QRectF(-tooth_w / 2, -21, tooth_w, 9), 2.0, 2.0)
+            p.restore()
+        p.drawEllipse(QPointF(0, 0), 16.5, 16.5)  # 轮盘
+        p.restore()
+        p.setBrush(QColor("#ffffff"))  # 中心孔（位于白色卡片上，白色镂空）
+        p.drawEllipse(QPointF(24, 24), 6.2, 6.2)
+        p.end()
+        return QIcon(pm)
+
     class _Bridge(QObject):
         done = Signal(bool, str)
 
@@ -1099,18 +1498,17 @@ def _prompt_phone_connection_gui(
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
                                 | Qt.Dialog | Qt.WindowTitleHint)
             self.setAttribute(Qt.WA_TranslucentBackground)
-            self.setFixedSize(400, 660)
+            self.setFixedSize(400, 516)
             self._drag_pos = None
             self.success_msg = ""
             self._syncing = False
-            self.pad_buttons: list[QPushButton] = []
 
             root = QVBoxLayout(self)
             root.setContentsMargins(16, 16, 16, 16)
 
             card = QFrame()
             card.setObjectName("card")
-            card.setFixedSize(368, 628)
+            card.setFixedSize(368, 484)
             shadow = QGraphicsDropShadowEffect(card)
             shadow.setBlurRadius(32)
             shadow.setOffset(0, 10)
@@ -1119,8 +1517,26 @@ def _prompt_phone_connection_gui(
             root.addWidget(card)
 
             lay = QVBoxLayout(card)
-            lay.setContentsMargins(30, 26, 30, 24)
+            lay.setContentsMargins(30, 16, 30, 24)
             lay.setSpacing(0)
+
+            # —— 左上角：设置齿轮，只负责唤起 Windows 快速设置浮层
+            #    （Wi-Fi/蓝牙/音量等系统连接操作全在浮层里，本程序不自建面板）——
+            topbar = QHBoxLayout()
+            topbar.setContentsMargins(0, 0, 0, 0)
+            topbar.setSpacing(6)
+            self.btn_settings = QPushButton()
+            self.btn_settings.setObjectName("sysBtn")
+            self.btn_settings.setFixedSize(34, 30)
+            self.btn_settings.setCursor(Qt.PointingHandCursor)
+            self.btn_settings.setIcon(_make_gear_icon())
+            self.btn_settings.setIconSize(QSize(20, 20))
+            self.btn_settings.setToolTip("打开 Windows 快速设置（Win+A：Wi-Fi / 蓝牙等）")
+            self.btn_settings.clicked.connect(self._open_quick_settings)
+            topbar.addWidget(self.btn_settings)
+            topbar.addStretch(1)
+            lay.addLayout(topbar)
+            lay.addSpacing(8)
 
             self.avatar = QLabel("📱")
             self.avatar.setFixedSize(72, 72)
@@ -1156,8 +1572,8 @@ def _prompt_phone_connection_gui(
             lay.addSpacing(10)
 
             # —— 分段数字输入：[0-255].[0-255].[0-255].[0-255] : [1-65535] ——
-            # 5 个普通 QLineEdit；当前段由整数 self._active_seg(0..4) 决定，
-            # 九宫格只改文本和这个索引，不依赖 Qt 焦点链。
+            # 5 个普通 QLineEdit，用物理键盘 / 系统屏幕键盘（右下角悬浮图标）输入；
+            # 与上方整串输入框双向同步。
             seg_row = QHBoxLayout()
             seg_row.setSpacing(4)
             self.seg_boxes: list[QLineEdit] = []
@@ -1166,7 +1582,6 @@ def _prompt_phone_connection_gui(
                 box.setObjectName("seg")
                 box.setFixedHeight(34)
                 box.setAlignment(Qt.AlignCenter)
-                box.setProperty("active", "false")
                 if i < 4:
                     box.setMaxLength(3)
                     box.setFixedWidth(48)
@@ -1194,32 +1609,7 @@ def _prompt_phone_connection_gui(
             hint.setObjectName("hint")
             hint.setAlignment(Qt.AlignHCenter)
             lay.addWidget(hint)
-            lay.addSpacing(10)
-
-            # —— 计算器风数字九宫格：点击数字填入当前聚焦的数字框 ——
-            # 1..9 / . 跳到下一段 / 0 / ⌫ 删除（空位时回退上一段）。
-            # 按钮全部 NoFocus：点击不抢走数字框焦点，始终知道"当前框"是谁。
-            grid = QGridLayout()
-            grid.setSpacing(6)
-            grid.setContentsMargins(0, 0, 0, 0)
-            pad_keys = [
-                ("1", 0, 0, False), ("2", 0, 1, False), ("3", 0, 2, False),
-                ("4", 1, 0, False), ("5", 1, 1, False), ("6", 1, 2, False),
-                ("7", 2, 0, False), ("8", 2, 1, False), ("9", 2, 2, False),
-                (".", 3, 0, True),  ("0", 3, 1, False), ("⌫", 3, 2, True),
-            ]
-            for key, r, c, is_func in pad_keys:
-                btn = QPushButton(key)
-                btn.setObjectName("padFunc" if is_func else "pad")
-                btn.setFixedHeight(38)
-                btn.setFocusPolicy(Qt.NoFocus)
-                btn.setCursor(Qt.PointingHandCursor)
-                btn.clicked.connect(lambda _checked=False, k=key: self._on_pad(k))
-                grid.addWidget(btn, r, c)
-                grid.setColumnStretch(c, 1)
-                self.pad_buttons.append(btn)
-            lay.addLayout(grid)
-            lay.addSpacing(8)
+            lay.addSpacing(12)
 
             # —— 错误区：默认只有一句短提示；完整错误收进「详细信息」下拉 ——
             self.err_label = QLabel("⚠ 连接失败，请 USB 有线连接，并检查授权")
@@ -1278,21 +1668,14 @@ def _prompt_phone_connection_gui(
                 "QLineEdit:focus { border: 1px solid #0071e3; background: #ffffff; }"
                 "QLineEdit#seg { background: #f5f5f7; border: 1px solid #d2d2d7;"
                 "  border-radius: 8px; padding: 2px 4px; font-size: 14px; color: #1d1d1f; }"
-                "QLineEdit#seg[active=\"true\"] { border: 1px solid #0071e3;"
-                "  background: #ffffff; }"
+                "QLineEdit#seg:focus { border: 1px solid #0071e3; background: #ffffff; }"
                 "QPushButton#detail { color: #0071e3; background: transparent;"
                 "  border: none; font-size: 11px; padding: 2px 0; text-align: left; }"
                 "QPushButton#detail:hover { color: #147ce5; }"
-                "QPushButton#pad { background: #e9e9ee; color: #1d1d1f;"
-                "  border: none; border-radius: 8px; font-size: 17px; font-weight: 500; }"
-                "QPushButton#pad:hover { background: #dedee4; }"
-                "QPushButton#pad:pressed { background: #d0d0d8; }"
-                "QPushButton#pad:disabled { background: #f2f2f5; color: #b8b8bf; }"
-                "QPushButton#padFunc { background: #d2d2d7; color: #1d1d1f;"
-                "  border: none; border-radius: 8px; font-size: 16px; font-weight: 600; }"
-                "QPushButton#padFunc:hover { background: #c7c7cd; }"
-                "QPushButton#padFunc:pressed { background: #bcbcc3; }"
-                "QPushButton#padFunc:disabled { background: #ececf0; color: #b8b8bf; }"
+                "QPushButton#sysBtn { background: transparent; border: none;"
+                "  border-radius: 8px; }"
+                "QPushButton#sysBtn:hover { background: #e9e9ee; }"
+                "QPushButton#sysBtn:pressed { background: #d8d8df; }"
                 "QPushButton#login { background: #0071e3; color: #ffffff; border: none;"
                 "  border-radius: 10px; font-size: 14px; font-weight: 600; }"
                 "QPushButton#login:hover { background: #147ce5; }"
@@ -1302,25 +1685,18 @@ def _prompt_phone_connection_gui(
                 "QPushButton#cancel:hover { color: #147ce5; }"
             )
 
-            # 当前活动段：0..3=IP 四段，4=端口。九宫格只认这个整数索引。
-            self._active_seg = 2
-            # 物理键盘/鼠标点到某个段时（FocusIn），同步活动段
-            for b in self.seg_boxes:
-                b.installEventFilter(self)
-
-            # 用初始地址回填分段框；未提供地址时前两段默认 192.168
+            # 用初始地址回填分段框；未提供地址时前两段默认 192.168、端口 5555
             if (initial_address or "").strip():
                 self._sync_segments_from_text(self.addr_edit.text())
-                # 活动段：第一个为空的 IP 段；四段都有值则端口
-                active = next(
-                    (i for i in range(4) if not self.seg_boxes[i].text()), 4
-                )
             else:
                 self.seg_boxes[0].setText("192")
                 self.seg_boxes[1].setText("168")
                 self.seg_boxes[4].setText("5555")
-                active = 2
-            self._set_active(active)
+            # 焦点落在第一个为空的 IP 段（四段都有值则端口），屏幕键盘可直接输入
+            focus_idx = next(
+                (i for i in range(4) if not self.seg_boxes[i].text()), 4
+            )
+            self.seg_boxes[focus_idx].setFocus()
 
             if initial_error:
                 self._show_error(initial_error)
@@ -1349,55 +1725,12 @@ def _prompt_phone_connection_gui(
         def mouseReleaseEvent(self, ev):
             self._drag_pos = None
 
-        # ---- 活动段：整数索引 0..4（0-3=IP 段，4=端口），不碰 Qt 焦点链 ----
-        def eventFilter(self, obj, ev):
-            # 用户用鼠标点击/Tab 进入某个段时，顺带同步索引（只是辅助）
-            if ev.type() == QEvent.FocusIn and obj in self.seg_boxes:
-                self._set_active(self.seg_boxes.index(obj), focus=False)
-            return super().eventFilter(obj, ev)
-
-        def _set_active(self, idx: int, *, focus: bool = True) -> None:
-            if not focus and idx == self._active_seg:
-                return  # 无变化，避免重复 polish 引发事件连锁
-            self._active_seg = idx
-            for i, b in enumerate(self.seg_boxes):
-                want = "true" if i == idx else "false"
-                if b.property("active") != want:
-                    b.setProperty("active", want)
-                    b.style().unpolish(b)
-                    b.style().polish(b)
-            if focus:
-                self.seg_boxes[idx].setFocus()
-
-        # ---- 数字九宫格：只围绕 _active_seg 索引和框文本，无焦点推断 ----
-        def _on_pad(self, key: str) -> None:
-            if not self.login_btn.isEnabled():
-                return
-            idx = self._active_seg
-            box = self.seg_boxes[idx]
-            cur = box.text()
-
-            if key == ".":
-                self._set_active(min(idx + 1, 4))  # 下一段（.与:同义，端口为终点）
-                return
-
-            if key == "⌫":
-                if cur:
-                    box.setText(cur[:-1])  # textChanged 自动重建整串
-                elif idx > 0:
-                    self._set_active(idx - 1)  # 本段已空 → 退回上一段
-                return
-
-            # 数字 0-9：追加；前导 0 直接替换；超长/超范围忽略
-            new = key if cur in ("", "0") else cur + key
-            max_len = 3 if idx < 4 else 5
-            limit = 255 if idx < 4 else 65535
-            if len(new) > max_len or int(new) > limit:
-                return
-            box.setText(new)
-            box.setCursorPosition(len(new))
-            if idx < 4 and len(new) == 3:
-                self._set_active(idx + 1)  # IP 段满 3 位 → 下一段
+        # ---- 左上角齿轮：只唤起 Windows 快速设置浮层，无任何自建面板 ----
+        def _open_quick_settings(self) -> None:
+            ok, msg = _open_quick_settings()
+            print(("[phone-login] ✅ " if ok else "[phone-login] ❌ ") + msg)
+            if not ok:
+                self._show_error(msg)
 
         # ---- 整串框 ↔ 分段框 双向同步（_syncing 防信号递归） ----
         def _on_seg_edited(self, *_a) -> None:
@@ -1483,8 +1816,6 @@ def _prompt_phone_connection_gui(
             self.addr_edit.setEnabled(not busy)
             for box in self.seg_boxes:
                 box.setEnabled(not busy)
-            for btn in self.pad_buttons:
-                btn.setEnabled(not busy)
             self.login_btn.setText("连接中…" if busy else "登  入")
 
         def _on_login(self) -> None:
@@ -1518,10 +1849,51 @@ def _prompt_phone_connection_gui(
 
     app = QApplication.instance() or QApplication(sys.argv)
     dlg = _PhoneLoginDialog()
+    # 右下角悬浮键盘图标：由 detached 常驻宿主（osk-icon 子命令）提供，
+    # 必须是独立进程——Qt 模态对话框会屏蔽同进程其它窗口的鼠标点击。
+    # 取消登录 → 杀宿主（图标消失）并顺手关掉 osk；登入成功 → 宿主保留，
+    # 之后跟随 server 周期（stop 杀宿主并代关 osk）。
+    _spawn_osk_icon_host()
     accepted = dlg.exec() == QDialog.Accepted
     if accepted:
+        # 记住本次登入成功的地址（仅 USB、地址留空时不覆盖已保存的 IP）
+        addr, _addr_err = dlg._normalize_addr(dlg.addr_edit.text())
+        if addr:
+            _update_config(last_phone_address=addr)
         return True, dlg.success_msg
+    # 取消/关窗：收回图标宿主；osk 若开着用 Win+Ctrl+O 关闭
+    # （osk 高完整性，taskkill 会被 UIPI error 5 拒绝）
+    _stop_osk_icon_host()
+    try:
+        _OSK_ICON_PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    if not _close_osk_if_running():
+        print("[phone-login] ⚠️ 屏幕键盘 osk 未能自动关闭，请手动按 Win+Ctrl+O 关闭。")
     return False, "用户取消手机连接"
+
+
+def _autodetect_phone(phoneaddress: Optional[str]):
+    """bootstrap 手机检测顺序。
+
+    返回 (ok, msg, used_address, saved_address)：
+      1) 显式 --phoneaddress / USB 单次检测；
+      2) 未显式给地址时，再试 virtual_desktop_config.json 里上次登入成功的 IP；
+      3) 仍失败 → 交调用方弹登录窗（输入框预填 saved_address）。
+    """
+    saved_address = (_load_config().get("last_phone_address") or "").strip() or None
+    ok, msg = _ensure_phone_connected(phoneaddress, verbose=False)
+    if ok:
+        return True, msg, phoneaddress or None, saved_address
+    if not phoneaddress and saved_address:
+        print(f"[bootstrap] 首次检测失败，尝试上次登入成功的地址：{saved_address} ...")
+        ok, msg = _ensure_phone_connected(saved_address, verbose=True)
+        if ok:
+            print(f"[bootstrap] ✅ 已通过上次地址连接：{saved_address}")
+            return True, msg, saved_address, saved_address
+        first = str(msg).splitlines()[0] if msg else "手机未连接"
+        print(f"[bootstrap] ⚠️ 上次地址 {saved_address} 也不可达：{first}")
+    return False, msg, None, saved_address
 
 
 # ---------------------------------------------------------------------------
@@ -1534,6 +1906,10 @@ import json as _json
 from datetime import datetime as _datetime
 
 _STATE_FILE = _SCRIPT_DIR / ".vd_state.json"
+# 用户级持久配置（与临时运行态 state 不同，stop 不清理）：
+#   last_phone_address —— 上次登入成功的手机 IP:端口，下次 bootstrap 先试它；
+#   osk_icon_pos       —— 右下角键盘图标被长按拖动后的位置（逻辑像素 [x, y]）。
+_CONFIG_FILE = _SCRIPT_DIR / "virtual_desktop_config.json"
 # 主桌面 toolbar（front/qt_backdrop.py 的 multiprocessing spawn 子进程）自报 PID 文件
 _BACKDROP_PID_FILE = _SCRIPT_DIR / ".vd_backdrop.pid"
 _WATCHER_LOG = _SCRIPT_DIR / ".vd_watcher.log"
@@ -1693,6 +2069,7 @@ _STOP_CMDLINE_PATTERNS = {
     "watcher": _re.compile(r"virtual_desktop\.py[\"']?\s+watch\b"),
     "uu-dock": _re.compile(r"front[/\\]uu_dock\.py|[\"']?uu_dock\.py"),
     "server": _re.compile(r"[\\/\s]server\.py(?:\s|$|[\"'])"),
+    "osk-icon": _re.compile(r"virtual_desktop\.py[\"']?\s+osk-icon\b"),
 }
 
 
@@ -1815,6 +2192,27 @@ def _clear_state() -> None:
         _STATE_FILE.unlink()
     except FileNotFoundError:
         pass
+
+
+def _load_config() -> dict:
+    """读取 virtual_desktop_config.json（不存在/损坏返回 {}，不抛异常）。"""
+    try:
+        with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _update_config(**changes) -> dict:
+    """读取-合并-原子写回 virtual_desktop_config.json；None 值不写入。"""
+    cfg = _load_config()
+    cfg.update({k: v for k, v in changes.items() if v is not None})
+    tmp = _CONFIG_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _os.replace(tmp, _CONFIG_FILE)
+    return cfg
 
 
 def _update_state(**changes) -> Optional[dict]:
@@ -2206,6 +2604,8 @@ def do_stop(args) -> int:
          · scrcpy.exe × N …… atexit stop_all 后仍无条件按进程名扫尾；
          · UU 主程序（GameViewer.exe 及其 webview2/crashpad 子孙）… 默认 /T 整棵
            关闭（--no-kill-uu 保留）；后台服务无窗口默认不动；
+         · 右下角键盘图标宿主（osk-icon，detached）… PID 文件 + 命令行兜底；
+           系统屏幕键盘 osk … 高完整性无法 taskkill，改用 Win+Ctrl+O 关闭；
          · UU 虚拟桌面 …… 默认删除（--no-remove-desktops 保留）。
 
        无 state 也执行「孤儿清扫模式」：state 失配/被清后仍能按命令行特征、
@@ -2288,7 +2688,7 @@ def do_stop(args) -> int:
         # 4a. 命令行特征：watcher / uu_dock / server（覆盖 state PID 失配、
         #     被 uu-open 补启、强杀后子孙变孤儿等全部场景）
         hits = _find_project_pids_by_cmdline(_STOP_CMDLINE_PATTERNS)
-        for label in ("watcher", "uu-dock", "server"):
+        for label in ("watcher", "uu-dock", "server", "osk-icon"):
             for pid in hits.get(label, []):
                 if _pid_alive(pid) and _taskkill_tree(pid, label=f"residual-{label}"):
                     print(f"[stop] 兜底结束残留 {label} PID={pid}。", flush=True)
@@ -2303,7 +2703,24 @@ def do_stop(args) -> int:
             else:
                 print(f"[stop] 主桌面 toolbar PID={bd_pid} 已自行退出。", flush=True)
 
-        # 4c. scrcpy：server 死后任何残留 scrcpy 都是孤儿，无条件全部清扫
+        # 4c. 右下角键盘图标宿主（osk-icon 常驻进程）：PID 文件先杀，
+        #     命令行兜底已在 4a 覆盖；宿主没了用户也无法再从图标重开 osk
+        osk_icon_pid = _read_pid_file(_OSK_ICON_PID_FILE)
+        if osk_icon_pid is not None and _pid_alive(osk_icon_pid):
+            if _taskkill_tree(osk_icon_pid, label="osk-icon"):
+                print(f"[stop] 右下角键盘图标宿主 PID={osk_icon_pid} 已停止。",
+                      flush=True)
+
+        # 4d. 系统屏幕键盘 osk：高完整性无法 taskkill（UIPI error 5），
+        #     用 Win+Ctrl+O 系统开关关闭（stop 与键盘图标都随 server 周期结束）
+        if _find_osk_hwnd():
+            if _close_osk_if_running():
+                print("[stop] 系统屏幕键盘 osk 已关闭（Win+Ctrl+O）。", flush=True)
+            else:
+                print("[stop] ⚠️ osk 未能自动关闭（高完整性进程，快捷键未生效），"
+                      "请手动按 Win+Ctrl+O 关闭。", flush=True)
+
+        # 4e. scrcpy：server 死后任何残留 scrcpy 都是孤儿，无条件全部清扫
         n_scrcpy = _sweep_scrcpy()
         if n_scrcpy:
             print(f"[stop] 已清扫残留 scrcpy.exe {n_scrcpy} 个。", flush=True)
@@ -2378,12 +2795,17 @@ def do_stop(args) -> int:
             _BACKDROP_PID_FILE.unlink(missing_ok=True)
         except Exception:
             pass
+        try:
+            _OSK_ICON_PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
         if remain_py or remain_bd or remain_scrcpy or remain_uu:
             print("[stop] ❌ 仍有项目进程残留（可能权限不足，请任务管理器手动结束）：",
                   flush=True)
             if remain_py:
-                print(f"        python(server/watcher/uu_dock) PIDs={remain_py}", flush=True)
+                print(f"        python(server/watcher/uu_dock/osk-icon) PIDs={remain_py}",
+                      flush=True)
             if remain_bd:
                 print(f"        主桌面 toolbar qt_backdrop PIDs={remain_bd}", flush=True)
             if remain_scrcpy:
@@ -2392,7 +2814,8 @@ def do_stop(args) -> int:
                 print(f"        UU 主程序 PIDs={remain_uu}", flush=True)
         else:
             print("[stop] ✅ 项目进程零残留：server / watcher / 两个 toolbar / "
-                  "scrcpy 全部结束" + ("，UU 已关闭" if kill_uu else "（UU 按要求保留）")
+                  "键盘图标 / scrcpy 全部结束，osk 已关闭"
+                  + ("，UU 已关闭" if kill_uu else "（UU 按要求保留）")
                   + "。", flush=True)
         if adb_pids:
             print(f"[stop] ℹ️  adb 服务（5037 端口，全机共享）PID={adb_pids} 未停止；"
@@ -2470,9 +2893,12 @@ def do_bootstrap(args) -> int:
         phoneaddress = f"{phoneaddress.strip()}:5555"
         print(f"[bootstrap] --phoneaddress 未带端口，使用无线 ADB 默认端口：{phoneaddress}")
     print("[bootstrap] 检查手机 ADB 连接（单次检测；不可达会弹出连接窗口，不再后台循环等待）...")
-    phone_ok, phone_msg = _ensure_phone_connected(phoneaddress, verbose=False)
+    phone_ok, phone_msg, used_address, saved_address = _autodetect_phone(phoneaddress)
     if phone_ok:
         print(f"[bootstrap] ✅ {phone_msg}")
+        # 记住本次成功地址（显式 --phoneaddress 或配置里的上次 IP 命中）
+        if used_address:
+            _update_config(last_phone_address=used_address)
     else:
         first_line = str(phone_msg).splitlines()[0] if phone_msg else "手机未连接"
         print(f"[bootstrap] ⚠️ 手机暂不可达：{first_line}")
@@ -2481,7 +2907,7 @@ def do_bootstrap(args) -> int:
             "           也可插入 ADB 数据线并在手机上授权后点「登入」重试。"
         )
         phone_ok, phone_msg = _prompt_phone_connection_gui(
-            phoneaddress, initial_error=first_line
+            phoneaddress or saved_address, initial_error=first_line
         )
         if not phone_ok:
             print("[bootstrap] ❌ 已取消手机连接，中止 bootstrap（server.py 未启动）。")
@@ -2677,6 +3103,14 @@ def do_bootstrap(args) -> int:
         _save_state(state)
         print(f"[bootstrap] 💾 会话状态已写入 {_STATE_FILE.name}；"
               f"停止整条链路请执行：python virtual_desktop.py stop")
+
+        # —— 右下角悬浮键盘图标：detached 常驻宿主（幂等；登录窗已拉起则复用）。
+        #   跟随 server 生命周期：stop 凭 .vd_osktop.pid + 命令行特征终止，
+        #   并代为关闭系统 osk；与 watcher 相同的 CREATE_NO_WINDOW detached flags。
+        icon_pid = _spawn_osk_icon_host()
+        if icon_pid is not None:
+            print(f"[bootstrap] ⌨️  右下角键盘图标宿主 PID={icon_pid}"
+                  f"（单击开/关系统屏幕键盘；日志 .vd_osktop.log）")
 
     return 0 if p_server is not None else 1
 
@@ -2903,6 +3337,9 @@ def main() -> int:
     p_sig = sub.add_parser("signal-pid", help=argparse.SUPPRESS)
     p_sig.add_argument("--pid", type=int, required=True)
 
+    # osk-icon（内部命令：bootstrap 以 detached 方式自启的右下角键盘图标常驻宿主）
+    sub.add_parser("osk-icon", help=argparse.SUPPRESS)
+
     # stop：全量停止——默认连 UU 主程序、UU 虚拟桌面一起清理，做到零项目进程残留
     p_stop = sub.add_parser(
         "stop",
@@ -2943,6 +3380,8 @@ def main() -> int:
         return do_watch(args)
     if args.cmd == "signal-pid":
         return do_signal_pid(args)
+    if args.cmd == "osk-icon":
+        return _run_osk_icon_host()
     if args.cmd == "stop":
         return do_stop(args)
     if args.cmd == "status":

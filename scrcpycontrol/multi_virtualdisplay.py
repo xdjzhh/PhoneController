@@ -189,6 +189,9 @@ class MainDisplay:
             cmd.append("--turn-screen-off")
         if cfg.stay_awake:
             cmd.append("--stay-awake")
+        if not cfg.audio:
+            # 该卡片静音：不建立音频流，多卡片同时播放串音问题消除，也省音频通道带宽
+            cmd.append("--no-audio")
 
         # ── Mac card style defaults (hardcoded, not configurable) ──
         # These provide the floating card appearance:
@@ -586,6 +589,9 @@ class AppVirtualDisplay:
             cmd.append("--turn-screen-off")
         if cfg.stay_awake:
             cmd.append("--stay-awake")
+        if not cfg.audio:
+            # 该卡片静音：不建立音频流，避免多卡片同时出声，并省音频通道带宽
+            cmd.append("--no-audio")
 
         # ── Mac card style defaults (hardcoded) ──
         cmd.append("--window-borderless")

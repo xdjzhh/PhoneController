@@ -34,6 +34,7 @@
     "keep_active": true,
     "turn_screen_off": true,
     "stay_awake": true,
+    "audio": true,
     "default_load": true,
     "_owner": "display_manager"
   },
@@ -53,6 +54,7 @@
       "video_codec": "h265",
       "keep_active": true,
       "stay_awake": true,
+      "audio": false,
       "default_load": true,
       "_owner": "display_manager"
     },
@@ -71,6 +73,7 @@
       "video_buffer_ms": 60,
       "keep_active": true,
       "stay_awake": true,
+      "audio": false,
       "default_load": false,
       "_owner": "display_manager"
     },
@@ -89,6 +92,7 @@
       "video_buffer_ms": 120,
       "keep_active": true,
       "stay_awake": true,
+      "audio": false,
       "default_load": false,
       "_owner": "display_manager"
     },
@@ -116,6 +120,7 @@
       "video_codec": "h265",
       "keep_active": true,
       "stay_awake": true,
+      "audio": false,
       "default_load": true,
       "_owner": "display_manager"
     }

@@ -38,6 +38,8 @@ class WindowConfig:
         keep_active: Keep scrcpy process alive and attempt reconnection.
         turn_screen_off: Turn off physical phone screen after starting (main display only).
         stay_awake: Prevent Android from sleeping while scrcpy is connected.
+        audio: 是否转发音频（默认 True）。False → scrcpy 加 --no-audio，
+               卡片静音且不占用音频通道带宽；多卡片场景通常只让主卡开音频。
 
         tall_new_display_width:  VD width  used when window is tall  (w <  h).
         tall_new_display_height: VD height used when window is tall  (w <  h).
@@ -65,6 +67,9 @@ class WindowConfig:
     keep_active: bool = True
     turn_screen_off: bool = True
     stay_awake: bool = True
+    # 音频转发开关：False 时 scrcpy 以 --no-audio 启动（卡片静音 + 省音频通道）。
+    # 默认 True 与 scrcpy 原生行为一致；需要静音的卡片在 display_config.json 里显式设 false。
+    audio: bool = True
 
     # Virtual display resolution - selected purely by window aspect ratio (w < h → tall).
     # (Names kept deliberately neutral — no "portrait/landscape" semantics, no swapping.)
@@ -119,6 +124,7 @@ class WindowConfig:
             keep_active=cfg.get("keep_active", True),
             turn_screen_off=cfg.get("turn_screen_off", True if is_main else False),
             stay_awake=cfg.get("stay_awake", True),
+            audio=cfg.get("audio", True),
             tall_new_display_width=tall_w,
             tall_new_display_height=tall_h,
             tall_new_display_dpi=tall_dpi,

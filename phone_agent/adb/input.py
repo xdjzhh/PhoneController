@@ -35,6 +35,8 @@ def type_text(text: str, device_id: str | None = None) -> None:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
         # Step 1: 通过广播设置剪贴板
     # subprocess.run(
@@ -84,6 +86,8 @@ def clear_text(device_id: str | None = None) -> None:
         adb_prefix + ["shell", "am", "broadcast", "-a", "ADB_CLEAR_TEXT"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
@@ -104,6 +108,8 @@ def detect_and_set_adb_keyboard(device_id: str | None = None) -> str:
         adb_prefix + ["shell", "settings", "get", "secure", "default_input_method"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     current_ime = (result.stdout + result.stderr).strip()
 
@@ -113,6 +119,8 @@ def detect_and_set_adb_keyboard(device_id: str | None = None) -> str:
             adb_prefix + ["shell", "ime", "set", "com.android.adbkeyboard/.AdbIME"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
     # Warm up the keyboard
@@ -132,7 +140,9 @@ def restore_keyboard(ime: str, device_id: str | None = None) -> None:
     adb_prefix = _get_adb_prefix(device_id)
 
     subprocess.run(
-        adb_prefix + ["shell", "ime", "set", ime], capture_output=True, text=True
+        adb_prefix + ["shell", "ime", "set", ime],
+        capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
     )
 
 

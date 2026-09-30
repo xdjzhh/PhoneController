@@ -511,6 +511,8 @@ class ActionHandler:
                 cmd_prefix + ["shell", "input", "keyevent", keycode],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
 
     @staticmethod

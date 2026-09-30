@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 
 def _force_utf8_stdio() -> None:
@@ -260,6 +260,7 @@ class VirtualDesktops:
                           no_window: bool = False,
                           mode: str = "auto",
                           min_hwnd_count: int = 1,
+                          ready_probe: "Optional[Callable[[], bool]]" = None,
                           ) -> tuple[Optional[subprocess.Popen],
                                      Optional[_threading.Thread],
                                      str]:
@@ -307,9 +308,14 @@ class VirtualDesktops:
         # 模式 A：switch_wait_switchback（强隔离，本轮默认 & 推荐）
         # =================================================================
         if mode == "switch_wait_switchback":
+            # 目标桌面本就是当前桌面：子孙窗口生下来即在目标桌面，无需任何事后
+            # 搬运（懒创建模型下 server 即此情形），sweeper 直接省掉。
+            was_current = (self.current_index() == index)
+            ready_desc = ("等 HTTP 就绪探针应答" if ready_probe is not None
+                          else f"等 >= {min_hwnd_count} 个顶层 HWND 出现")
             print(
                 f"[launch{label_suffix}] 🛡️  强隔离模式（switch_wait_switchback）："
-                f"切到 desktop#{index} → Popen → 等 >= {min_hwnd_count} 个顶层 HWND 出现"
+                f"切到 desktop#{index} → Popen → {ready_desc}"
                 f"后再离开（**不是死 sleep**）。"
             )
             # Phase 1: 切桌面
@@ -326,20 +332,51 @@ class VirtualDesktops:
                 return None, None, mode
             print(f"[launch{label_suffix}] ✅ PID={proc.pid} 已在 desktop#{index} 创建。")
 
-            # Phase 3: 条件等待 HWND 出现（不是死 sleep）
+            # Phase 3: 就绪判定。
+            #   ready_probe（server 用）：以 HTTP /status 应答为准——语义正确，
+            #   不受顶层窗口数量波动（控制台/crashpad/懒创建卡片）影响；
+            #   否则退化为「等 >= N 个顶层 HWND」（uu-open 等无 HTTP 的进程）。
             wait_ms = max(3000, int(wait_window_ms))
-            _wait_until_hwnds_ready(
-                proc.pid, index,
-                total_ms=wait_ms,
-                min_hwnd_count=min_hwnd_count,
-                label=f"{label}: desktop#{index}",
-            )
+            if ready_probe is not None:
+                t0 = _time.monotonic()
+                deadline = t0 + wait_ms / 1000.0
+                ok = False
+                while _time.monotonic() < deadline:
+                    try:
+                        ok = bool(ready_probe())
+                    except Exception:
+                        ok = False
+                    if ok:
+                        break
+                    _time.sleep(0.5)
+                el = int((_time.monotonic() - t0) * 1000)
+                if ok:
+                    print(f"[launch{label_suffix}] ✅ 就绪探针成功（{el}ms）。")
+                else:
+                    print(f"[launch{label_suffix}] ⚠️  就绪探针 {wait_ms}ms 未成功"
+                          f"（继续后续流程，watcher 兜底动态窗口）。")
+            else:
+                _wait_until_hwnds_ready(
+                    proc.pid, index,
+                    total_ms=wait_ms,
+                    min_hwnd_count=min_hwnd_count,
+                    label=f"{label}: desktop#{index}",
+                )
 
-            # Phase 4: 仍留在 desktop#N（调用方 do_bootstrap 决定下一步），
-            #         但同时立刻开一个 10s 的扫尾 poller，抓那些"16s 超时后才冒出来"的残余卡片
+            # Phase 4: 仍留在 desktop#N（调用方决定下一步）。
+            #         目标桌面=当前桌面时无窗可搬，不启 sweeper（bootstrap 的
+            #         server 启动每次省掉固定 ~9s；短暂空窗由随后启动的 watcher 兜）；
+            #         跨桌面启动（如 uu-open）才开扫尾 poller，且安静 4s 即提前收工。
+            if was_current:
+                print(
+                    f"[launch{label_suffix}] ⏭️  目标即当前桌面，窗口天然归位，"
+                    f"跳过 sweeper（后续动态卡片归常驻 watcher）。"
+                )
+                return proc, None, mode
             sweeper = _start_hwnd_assignment_poller(
                 proc.pid, index,
                 total_ms=max(8000, wait_ms // 2),
+                quiet_ms=4000,
                 label=f"sweeper {label or ''}: D{index}",
             )
             return proc, sweeper, mode
@@ -719,6 +756,7 @@ def _start_hwnd_assignment_poller(
     *,
     total_ms: int = 10000,
     tick_ms: int = 350,
+    quiet_ms: int = 0,
     label: str = "",
 ) -> _threading.Thread:
     """
@@ -726,6 +764,9 @@ def _start_hwnd_assignment_poller(
     顶层 HWND 一个个 move 到目标桌面。
     **主要作为切完桌面后的"扫尾"**——强隔离模式下 99% 的 HWND 已经在 Popen 时
     归属正确了，这里只抓那些"迟了 N 秒才冒出来"的残余卡片。
+
+    quiet_ms>0 时启用「安静提前收工」：连续 quiet_ms 没有发现任何新窗口即退出
+    （残余卡片由常驻 watcher 兜底），避免把 total_ms 固定熬完。
     """
     label_suffix = f" [{label}]" if label else ""
     seen: set[int] = set()
@@ -736,6 +777,7 @@ def _start_hwnd_assignment_poller(
         end_at = _time.monotonic() + (total_ms / 1000.0)
         total_moved = 0
         tick = 0
+        last_activity = _time.monotonic()
         while _time.monotonic() < end_at:
             tick += 1
             pids = _collect_descendant_pids(root_pid)
@@ -744,6 +786,7 @@ def _start_hwnd_assignment_poller(
             for hwnd in hwnds:
                 if hwnd in seen:
                     continue
+                last_activity = _time.monotonic()
                 title = _get_window_title(hwnd, 60)
                 # 先查真实桌面：已对的话直接记为 seen
                 real_idx = _get_hwnd_desktop_index(hwnd)
@@ -778,6 +821,12 @@ def _start_hwnd_assignment_poller(
                     f"[poller{label_suffix}] tick#{tick}: 本轮确认 {newly_done_this_tick} 个"
                     f" HWND 归位；累计 {total_moved} 个。"
                 )
+            if quiet_ms and (_time.monotonic() - last_activity) * 1000 >= quiet_ms:
+                print(
+                    f"[poller{label_suffix}] 🏁 连续 {quiet_ms}ms 无新窗口，提前收工"
+                    f"（上限 {total_ms}ms，累计 {total_moved} 个 HWND，残余由 watcher 兜底）。"
+                )
+                return
             _time.sleep(tick_ms / 1000.0)
         print(
             f"[poller{label_suffix}] 🏁 扫尾结束。时间窗口={total_ms}ms，"
@@ -957,6 +1006,7 @@ def _adb_run(adb_exe: str, args: list[str], timeout: float = 15.0) -> str:
     r = subprocess.run(
         [adb_exe, *args],
         capture_output=True, text=True, timeout=timeout,
+        encoding="utf-8", errors="replace",
         creationflags=creationflags,
     )
     return ((r.stdout or "") + (r.stderr or "")).strip()
@@ -1113,10 +1163,9 @@ def _open_quick_settings() -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# 系统屏幕键盘 osk.exe + 右下角悬浮键盘图标（Win+Ctrl+O 手动开关）。
-# 生命周期：登录窗期间窗内显示图标，取消登录→图标消失并代为关闭 osk；
-# 登入成功后 bootstrap detached 拉起常驻宿主 osk-icon，图标跟随 server
-# 周期——stop 杀宿主（.vd_osktop.pid + 命令行兜底）并代为关闭 osk。
+# 系统屏幕键盘 osk.exe（由 Toolbar 服务 Dock 的键盘钮 Win+Ctrl+O 开关）。
+# 生命周期：bootstrap 最早期拉起 Toolbar 常驻服务，取消登录/stop 时杀服务并
+# 代为关闭 osk。
 # 实测（Win11 25H2）限制：osk 以高完整性 + uiAccess 运行，普通进程对其窗口
 # 的 taskkill / PostMessage / SetWindowPos / SetWindowLong 全部 error 5
 # （UIPI 拒绝）——既不能移动它，也不能隐藏其标题栏、不能模拟点击其按钮；
@@ -1128,9 +1177,15 @@ def _open_quick_settings() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 _OSK_WINDOW_CLASS = "OSKMainClass"
 _OSK_REG_KEY = r"Software\Microsoft\Osk"
-# 常驻键盘小图标宿主（`virtual_desktop.py osk-icon`，detached）：跟随 server 生命周期
-_OSK_ICON_PID_FILE = _SCRIPT_DIR / ".vd_osktop.pid"
-_OSK_ICON_LOG = _SCRIPT_DIR / ".vd_osktop.log"
+# Toolbar 常驻服务（`virtual_desktop.py toolbar`，detached）：bootstrap 最早期拉起，
+# 每个虚拟桌面一个底部 Dock（含键盘钮），跟随 server 生命周期。
+# PID/日志路径常量单一真相源在 virtualdesk/toolbar_service.py（该模块仅依赖标准库）。
+from virtualdesk.toolbar_service import TOOLBAR_PID_FILE as _TOOLBAR_PID_FILE
+from virtualdesk.toolbar_service import TOOLBAR_LOG as _TOOLBAR_LOG
+# osk 定位时为贴底 Dock 预留的垂直空间（逻辑像素）：
+# dock 高(48+2*10=68) + 底边距 6 + osk 与 dock 间隔 8 = 82。
+# 与 virtualdesk/toolbar.py 的 _v_padding / DOCK_BOTTOM_MARGIN / OSK_DOCK_GAP 保持一致。
+_OSK_RESERVE_DOCK_LOGICAL = 82
 VK_LWIN, VK_CONTROL, VK_O = 0x5B, 0x11, 0x4F
 
 
@@ -1186,8 +1241,11 @@ def _position_osk_bottom_center() -> None:
             SPI_GETWORKAREA, 0, ctypes.byref(wa), 0)
         phys_w = int(reg_w * scale)
         phys_h = int(reg_h * scale)
+        # 为贴底 Dock 预留空间：osk 底边落在 dock 顶边之上（再留 OSK_DOCK_GAP），
+        # 保证 osk 打开时 dock 不被遮挡、键盘钮「再点关闭」始终可达。
+        reserve_phys = int(_OSK_RESERVE_DOCK_LOGICAL * scale)
         left = max(wa.left, wa.left + (wa.right - wa.left - phys_w) // 2)
-        top = max(wa.top, wa.bottom - phys_h)
+        top = max(wa.top, wa.bottom - phys_h - reserve_phys)
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _OSK_REG_KEY, 0,
                             winreg.KEY_SET_VALUE) as k:
             winreg.SetValueEx(k, "WindowLeft", 0, winreg.REG_DWORD, int(left))
@@ -1230,198 +1288,39 @@ def _close_osk_if_running(timeout_s: float = 2.5) -> bool:
     return not _find_osk_hwnd()
 
 
-def _spawn_osk_icon_host():
-    """detached 拉起右下角键盘图标常驻宿主（osk-icon 子命令）。
+def _spawn_toolbar_service():
+    """detached 拉起 Toolbar 常驻服务（toolbar 子命令）。
 
-    - 幂等：.vd_osktop.pid 指向的宿主仍存活则直接返回其 PID，不重复拉起；
+    - 幂等：.vd_toolbar.pid 指向的服务仍存活则直接返回其 PID（服务内也有单实例保护）；
     - offscreen/无头环境不起常驻 UI 进程，返回 None；
     - 启动失败仅告警返回 None（不影响主流程）。
-    宿主与 watcher 相同的 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP detached flags。
+    与 watcher 相同的 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP detached flags。
     """
     if _os.environ.get("QT_QPA_PLATFORM") == "offscreen":
         return None
-    existing = _read_pid_file(_OSK_ICON_PID_FILE)
+    existing = _read_pid_file(_pathlib.Path(_TOOLBAR_PID_FILE))
     if existing is not None and _pid_alive(existing):
         return existing
     try:
-        log_fp = open(_OSK_ICON_LOG, "a", encoding="utf-8")
+        log_fp = open(_TOOLBAR_LOG, "a", encoding="utf-8")
         proc = subprocess.Popen(
-            [sys.executable, str(_SCRIPT_DIR / "virtual_desktop.py"), "osk-icon"],
+            [sys.executable, str(_SCRIPT_DIR / "virtual_desktop.py"), "toolbar"],
             cwd=str(_SCRIPT_DIR),
             stdout=log_fp, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             close_fds=True, creationflags=0x08000000 | 0x00000200,
         )
     except Exception as e:
-        print(f"[osk-icon] ⚠️ 键盘图标宿主启动失败（不影响主流程）: {e!r}")
+        print(f"[toolbar] ⚠️ Toolbar 服务启动失败（不影响主流程）: {e!r}")
         return None
     return proc.pid
 
 
-def _stop_osk_icon_host() -> bool:
-    """终止键盘图标宿主（按 PID 文件 taskkill /T /F）。返回是否已确保无宿主。"""
-    pid = _read_pid_file(_OSK_ICON_PID_FILE)
+def _stop_toolbar_service() -> bool:
+    """终止 Toolbar 服务（按 PID 文件 taskkill /T /F）。返回是否已确保无残留进程。"""
+    pid = _read_pid_file(_pathlib.Path(_TOOLBAR_PID_FILE))
     if pid is None or not _pid_alive(pid):
         return True
-    return bool(_taskkill_tree(pid, label="osk-icon"))
-
-
-def _osk_button_class():
-    """懒加载并返回右下角悬浮键盘图标类（PySide6 仅在真正显示 UI 时导入）。"""
-    from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
-    from PySide6.QtGui import QColor, QPainter, QPen
-    from PySide6.QtWidgets import QApplication, QWidget
-
-    class _OskToggleButton(QWidget):
-        """屏幕右下角置顶的键盘小图标：单击开/关系统屏幕键盘（Win+Ctrl+O）。
-
-        - 无边框、半透明圆角、不抢焦点（点击后焦点仍停在输入框，可直接打字）；
-        - 1s 轮询 osk 窗口：蓝色=已打开（再点关闭），灰色=已关闭（再点打开）；
-        - osk 的开/关/定位全部由模块级 _toggle_osk() 走系统通道，本控件只负责 UI。
-        """
-
-        def __init__(self) -> None:
-            super().__init__(
-                None,
-                Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
-                | Qt.WindowDoesNotAcceptFocus,
-            )
-            self.setAttribute(Qt.WA_TranslucentBackground)
-            self.setFocusPolicy(Qt.NoFocus)
-            self.setFixedSize(54, 54)
-            self.setCursor(Qt.PointingHandCursor)
-            self._open = bool(_find_osk_hwnd())
-            self._reposition()
-            self._timer = QTimer(self)
-            self._timer.setInterval(1000)
-            self._timer.timeout.connect(self._refresh_state)
-            self._timer.start()
-            self._refresh_state()
-            # 长按拖动：按下 450ms 不松 → 进入拖动模式，移动改位置、松手落盘；
-            # 450ms 内松手 = 普通单击（开/关 osk）
-            self._drag_armed = False
-            self._drag_offset = None
-            self._long_press_timer = QTimer(self)
-            self._long_press_timer.setSingleShot(True)
-            self._long_press_timer.setInterval(450)
-            self._long_press_timer.timeout.connect(self._arm_drag)
-
-        def _clamped_pos(self, x: int, y: int):
-            """把 (x,y) 夹在主屏幕工作区内（分辨率/任务栏变化后自动回拉）。"""
-            screen = QApplication.primaryScreen()
-            g = screen.availableGeometry() if screen else None
-            if g is not None:
-                x = max(g.left(), min(x, g.right() - self.width() + 1))
-                y = max(g.top(), min(y, g.bottom() - self.height() + 1))
-            return x, y
-
-        def _reposition(self) -> None:
-            screen = QApplication.primaryScreen()
-            g = screen.availableGeometry() if screen else None
-            if g is None:
-                return
-            # 默认：桌面工作区（任务栏之上）最右下角，留 8px 边距；
-            # 配置里有拖动后保存的位置则用它（夹取到工作区内）
-            x, y = g.right() - self.width() - 8, g.bottom() - self.height() - 8
-            saved = _load_config().get("osk_icon_pos")
-            if (isinstance(saved, list) and len(saved) == 2
-                    and all(isinstance(v, int) for v in saved)):
-                x, y = saved
-            self.move(*self._clamped_pos(x, y))
-
-        def _refresh_state(self) -> None:
-            self._open = bool(_find_osk_hwnd())
-            self.setToolTip(
-                ("点击关闭屏幕键盘" if self._open else "点击打开屏幕键盘")
-                + "；长按可拖动位置"
-            )
-            self.update()
-
-        def _arm_drag(self) -> None:
-            self._drag_armed = True
-            self.setCursor(Qt.ClosedHandCursor)
-
-        def mousePressEvent(self, event) -> None:  # type: ignore[override]
-            if event.button() == Qt.LeftButton:
-                self._drag_offset = (
-                    event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-                )
-                self._long_press_timer.start()
-                event.accept()
-
-        def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-            if self._drag_armed and event.buttons() & Qt.LeftButton:
-                top_left = event.globalPosition().toPoint() - self._drag_offset
-                self.move(*self._clamped_pos(top_left.x(), top_left.y()))
-                event.accept()
-
-        def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-            if event.button() != Qt.LeftButton:
-                return
-            self._long_press_timer.stop()
-            if self._drag_armed:
-                # 长按拖动结束：落盘新位置（下次启动/登入保持），不触发开/关
-                self._drag_armed = False
-                self._drag_offset = None
-                self.setCursor(Qt.PointingHandCursor)
-                _update_config(osk_icon_pos=[self.x(), self.y()])
-            else:
-                # 短按 = 单击开/关 osk（在松手时判定，以区分长按拖动）
-                self._drag_offset = None
-                _toggle_osk()
-                QTimer.singleShot(700, self._refresh_state)  # 等系统动画/起进程
-            event.accept()
-
-        def paintEvent(self, event) -> None:  # type: ignore[override]
-            p = QPainter(self)
-            p.setRenderHint(QPainter.Antialiasing)
-            rect = QRectF(2, 2, self.width() - 4, self.height() - 4)
-            # 投影
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, 38))
-            p.drawRoundedRect(rect.translated(0, 2), 15, 15)
-            # 底卡：开启=蓝，关闭=深灰
-            p.setBrush(QColor("#0A84FF") if self._open else QColor("#3a3a3d"))
-            p.drawRoundedRect(rect, 15, 15)
-            # 键盘图标：白色圆角底板 + 三排键
-            p.setBrush(QColor(255, 255, 255, 235))
-            kb = QRectF(12, 16, 30, 21)
-            p.drawRoundedRect(kb, 4, 4)
-            pen = QPen(QColor("#0A84FF") if self._open else QColor("#3a3a3d"), 1.6)
-            pen.setCapStyle(Qt.RoundCap)
-            p.setPen(pen)
-            x0, y0, w = 15.0, 19.0, 24.0
-            for row in range(3):  # 三排横线
-                y = y0 + 2.5 + row * 5.0
-                p.drawLine(QPointF(x0, y), QPointF(x0 + w, y))
-            n_cols = 5
-            for col in range(n_cols + 1):  # 纵向分格
-                x = x0 + col * (w / n_cols)
-                p.drawLine(QPointF(x, y0 + 2.5), QPointF(x, y0 + 12.5))
-            p.end()
-
-    return _OskToggleButton
-
-
-def _run_osk_icon_host() -> int:
-    """osk-icon 子命令入口：常驻右下角键盘图标，跟随 server 生命周期。
-
-    bootstrap 启动 server 后 detached 拉起；进程一启动先写 PID 文件，
-    stop 凭 PID 文件 + 命令行特征双保险终止，退出时自清 PID 文件。
-    """
-    from PySide6.QtWidgets import QApplication
-
-    try:
-        _OSK_ICON_PID_FILE.write_text(str(_os.getpid()), encoding="utf-8")
-        app = QApplication.instance() or QApplication(sys.argv)
-        app.setQuitOnLastWindowClosed(True)
-        btn = _osk_button_class()()
-        btn.show()
-        return app.exec()
-    finally:
-        try:
-            _OSK_ICON_PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+    return bool(_taskkill_tree(pid, label="toolbar"))
 
 
 # ---------------------------------------------------------------------------
@@ -1498,17 +1397,17 @@ def _prompt_phone_connection_gui(
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
                                 | Qt.Dialog | Qt.WindowTitleHint)
             self.setAttribute(Qt.WA_TranslucentBackground)
-            self.setFixedSize(400, 516)
+            self.setFixedSize(400, 484)
             self._drag_pos = None
             self.success_msg = ""
             self._syncing = False
 
             root = QVBoxLayout(self)
-            root.setContentsMargins(16, 16, 16, 16)
+            root.setContentsMargins(16, 12, 16, 12)
 
             card = QFrame()
             card.setObjectName("card")
-            card.setFixedSize(368, 484)
+            card.setFixedSize(368, 460)
             shadow = QGraphicsDropShadowEffect(card)
             shadow.setBlurRadius(32)
             shadow.setOffset(0, 10)
@@ -1517,7 +1416,7 @@ def _prompt_phone_connection_gui(
             root.addWidget(card)
 
             lay = QVBoxLayout(card)
-            lay.setContentsMargins(30, 16, 30, 24)
+            lay.setContentsMargins(30, 14, 30, 18)
             lay.setSpacing(0)
 
             # —— 左上角：设置齿轮，只负责唤起 Windows 快速设置浮层
@@ -1536,7 +1435,7 @@ def _prompt_phone_connection_gui(
             topbar.addWidget(self.btn_settings)
             topbar.addStretch(1)
             lay.addLayout(topbar)
-            lay.addSpacing(8)
+            lay.addSpacing(6)
 
             self.avatar = QLabel("📱")
             self.avatar.setFixedSize(72, 72)
@@ -1548,7 +1447,7 @@ def _prompt_phone_connection_gui(
                 "font-size: 36px;"
             )
             lay.addWidget(self.avatar, 0, Qt.AlignHCenter)
-            lay.addSpacing(14)
+            lay.addSpacing(10)
 
             title = QLabel("连接手机")
             title.setObjectName("title")
@@ -1560,7 +1459,7 @@ def _prompt_phone_connection_gui(
             subtitle.setObjectName("subtitle")
             subtitle.setAlignment(Qt.AlignHCenter)
             lay.addWidget(subtitle)
-            lay.addSpacing(20)
+            lay.addSpacing(14)
 
             self.addr_edit = QLineEdit()
             self.addr_edit.setPlaceholderText("手机局域网 IP，如 192.168.1.100（默认端口 5555）")
@@ -1609,7 +1508,7 @@ def _prompt_phone_connection_gui(
             hint.setObjectName("hint")
             hint.setAlignment(Qt.AlignHCenter)
             lay.addWidget(hint)
-            lay.addSpacing(12)
+            lay.addSpacing(8)
 
             # —— 错误区：默认只有一句短提示；完整错误收进「详细信息」下拉 ——
             self.err_label = QLabel("⚠ 连接失败，请 USB 有线连接，并检查授权")
@@ -1645,7 +1544,7 @@ def _prompt_phone_connection_gui(
             self.login_btn.setCursor(Qt.PointingHandCursor)
             self.login_btn.clicked.connect(self._on_login)
             lay.addWidget(self.login_btn)
-            lay.addSpacing(8)
+            lay.addSpacing(6)
 
             self.cancel_btn = QPushButton("取消启动")
             self.cancel_btn.setObjectName("cancel")
@@ -1701,11 +1600,13 @@ def _prompt_phone_connection_gui(
             if initial_error:
                 self._show_error(initial_error)
 
-            # 居中于当前屏幕
+            # 固定偏上：水平居中、距工作区顶 12px。
+            # osk 打开时位于屏幕下方（dock 正上方），偏上布局保证登录窗/osk/dock
+            # 三者同时在屏时几何无交集；不随 osk 开/关跳动。
             screen = QApplication.primaryScreen().availableGeometry()
             self.move(
                 screen.center().x() - self.width() // 2,
-                screen.center().y() - self.height() // 2,
+                screen.top() + 12,
             )
 
             self._bridge = _Bridge()
@@ -1849,11 +1750,8 @@ def _prompt_phone_connection_gui(
 
     app = QApplication.instance() or QApplication(sys.argv)
     dlg = _PhoneLoginDialog()
-    # 右下角悬浮键盘图标：由 detached 常驻宿主（osk-icon 子命令）提供，
-    # 必须是独立进程——Qt 模态对话框会屏蔽同进程其它窗口的鼠标点击。
-    # 取消登录 → 杀宿主（图标消失）并顺手关掉 osk；登入成功 → 宿主保留，
-    # 之后跟随 server 周期（stop 杀宿主并代关 osk）。
-    _spawn_osk_icon_host()
+    # 键盘入口由 Toolbar 常驻服务（bootstrap 最早期拉起，独立进程）底部 Dock
+    # 的键盘钮提供——必须是独立进程：Qt 模态对话框会屏蔽同进程其它窗口的鼠标点击。
     accepted = dlg.exec() == QDialog.Accepted
     if accepted:
         # 记住本次登入成功的地址（仅 USB、地址留空时不覆盖已保存的 IP）
@@ -1861,13 +1759,9 @@ def _prompt_phone_connection_gui(
         if addr:
             _update_config(last_phone_address=addr)
         return True, dlg.success_msg
-    # 取消/关窗：收回图标宿主；osk 若开着用 Win+Ctrl+O 关闭
-    # （osk 高完整性，taskkill 会被 UIPI error 5 拒绝）
-    _stop_osk_icon_host()
-    try:
-        _OSK_ICON_PID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+    # 取消/关窗：osk 若开着用 Win+Ctrl+O 关闭
+    # （osk 高完整性，taskkill 会被 UIPI error 5 拒绝）；
+    # Toolbar 服务的终止由 bootstrap 取消路径统一处理。
     if not _close_osk_if_running():
         print("[phone-login] ⚠️ 屏幕键盘 osk 未能自动关闭，请手动按 Win+Ctrl+O 关闭。")
     return False, "用户取消手机连接"
@@ -1907,18 +1801,12 @@ from datetime import datetime as _datetime
 
 _STATE_FILE = _SCRIPT_DIR / ".vd_state.json"
 # 用户级持久配置（与临时运行态 state 不同，stop 不清理）：
-#   last_phone_address —— 上次登入成功的手机 IP:端口，下次 bootstrap 先试它；
-#   osk_icon_pos       —— 右下角键盘图标被长按拖动后的位置（逻辑像素 [x, y]）。
+#   last_phone_address —— 上次登入成功的手机 IP:端口，下次 bootstrap 先试它。
 _CONFIG_FILE = _SCRIPT_DIR / "virtual_desktop_config.json"
-# 主桌面 toolbar（front/qt_backdrop.py 的 multiprocessing spawn 子进程）自报 PID 文件
-_BACKDROP_PID_FILE = _SCRIPT_DIR / ".vd_backdrop.pid"
 _WATCHER_LOG = _SCRIPT_DIR / ".vd_watcher.log"
-# uu-open 懒创建的串行锁（防止连点电脑按钮导致 UU/回程 Dock 被启动两份）
+# uu-open 懒创建的串行锁（防止连点电脑按钮导致 UU 被启动两份）
 _UU_LOCK_FILE = _SCRIPT_DIR / ".vd_uu.lock"
 _UU_LOG = _SCRIPT_DIR / ".vd_uu.log"
-# UU 桌面上的回程 Dock：front/uu_dock.py，只由 uu-open 在 UU 桌面启动
-_UU_DOCK_SCRIPT = _SCRIPT_DIR / "front" / "uu_dock.py"
-_UU_DOCK_LOG = _SCRIPT_DIR / ".vd_uudock.log"
 
 # 需要归位到"远程桌面"的客户端主进程名（小写）。必须按**进程名**全局识别，
 # 因为"早已运行"的 UU 不是 bootstrap 的子孙，按进程树枚举永远找不到它。
@@ -2067,9 +1955,8 @@ def _find_project_pids_by_cmdline(patterns: dict[str, "_re.Pattern"]) -> dict[st
 # 本项目 detached / 独立 python 进程的命令行特征（一个命令行只会命中一个 label）
 _STOP_CMDLINE_PATTERNS = {
     "watcher": _re.compile(r"virtual_desktop\.py[\"']?\s+watch\b"),
-    "uu-dock": _re.compile(r"front[/\\]uu_dock\.py|[\"']?uu_dock\.py"),
+    "toolbar": _re.compile(r"virtual_desktop\.py[\"']?\s+toolbar\b"),
     "server": _re.compile(r"[\\/\s]server\.py(?:\s|$|[\"'])"),
-    "osk-icon": _re.compile(r"virtual_desktop\.py[\"']?\s+osk-icon\b"),
 }
 
 
@@ -2224,6 +2111,37 @@ def _update_state(**changes) -> Optional[dict]:
     return st
 
 
+def _get_server_status(host: str, port: int, *, timeout: float = 1.0) -> Optional[dict]:
+    """单次 GET /status，返回 JSON dict；任何异常/非 200 返回 None。"""
+    import urllib.request as _urllib_request
+    url = f"http://{host}:{int(port)}/status"
+    try:
+        with _urllib_request.urlopen(url, timeout=timeout) as resp:
+            return _json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _fetch_server_backdrop_pid(host: str, port: int, *,
+                               timeout_s: float = 12.0) -> Optional[int]:
+    """server 启动后轮询 GET /status，取其 multiprocessing 孩子 backdrop 的 PID。
+
+    责任域约定：virtual_desktop 不读 server 侧任何文件，跨域信息只走 HTTP。
+    server 在 app.run 之前已完成 backdrop 初始化，故 /status 一旦应答即为
+    终态：有 backdrop_pid 直接返回，无字段（未启用/启动失败）立即返回 None；
+    只有连接失败/响应异常才轮询至超时。"""
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        # 单次请求超时受剩余 deadline 约束，避免最后一轮多等一个完整超时周期
+        remaining = max(0.1, min(1.0, deadline - _time.monotonic()))
+        data = _get_server_status(host, port, timeout=remaining)
+        if data is not None:
+            pid = data.get("backdrop_pid")
+            return int(pid) if pid else None
+        _time.sleep(0.5)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # uu-open 懒创建辅助
 # ---------------------------------------------------------------------------
@@ -2293,29 +2211,6 @@ def _switch_desktop_verified(vd: "VirtualDesktops", idx: int, *,
     print(f"[{tag}] ❌ {attempts} 次尝试后仍未切到桌面 #{idx}"
           f"（当前 #{last_seen}）。", flush=True)
     return False
-
-
-def _start_uu_dock(uu_idx: int) -> Optional[int]:
-    """在 UU 桌面启动回程 Dock（front/uu_dock.py）。
-    必须【先切到 uu_idx 再 Popen】，窗口初始桌面才绑定该桌面。
-    返回 dock PID；脚本缺失/启动失败返回 None。"""
-    if not _UU_DOCK_SCRIPT.exists():
-        print(f"[uu-open] ⚠️ 未找到 {_UU_DOCK_SCRIPT}，跳过回程 Dock。", flush=True)
-        return None
-    try:
-        dock_fp = open(_UU_DOCK_LOG, "a", encoding="utf-8")
-        p = subprocess.Popen(
-            [sys.executable, str(_UU_DOCK_SCRIPT)],
-            cwd=str(_SCRIPT_DIR),
-            stdout=dock_fp, stderr=subprocess.STDOUT, close_fds=True,
-            creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        )
-        print(f"[uu-open] 🖥️  UU 回程 Dock 已在桌面 #{uu_idx} 启动 PID={p.pid}"
-              f"（日志 .vd_uudock.log）", flush=True)
-        return p.pid
-    except Exception as e:
-        print(f"[uu-open] ⚠️  UU 回程 Dock 启动失败（不影响主链路）: {e!r}", flush=True)
-        return None
 
 
 def _launch_uu_on_desktop(vd: "VirtualDesktops", uu_idx: int, uu_cmd: list[str],
@@ -2412,11 +2307,11 @@ def do_watch(args) -> int:
     """常驻归位守护（独立 detached 进程）：
       · server.py 子孙进程的窗口（含 AI 运行中**动态新开**的抖音/微信等 scrcpy
         卡片）一旦不在 server 桌面，立刻迁回；
-      · 远程客户端（UU/向日葵/ToDesk，**含早已运行的实例**）与回程 Dock 的窗口
+      · 远程客户端（UU/向日葵/ToDesk，**含早已运行的实例**）的窗口
         只在 UU 桌面已由 uu-open 懒创建（state.uu_active=True）后才归到该桌面；
         未创建时 UU 尚未启动，保持空闲，绝不向不存在的桌面搬窗；
       · 每轮重新读取 state 文件——用户运行中点「电脑」按钮创建 UU 桌面后，
-        无需重启 watcher 即可获得新的 uu_desktop / uu_dock_pid；
+        无需重启 watcher 即可获得新的 uu_desktop；
       · server.py 连续 3 轮确认退出后本守护自动退出。
     日志追加写入 .vd_watcher.log。"""
     state_file = _pathlib.Path(getattr(args, "state_file", None) or _STATE_FILE)
@@ -2461,11 +2356,10 @@ def do_watch(args) -> int:
 
     fail_s: dict[int, int] = {}
     fail_u: dict[int, int] = {}
-    fail_d: dict[int, int] = {}
     missed = 0
     last_uu_active = None
     while True:
-        # 每轮重读 state：捕获 uu-open 写入的 uu_active/uu_desktop/uu_dock_pid
+        # 每轮重读 state：捕获 uu-open 写入的 uu_active/uu_desktop
         fresh = _load_state()
         if fresh is not None:
             st = fresh
@@ -2495,13 +2389,10 @@ def do_watch(args) -> int:
                 total_desktops = 0
             uu_desk = int(st.get("uu_desktop"))
             if 0 <= uu_desk < total_desktops:
-                # UU 无论 server 死活都持续归位（用户可能在停服后仍使用远程桌面）
+                # UU 无论 server 死活都持续归位（用户可能在停服后仍使用远程桌面）。
+                # 各桌面的底部 Dock 由 Toolbar 常驻服务自行 reconcile，watcher 不插手
+                # （单进程多 Dock，按进程树归位会误伤其他桌面的 Dock）。
                 _move_wrong_hwnds(_remote_pids(), uu_desk, fail_u, "uu")
-                # UU 桌面上的回程 Dock（front/uu_dock.py）始终钉在 UU 桌面
-                uu_dock_pid = st.get("uu_dock_pid")
-                if uu_dock_pid and _pid_alive(uu_dock_pid):
-                    _move_wrong_hwnds(_collect_descendant_pids(int(uu_dock_pid)),
-                                      uu_desk, fail_d, "uu-dock")
         _time.sleep(interval)
 
 
@@ -2596,20 +2487,23 @@ def do_stop(args) -> int:
 
        进程拓扑与各自归宿：
          · watcher（virtual_desktop.py watch，detached）… state PID + 命令行兜底；
-         · UU 桌面 toolbar（front/uu_dock.py，detached）… state PID + 命令行兜底；
+         · Toolbar 服务（virtual_desktop.py toolbar，detached）… state PID 优先、
+           同域 .vd_toolbar.pid 文件兜底，一个进程托管各虚拟桌面的底部 Dock；
          · server.py（py launcher + python 树）…… CTRL_C 优雅退出，超时强杀 /T；
-         · 主桌面 toolbar（qt_backdrop.py 的 multiprocessing spawn 子进程，内含
-           Backdrop/Dock/通知/思考 4 个窗口）… server finally 会 stop，再用
-           .vd_backdrop.pid 核验补刀（强杀 server 时 daemon 回收机制会失效）；
+         · 主桌面 backdrop（qt_backdrop.py 的 multiprocessing spawn 子进程，内含
+           Backdrop/通知/思考 3 个窗口）… server finally 会 stop，再用 state 中
+           经 HTTP /status 登记的 backdrop_pid 核验补刀（强杀 server 时 daemon
+           回收机制会失效）；
          · scrcpy.exe × N …… atexit stop_all 后仍无条件按进程名扫尾；
          · UU 主程序（GameViewer.exe 及其 webview2/crashpad 子孙）… 默认 /T 整棵
            关闭（--no-kill-uu 保留）；后台服务无窗口默认不动；
-         · 右下角键盘图标宿主（osk-icon，detached）… PID 文件 + 命令行兜底；
-           系统屏幕键盘 osk … 高完整性无法 taskkill，改用 Win+Ctrl+O 关闭；
+         · 系统屏幕键盘 osk … 高完整性无法 taskkill，Toolbar 服务被杀后改用
+           Win+Ctrl+O 关闭；
          · UU 虚拟桌面 …… 默认删除（--no-remove-desktops 保留）。
 
        无 state 也执行「孤儿清扫模式」：state 失配/被清后仍能按命令行特征、
-       PID 文件、进程名把残留清干净。
+       同域 PID 文件、进程名把残留清干净；唯 backdrop 子进程命令行无特征，
+       state 缺失时无法定位（优雅退出路径不受影响）。
        注：adb fork-server（5037）是全机共享服务，默认不动（结尾给出提示）。"""
     st = _load_state() or {}
     forced = getattr(args, "server_pid", None)
@@ -2620,13 +2514,13 @@ def do_stop(args) -> int:
             st = {"server_pid": int(forced)}
         else:
             print(f"[stop] 未找到 {_STATE_FILE.name}：进入【孤儿清扫模式】——不发 "
-                  f"CTRL_C，但仍按命令行特征 / PID 文件 / 进程名清理 watcher、"
-                  f"两个 toolbar、scrcpy、UU。", flush=True)
+                  f"CTRL_C，按命令行特征 / 同域 PID 文件 / 进程名清理 watcher、"
+                  f"Toolbar 服务、scrcpy、UU（backdrop 子进程无特征，无法定位）。",
+                  flush=True)
             st = {}
 
     watcher_pid = st.get("watcher_pid")
     server_pid = st.get("server_pid")
-    uu_dock_pid = st.get("uu_dock_pid")
     kill_uu = bool(getattr(args, "kill_uu", True))
     remove_desktops = bool(getattr(args, "remove_desktops", True))
 
@@ -2636,7 +2530,8 @@ def do_stop(args) -> int:
     _kernel32.SetConsoleCtrlHandler(None, True)
     try:
         print(f"[stop-diag] state 记录的 PID：server={server_pid} "
-              f"watcher={watcher_pid} uu_dock={uu_dock_pid}；"
+              f"watcher={watcher_pid} toolbar={st.get('toolbar_pid')} "
+              f"backdrop={st.get('backdrop_pid')}；"
               f"kill_uu={kill_uu} remove_desktops={remove_desktops}", flush=True)
         print("[stop-diag] 停止前相关进程快照（python/scrcpy/adb/uu）：", flush=True)
         _diag_dump_related()
@@ -2646,10 +2541,15 @@ def do_stop(args) -> int:
             _taskkill_tree(int(watcher_pid), label="watcher")
             print(f"[stop] watcher PID={watcher_pid} 已停止。", flush=True)
 
-        # ---- 2) 先杀 UU 桌面 toolbar（纯 UI，强杀无副作用）----
-        if uu_dock_pid and _pid_alive(uu_dock_pid):
-            _taskkill_tree(int(uu_dock_pid), label="uu-dock")
-            print(f"[stop] UU 桌面 toolbar（uu_dock.py）PID={uu_dock_pid} 已停止。",
+        # ---- 2) 杀 Toolbar 服务（纯 UI 常驻，强杀无副作用）：state 优先，
+        #      .vd_toolbar.pid 是 vd 同域文件，仅作旧 state/启动失败时的回退 ----
+        toolbar_pid = st.get("toolbar_pid")
+        if not (isinstance(toolbar_pid, int) and _pid_alive(toolbar_pid)):
+            fb = _read_pid_file(_pathlib.Path(_TOOLBAR_PID_FILE))
+            toolbar_pid = fb if (fb is not None and _pid_alive(fb)) else None
+        if toolbar_pid is not None:
+            _taskkill_tree(int(toolbar_pid), label="toolbar")
+            print(f"[stop] Toolbar 服务 PID={toolbar_pid} 已停止（各桌面底部 Dock 消失）。",
                   flush=True)
 
         # ---- 3) CTRL_C 优雅停 server.py；失败/超时回退整树强杀 ----
@@ -2685,34 +2585,35 @@ def do_stop(args) -> int:
             print(f"[stop] server.py PID={server_pid} 已不在运行。", flush=True)
 
         # ---- 4) 无条件兜底清扫（不信赖任何隐式回收，只认真实存活）----
-        # 4a. 命令行特征：watcher / uu_dock / server（覆盖 state PID 失配、
-        #     被 uu-open 补启、强杀后子孙变孤儿等全部场景）
+        # 4a. 命令行特征：watcher / toolbar / server（覆盖 PID 失配、
+        #     被 uu-open 补启、强杀后子孙变孤儿等全部场景；另含旧版 uu_dock 兼容）
         hits = _find_project_pids_by_cmdline(_STOP_CMDLINE_PATTERNS)
-        for label in ("watcher", "uu-dock", "server", "osk-icon"):
+        for label in ("watcher", "toolbar", "server"):
             for pid in hits.get(label, []):
                 if _pid_alive(pid) and _taskkill_tree(pid, label=f"residual-{label}"):
                     print(f"[stop] 兜底结束残留 {label} PID={pid}。", flush=True)
+        # 旧版遗留：front/uu_dock.py 进程（新架构已由 toolbar 服务接管）
+        for pid in _find_project_pids_by_cmdline(
+                {"uu-dock-legacy": _re.compile(r"front[/\\]uu_dock\.py|uu_dock\.py")}
+        ).get("uu-dock-legacy", []):
+            if _pid_alive(pid) and _taskkill_tree(pid, label="residual-uu-dock"):
+                print(f"[stop] 兜底结束旧版残留 uu_dock PID={pid}。", flush=True)
 
-        # 4b. 主桌面 toolbar：.vd_backdrop.pid（spawn 子进程命令行无特征，只能靠它）
-        bd_pid = _read_pid_file(_BACKDROP_PID_FILE)
+        # 4b. 主桌面 backdrop：PID 来自 state（bootstrap 经 HTTP /status 登记）。
+        #     spawn 子进程命令行无特征，无法枚举——state 缺失（孤儿清扫模式）时
+        #     此项只能跳过；正常链路 server 被 CTRL_C 优雅退出时 daemon 孩子会
+        #     被 Python 回收，仅强杀/崩溃场景才需要这里补刀。
+        bd_pid = st.get("backdrop_pid")
         if bd_pid is not None:
             if _pid_alive(bd_pid):
-                _taskkill_tree(bd_pid, label="main-toolbar(qt_backdrop)")
-                print(f"[stop] 主桌面 toolbar（qt_backdrop.py）PID={bd_pid} 已停止。",
+                _taskkill_tree(bd_pid, label="backdrop(qt_backdrop)")
+                print(f"[stop] 主桌面 backdrop（qt_backdrop.py）PID={bd_pid} 已停止。",
                       flush=True)
             else:
-                print(f"[stop] 主桌面 toolbar PID={bd_pid} 已自行退出。", flush=True)
+                print(f"[stop] 主桌面 backdrop PID={bd_pid} 已自行退出。", flush=True)
 
-        # 4c. 右下角键盘图标宿主（osk-icon 常驻进程）：PID 文件先杀，
-        #     命令行兜底已在 4a 覆盖；宿主没了用户也无法再从图标重开 osk
-        osk_icon_pid = _read_pid_file(_OSK_ICON_PID_FILE)
-        if osk_icon_pid is not None and _pid_alive(osk_icon_pid):
-            if _taskkill_tree(osk_icon_pid, label="osk-icon"):
-                print(f"[stop] 右下角键盘图标宿主 PID={osk_icon_pid} 已停止。",
-                      flush=True)
-
-        # 4d. 系统屏幕键盘 osk：高完整性无法 taskkill（UIPI error 5），
-        #     用 Win+Ctrl+O 系统开关关闭（stop 与键盘图标都随 server 周期结束）
+        # 4c. 系统屏幕键盘 osk：高完整性无法 taskkill（UIPI error 5），
+        #     Toolbar 服务已杀，再用 Win+Ctrl+O 系统开关关闭 osk
         if _find_osk_hwnd():
             if _close_osk_if_running():
                 print("[stop] 系统屏幕键盘 osk 已关闭（Win+Ctrl+O）。", flush=True)
@@ -2720,7 +2621,7 @@ def do_stop(args) -> int:
                 print("[stop] ⚠️ osk 未能自动关闭（高完整性进程，快捷键未生效），"
                       "请手动按 Win+Ctrl+O 关闭。", flush=True)
 
-        # 4e. scrcpy：server 死后任何残留 scrcpy 都是孤儿，无条件全部清扫
+        # 4d. scrcpy：server 死后任何残留 scrcpy 都是孤儿，无条件全部清扫
         n_scrcpy = _sweep_scrcpy()
         if n_scrcpy:
             print(f"[stop] 已清扫残留 scrcpy.exe {n_scrcpy} 个。", flush=True)
@@ -2778,7 +2679,7 @@ def do_stop(args) -> int:
         leftovers = _find_project_pids_by_cmdline(_STOP_CMDLINE_PATTERNS)
         remain_py = sorted(pid for pids in leftovers.values() for pid in pids
                            if _pid_alive(pid))
-        remain_bd = [bd] if (bd := _read_pid_file(_BACKDROP_PID_FILE)) and _pid_alive(bd) else []
+        remain_bd = [bd] if (bd := st.get("backdrop_pid")) and _pid_alive(bd) else []
         remain_scrcpy = [pid for pids in _find_pids_by_names({"scrcpy.exe"}).values()
                          for pid in pids if _pid_alive(pid)]
         remain_uu = ([pid for pids in _find_pids_by_names(_REMOTE_PROCESS_NAMES).values()
@@ -2792,11 +2693,7 @@ def do_stop(args) -> int:
             _clear_state()
             print(f"[stop] 已清理状态文件 {_STATE_FILE.name}。", flush=True)
         try:
-            _BACKDROP_PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
-        try:
-            _OSK_ICON_PID_FILE.unlink(missing_ok=True)
+            _pathlib.Path(_TOOLBAR_PID_FILE).unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -2804,17 +2701,17 @@ def do_stop(args) -> int:
             print("[stop] ❌ 仍有项目进程残留（可能权限不足，请任务管理器手动结束）：",
                   flush=True)
             if remain_py:
-                print(f"        python(server/watcher/uu_dock/osk-icon) PIDs={remain_py}",
+                print(f"        python(server/watcher/toolbar) PIDs={remain_py}",
                       flush=True)
             if remain_bd:
-                print(f"        主桌面 toolbar qt_backdrop PIDs={remain_bd}", flush=True)
+                print(f"        backdrop qt_backdrop PIDs={remain_bd}", flush=True)
             if remain_scrcpy:
                 print(f"        scrcpy.exe PIDs={remain_scrcpy}", flush=True)
             if remain_uu:
                 print(f"        UU 主程序 PIDs={remain_uu}", flush=True)
         else:
-            print("[stop] ✅ 项目进程零残留：server / watcher / 两个 toolbar / "
-                  "键盘图标 / scrcpy 全部结束，osk 已关闭"
+            print("[stop] ✅ 项目进程零残留：server / watcher / Toolbar 服务 / "
+                  "backdrop / scrcpy 全部结束，osk 已关闭"
                   + ("，UU 已关闭" if kill_uu else "（UU 按要求保留）")
                   + "。", flush=True)
         if adb_pids:
@@ -2838,15 +2735,15 @@ def do_status(args) -> int:
           f"{'🟢 运行中' if _pid_alive(st.get('server_pid')) else '⚪ 已退出'} → 桌面 #{st.get('server_desktop')}")
     print(f"  watcher       : PID={st.get('watcher_pid')} "
           f"{'🟢 运行中' if _pid_alive(st.get('watcher_pid')) else '⚪ 已退出'}")
+    tb_pid = _read_pid_file(_pathlib.Path(_TOOLBAR_PID_FILE))
+    print(f"  Toolbar 服务  : "
+          f"{('PID=' + str(tb_pid) + ' 🟢 运行中') if tb_pid and _pid_alive(tb_pid) else '⚪ 未运行'}"
+          f"（各桌面底部 Dock）")
     uu_idx = st.get("uu_desktop")
     uu_active = bool(st.get("uu_active"))
     if not uu_active or uu_idx is None:
-        print("  UU 远程桌面   : ⚪ 未创建（点 toolbar 电脑钮 / 运行 uu-open 按需创建）")
+        print("  UU 远程桌面   : ⚪ 未创建（点 Dock 电脑钮 / 运行 uu-open 按需创建）")
     else:
-        dock_pid = st.get('uu_dock_pid')
-        if dock_pid:
-            print(f"  UU回程Dock    : PID={dock_pid} "
-                  f"{'🟢 运行中' if _pid_alive(dock_pid) else '⚪ 已退出'} → 桌面 #{uu_idx}")
         print(f"  UU 远程       : {'早已运行(按进程名归位)' if st.get('uu_preexisting') else 'uu-open 启动'} "
               f"→ 桌面 #{uu_idx}，PID={st.get('uu_pids')}")
     print(vd.info())
@@ -2866,8 +2763,10 @@ def do_bootstrap(args) -> int:
       2) 检测一次手机 ADB 可达性；不可达则弹出 macOS 登录风连接窗口
          （输入手机局域网 IP 或插好 USB 后点「登入」重试；失败保持窗口
          并显示/打印错误；取消则中止）——不再后台循环等待 5 分钟；
-      3) 在当前桌面 Popen server.py，轮询条件等待 ≥N 个顶层 HWND 真正出现；
-      4) join sweeper poller（8~10s 扫尾迟来的 scrcpy）；
+      3) 在当前桌面 Popen server.py，以 HTTP /status 应答为就绪判据
+         （不再数顶层窗口：卡片懒创建、窗口数天然波动）；
+      4) 目标即当前桌面时跳过 sweeper（零耗时）；仅跨桌面启动才 join 扫尾
+         poller（无新窗口 4s 提前收工，上限 ~9s）；
       5) 审计报告：枚举 server 子孙 PID 的全部 HWND 与真实桌面归属；
       6) state 落盘（uu_active=False，UU 相关字段为空）+ 启动常驻 watcher。
     """
@@ -2884,6 +2783,14 @@ def do_bootstrap(args) -> int:
         "           新建 UU 桌面并启动 GameViewer（已存在则只切换，不重复创建）。\n"
     )
     print("-" * 64)
+
+    # Step 1: 最先拉起 Toolbar 常驻服务（登录窗/手机检测之前）：
+    #   底部 Dock（含键盘钮）在登录阶段就可用；独立进程不被模态登录窗屏蔽点击。
+    #   取消登录 → 本函数下方停服务并关 osk；登入成功 → 跟随 server 周期（stop 收尾）。
+    toolbar_pid = _spawn_toolbar_service()
+    if toolbar_pid is not None:
+        print(f"[bootstrap] 🧰 Toolbar 服务已启动 PID={toolbar_pid}"
+              f"（屏幕底部悬停唤出；日志 .vd_toolbar.log）")
 
     # Step 1.5: 启动 server.py 前确认手机 ADB 可达
     #   只检测一次（有 USB 设备直接通过；否则用 --phoneaddress 尝试 adb connect），
@@ -2911,6 +2818,11 @@ def do_bootstrap(args) -> int:
         )
         if not phone_ok:
             print("[bootstrap] ❌ 已取消手机连接，中止 bootstrap（server.py 未启动）。")
+            _stop_toolbar_service()
+            try:
+                _pathlib.Path(_TOOLBAR_PID_FILE).unlink(missing_ok=True)
+            except Exception:
+                pass
             return 1
         print(f"[bootstrap] ✅ {phone_msg}")
 
@@ -2934,13 +2846,26 @@ def do_bootstrap(args) -> int:
     #    UU 的 exe 路径/等待参数归 uu-open 子命令所有）——
     server_wait_ms = max(6000, int(getattr(args, "server_wait_ms", 18000)))
     server_no_win  = bool(getattr(args, "server_no_window", False))
-    server_min_hw  = max(1, int(getattr(args, "server_min_hwnds", 2)))   # Qt backdrop 至少有 2 窗
+    server_host    = getattr(args, "host", None) or "127.0.0.1"
+    server_port    = int(getattr(args, "port", None) or 8080)
 
     pollers_to_wait: list[_threading.Thread] = []
     srv_mode_used = launch_mode if launch_mode != "auto" else "switch_wait_switchback"
 
+    # 就绪判据：HTTP /status 应答（server 在 app.run 前已完成 backdrop/主屏
+    # 初始化）。不再数顶层窗口——窗口数随控制台/crashpad/懒创建卡片波动，
+    # 固定阈值（如 7）可能永远等不到。探针闭包顺带留存首次成功的 status。
+    server_status_holder: dict[str, Optional[dict]] = {"status": None}
+
+    def _server_ready_probe() -> bool:
+        st = _get_server_status(server_host, server_port, timeout=1.0)
+        if st is not None:
+            server_status_holder["status"] = st
+            return True
+        return False
+
     # =====================================================================
-    # Step 2：在【当前桌面】启 server.py（不切桌面 → 条件等 HWND ≥N 个出现）
+    # Step 2：在【当前桌面】启 server.py（不切桌面），就绪以 /status 应答为准
     #   手机桌面布局直接显示在用户当前所在的桌面上。
     # =====================================================================
     print(f"\n=== Step 2 / 2 ：当前桌面 #{server_desk} → server.py ===")
@@ -2951,7 +2876,7 @@ def do_bootstrap(args) -> int:
         label=f"{server_py.name} → #{server_desk}",
         no_window=server_no_win,
         mode=launch_mode,
-        min_hwnd_count=server_min_hw,
+        ready_probe=_server_ready_probe if srv_mode_used == "switch_wait_switchback" else None,
     )
     if p_server is None:
         print("[bootstrap] ⚠️  server.py 启动失败。")
@@ -2960,15 +2885,16 @@ def do_bootstrap(args) -> int:
             pollers_to_wait.append(srv_poller)
 
     # =====================================================================
-    # Step 3：join sweeper poller（~10s，扫尾迟来的 scrcpy 卡片）
+    # Step 3：跨桌面启动时 join sweeper poller（它自身安静 4s 即提前收工）
+    #   懒创建模型下 server 在当前桌面启动，poller 已跳过，本步零耗时。
     #   UU 远程与回程 Dock 已不在 bootstrap 启动——改由 Dock「电脑」按钮
     #   触发 `uu-open` 按需创建，见 do_uu_open()。
     # =====================================================================
     if pollers_to_wait:
-        wait_join_s = (server_wait_ms / 1000.0) * 0.8 + 2.0
+        wait_join_s = max(8000, server_wait_ms // 2) / 1000.0 + 1.0
         print(
             f"\n[bootstrap] 🧹 扫尾阶段：等 {len(pollers_to_wait)} 个 sweeper poller 结束"
-            f"（最多 {wait_join_s:.1f}s，抓那些 18s 后才冒出来的 scrcpy 卡片）..."
+            f"（最多 {wait_join_s:.1f}s；无新窗口 4s 即提前收工）..."
         )
         for th in pollers_to_wait:
             th.join(timeout=wait_join_s)
@@ -3048,10 +2974,9 @@ def do_bootstrap(args) -> int:
     else:
         print(
             f"\n  ⚠️  仍有 {total_ng} 个窗口不在当前桌面（watcher 会在运行期间持续补迁）。\n"
-            f"     建议：\n"
-            f"       · 如果是 scrcpy 还没出完：把 --server-wait-ms 加到 25000；\n"
-            f"       · 如果是 Qt notification_panel：把 --server-min-hwnds 调到 3；\n"
-            f"       · 动态新开的卡片：常驻 watcher 每 1.5s 巡检归位。"
+            f"     说明：\n"
+            f"       · server 就绪已以 HTTP /status 应答为准，与窗口数量无关；\n"
+            f"       · scrcpy 卡片是懒创建的，启动后陆续冒出由常驻 watcher 每 1.5s 归位。"
         )
     print("=" * 80)
 
@@ -3066,6 +2991,19 @@ def do_bootstrap(args) -> int:
     # =====================================================================
     watcher_pid = None
     if p_server is not None:
+        # backdrop PID 优先复用就绪探针首次成功时留存的 /status（零额外等待）；
+        # 探针超时（server 起得慢）时再补一轮短轮询。跨域只走 HTTP。
+        ready_status = server_status_holder.get("status")
+        backdrop_pid = None
+        if isinstance(ready_status, dict):
+            bp = ready_status.get("backdrop_pid")
+            backdrop_pid = int(bp) if bp else None
+        if backdrop_pid is None:
+            backdrop_pid = _fetch_server_backdrop_pid(server_host, server_port, timeout_s=10.0)
+        if backdrop_pid:
+            print(f"[bootstrap] 🪟 已从 /status 获取 backdrop 子进程 PID={backdrop_pid}")
+        else:
+            print("[bootstrap] ℹ️  未获取到 backdrop PID（未启用或超时），stop 将跳过该项")
         state = {
             "started_at": _datetime.now().isoformat(timespec="seconds"),
             "project_root": str(_SCRIPT_DIR),
@@ -3081,6 +3019,14 @@ def do_bootstrap(args) -> int:
             "uu_preexisting": False,
             "uu_dock_pid": None,
             "watcher_pid": None,
+            # Toolbar 是 vd 自己 Step 1 拉起的进程，PID 直接登记（其自写的
+            # .vd_toolbar.pid 仅作同域单实例锁与 stop 回退）。
+            "toolbar_pid": toolbar_pid,
+            # server 域 multiprocessing 孩子，经 HTTP /status 获取（见上）
+            "backdrop_pid": backdrop_pid,
+            # Toolbar 服务调 server HTTP 接口（设置→编辑模式）所需地址
+            "server_host": server_host,
+            "server_port": server_port,
         }
         _save_state(state)  # watcher 启动即读，必须先落盘
         if not bool(getattr(args, "no_watcher", False)):
@@ -3103,14 +3049,7 @@ def do_bootstrap(args) -> int:
         _save_state(state)
         print(f"[bootstrap] 💾 会话状态已写入 {_STATE_FILE.name}；"
               f"停止整条链路请执行：python virtual_desktop.py stop")
-
-        # —— 右下角悬浮键盘图标：detached 常驻宿主（幂等；登录窗已拉起则复用）。
-        #   跟随 server 生命周期：stop 凭 .vd_osktop.pid + 命令行特征终止，
-        #   并代为关闭系统 osk；与 watcher 相同的 CREATE_NO_WINDOW detached flags。
-        icon_pid = _spawn_osk_icon_host()
-        if icon_pid is not None:
-            print(f"[bootstrap] ⌨️  右下角键盘图标宿主 PID={icon_pid}"
-                  f"（单击开/关系统屏幕键盘；日志 .vd_osktop.log）")
+        # Toolbar 服务已在 Step 1 启动并将持续跟随 server 周期（stop 统一收尾）。
 
     return 0 if p_server is not None else 1
 
@@ -3120,12 +3059,13 @@ def do_uu_open(args) -> int:
 
       决策表：
         A) state.uu_active 且 UU 桌面仍存在 且 UU 进程存活
-             → 只切换到该桌面（回程 Dock 死了顺手补启），【不创建/不启动】；
+             → 只切换到该桌面，【不创建/不启动】；
         B) UU 桌面存在但 UU 已退出 / 从未启动成功
-             → 切过去，在该桌面启动（或唤醒）UU，补启回程 Dock；
+             → 切过去，在该桌面启动（或唤醒）UU；
         C) UU 桌面不存在（从未创建，或被用户手动删掉）
-             → 新建桌面（编号=当前总数-1）→ 切过去 → 启 UU + 回程 Dock；
+             → 新建桌面（编号=当前总数-1）→ 切过去 → 启 UU；
       全程结束后停留在 UU 桌面（这正是点「电脑」的目的，无 switchback）。
+      各桌面底部 Dock 由 Toolbar 常驻服务 reconcile 自动出现/消失，本函数不管 Dock。
     """
     # 与 watcher 相同：detached 新进程先初始化 COM，pyvda 调用才可靠
     try:
@@ -3162,12 +3102,6 @@ def do_uu_open(args) -> int:
             print(f"[uu-open] ℹ️  UU 桌面 #{uu_idx} 与 UU 进程均已存在，只切换，"
                   f"不重复创建、不重复启动。", flush=True)
             _switch_desktop_verified(vd, uu_idx, tag="uu-open")
-            # 回程 Dock 若已退出则顺手补启（不影响「不重复启动 UU」语义；
-            # 必须在确认已切到 uu_idx 后再 Popen，窗口才绑定该桌面）
-            dock_pid = st.get("uu_dock_pid")
-            if not (dock_pid and _pid_alive(dock_pid)) and not bool(getattr(args, "no_uu_dock", False)):
-                dock_pid = _start_uu_dock(uu_idx)
-                _update_state(uu_dock_pid=dock_pid)
             return 0
 
         # —— 情况 C：桌面不存在 → 新建（编号=当前总数，通常即 1）——
@@ -3212,14 +3146,7 @@ def do_uu_open(args) -> int:
             wait_ms=uu_wait_ms, min_hwnds=uu_min_hw, force_new=force_new,
         )
 
-        # 回程 Dock：已存活则复用，否则在 UU 桌面启动
-        dock_pid = st.get("uu_dock_pid")
-        if dock_pid and _pid_alive(dock_pid):
-            print(f"[uu-open] ℹ️  回程 Dock PID={dock_pid} 已存活，复用。", flush=True)
-            _move_wrong_hwnds(_collect_descendant_pids(int(dock_pid)),
-                              uu_idx, {}, "uu-open-dock")
-        elif not bool(getattr(args, "no_uu_dock", False)):
-            dock_pid = _start_uu_dock(uu_idx)
+        # 新桌面的底部 Dock 由 Toolbar 服务 reconcile（≤2s）自动补上。
 
         # 回填最终 state（watcher 下一轮（≤1.5s）即读到并开始 UU 归位）
         _update_state(
@@ -3227,7 +3154,7 @@ def do_uu_open(args) -> int:
             uu_desktop=uu_idx,
             uu_pids=sorted(record_pids),
             uu_preexisting=preexisting,
-            uu_dock_pid=dock_pid,
+            uu_dock_pid=None,
         )
 
         # 终态确认：必须停留在 UU 桌面（点「电脑」的目的）。再校验切换一次。
@@ -3235,7 +3162,8 @@ def do_uu_open(args) -> int:
             _switch_desktop_verified(vd, uu_idx, tag="uu-open-end")
         n_vis = len(_enum_top_level_hwnds_for_pids(record_pids))
         print(f"[uu-open] ✅ 完成（mode={mode}）：UU 桌面 #{uu_idx}，"
-              f"可见 UU 窗口 {n_vis} 个，回程Dock PID={dock_pid}，当前桌面 #{vd.current_index()}。",
+              f"可见 UU 窗口 {n_vis} 个，底部 Dock 由 Toolbar 服务托管，"
+              f"当前桌面 #{vd.current_index()}。",
               flush=True)
         return 0
     finally:
@@ -3290,12 +3218,12 @@ def main() -> int:
     p_boot.add_argument("--server-no-window", action="store_true",
                         help="隐藏 server.py 的控制台黑框（CREATE_NO_WINDOW）")
     p_boot.add_argument("--server-wait-ms", type=int, default=18000,
-                        help="switch_wait_switchback 模式：server 在主桌面0 条件等待的最长窗口（默认 18000ms，\n"
-                             "足以等 Qt backdrop 出来 + 多 stagger 2s 的 scrcpy 卡片；app 卡片特别多可调到 25000）。\n"
-                             "同时作为 poller 扫尾和 move_after 的时间窗口上限。")
+                        help="server 启动后等 HTTP /status 应答的最长时间（默认 18000ms）；\n"
+                             "server 在 app.run 前完成 backdrop/主屏初始化，应答即就绪。\n"
+                             "兼容启动模式（--launch-mode）下同时作为 HWND 等待/扫尾窗口。")
     p_boot.add_argument("--server-min-hwnds", type=int, default=2,
-                        help="switch_wait_switchback 模式 server 提前离开的条件：至少出现几个顶层 HWND（默认=2，\n"
-                             "对应 Qt notification_panel + thinking_log；app 卡片多时调到 3~5）。")
+                        help="【已废弃·仅兼容启动模式生效】默认启动以 /status 就绪为准，\n"
+                             "不再数顶层窗口；仅当显式 --launch-mode move_after/switch_then_sleep 时有意义。")
     p_boot.add_argument("--model", help="传给 server.py 的 --model 参数（如 autoglm-phone）")
     p_boot.add_argument("--host", help="传给 server.py 的 --host 参数")
     p_boot.add_argument("--port", type=int, help="传给 server.py 的 --port 参数")
@@ -3326,7 +3254,7 @@ def main() -> int:
     p_uu.add_argument("--force-new-uu", action="store_true",
                       help="即使检测到 UU 远程已在运行，也强制重新 Popen（默认复用旧实例）")
     p_uu.add_argument("--no-uu-dock", action="store_true",
-                      help="不在 UU 桌面启动回程 Dock（front/uu_dock.py：电脑按钮切回手机桌面）")
+                      help=argparse.SUPPRESS)  # 已废弃：Dock 改由 Toolbar 服务托管，参数仅为兼容旧命令行
 
     # watcher（内部命令，由 bootstrap 以 detached 方式自启，也可手动运行排障）
     p_watch = sub.add_parser("watch", help=argparse.SUPPRESS)
@@ -3337,13 +3265,13 @@ def main() -> int:
     p_sig = sub.add_parser("signal-pid", help=argparse.SUPPRESS)
     p_sig.add_argument("--pid", type=int, required=True)
 
-    # osk-icon（内部命令：bootstrap 以 detached 方式自启的右下角键盘图标常驻宿主）
-    sub.add_parser("osk-icon", help=argparse.SUPPRESS)
+    # toolbar（内部命令：bootstrap 最早期 detached 自启的底部 Dock 常驻 Qt 服务）
+    sub.add_parser("toolbar", help=argparse.SUPPRESS)
 
     # stop：全量停止——默认连 UU 主程序、UU 虚拟桌面一起清理，做到零项目进程残留
     p_stop = sub.add_parser(
         "stop",
-        help="全量停止：CTRL_C 优雅停 server（超时强杀）+ 两个 toolbar + watcher + "
+        help="全量停止：CTRL_C 优雅停 server（超时强杀）+ Toolbar 服务 + watcher + "
              "全部 scrcpy；默认同时关闭 UU 主程序并删除 UU 虚拟桌面；无 state 也清扫孤儿",
     )
     p_stop.set_defaults(kill_uu=True, remove_desktops=True)
@@ -3380,8 +3308,9 @@ def main() -> int:
         return do_watch(args)
     if args.cmd == "signal-pid":
         return do_signal_pid(args)
-    if args.cmd == "osk-icon":
-        return _run_osk_icon_host()
+    if args.cmd == "toolbar":
+        from virtualdesk.toolbar_service import run_toolbar_service
+        return run_toolbar_service()
     if args.cmd == "stop":
         return do_stop(args)
     if args.cmd == "status":

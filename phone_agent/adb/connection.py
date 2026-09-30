@@ -77,6 +77,8 @@ class ADBConnection:
                 [self.adb_path, "connect", address],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
             )
 
@@ -129,6 +131,8 @@ class ADBConnection:
                 [self.adb_path, "devices", "-l"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
 

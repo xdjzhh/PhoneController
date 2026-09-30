@@ -302,6 +302,10 @@ def get_status():
     if display_manager:
         status_info['main_display_running'] = display_manager.main_display_running
         status_info['active_app_displays'] = display_manager.active_app_count
+    # backdrop 子进程 PID 经 HTTP 报给 virtual_desktop bootstrap 登记入它自己的
+    # state；跨域只走 HTTP，不依赖任何共享文件（backdrop 未启动时字段缺省）。
+    if backdrop_manager and backdrop_manager.is_running:
+        status_info['backdrop_pid'] = backdrop_manager.child_pid
     return jsonify(status_info)
 
 
@@ -450,6 +454,13 @@ def set_edit_mode():
     app_package = data.get('app_package')  # None 或 "main" 表示主屏
     editing = data.get('editing', True)
     result = display_manager.set_edit_mode(app_package, editing=editing)
+    # 联动通知/思考面板的编辑外观（scrcpy 卡片已由 display_manager 处理）。
+    # 由独立 Toolbar 服务 Dock 的「设置」钮经 HTTP 触发；backdrop 未启动时跳过。
+    if result.get('success') and backdrop_manager and backdrop_manager.is_running:
+        try:
+            backdrop_manager.set_panels_edit_mode(bool(editing))
+        except Exception as e:
+            print(f"[server] set_panels_edit_mode 联动失败（不影响卡片）: {e!r}")
     status_code = 200 if result.get('success') else 500
     return jsonify(result), status_code
 

@@ -51,6 +51,8 @@ def get_screenshot(device_id: str | None = None, timeout: int = 10, display_id: 
             adb_prefix + screencap_cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
 
@@ -64,6 +66,8 @@ def get_screenshot(device_id: str | None = None, timeout: int = 10, display_id: 
             adb_prefix + ["pull", "/sdcard/tmp.png", temp_path],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
 

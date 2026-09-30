@@ -916,7 +916,9 @@ def _setup_scrcpy_control_socket(control_port=27183):
         # 检测 scrcpy 的 socket 名称
         result = subprocess.check_output(
             ['adb', 'shell', 'cat', '/proc/net/unix'],
-            text=True
+            text=True,
+            encoding='utf-8',
+            errors='replace'
         )
         
         # 查找 scrcpy 开头的 socket
@@ -972,7 +974,7 @@ def screen_power_off():
         
         print(f"[ScreenPower] Sending KEYCODE_SLEEP (223) via adb: {' '.join(cmd)}")
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
         
         if result.returncode == 0:
             print(f"[ScreenPower] ✅ Screen power OFF command sent via adb (KEYCODE_SLEEP)")
@@ -1029,7 +1031,7 @@ def screen_power_on():
         
         print(f"[ScreenPower] Sending KEYCODE_WAKEUP (224) via adb: {' '.join(cmd)}")
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
         
         if result.returncode == 0:
             print(f"[ScreenPower] ✅ Screen power ON command sent via adb (KEYCODE_WAKEUP)")

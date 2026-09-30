@@ -12,7 +12,8 @@ Qt Backdrop Window - 透明容器窗口 + macOS风格通知/思考面板 + 公�
 - 窗口是topmost但位于topmost Z-order最底部(HWND_BOTTOM)，与scrcpy同层但在其下
 - 不设置WS_EX_TRANSPARENT——点击空白区域被拦截但不处理
 - scrcpy窗口保持WS_EX_TOPMOST，始终浮在容器之上
-- 底部 Mac 风格 Dock 为公用组件 front/desktop_toolbar.DesktopToolbar
+- 底部 Mac 风格 Dock 已移至独立的 Toolbar 常驻服务（virtualdesk 包 /
+  `python virtual_desktop.py toolbar`），本进程只保留 backdrop + 通知/思考面板
 - 2秒定时器持续确保容器在Z-order底部，防止被其他topmost窗口挤到前面
 - 运行在独立QApplication进程中，避免与Flask/主进程冲突
 """
@@ -48,7 +49,11 @@ def _safe_hwnd(h):
 
 
 def _run_backdrop_process(pipe_conn, config_path=None):
-    """在独立进程中运行Qt背景窗口 + macOS风格通知面板 + Dock工具栏。"""
+    """在独立进程中运行Qt背景窗口 + macOS风格通知/思考面板。
+
+    底部 Dock 不在本进程：由独立的 Toolbar 常驻服务（virtualdesk 包）统一在
+    每个虚拟桌面绘制。编辑模式联动走 pipe cmd「set_panels_edit_mode」。
+    """
     if os.name != 'nt':
         return
 
@@ -57,18 +62,6 @@ def _run_backdrop_process(pipe_conn, config_path=None):
     _proj_root = os.path.dirname(_this_dir)
     if _proj_root not in sys.path:
         sys.path.insert(0, _proj_root)
-
-    # 落地本进程 PID，供 virtual_desktop.py stop 在 server 被强杀/daemon 回收
-    # 机制失效等场景下显式终止主桌面 toolbar（multiprocessing spawn 子进程的
-    # 命令行不含 'qt_backdrop'，无法靠命令行特征枚举，必须用 PID 文件）。
-    # 本进程若被 terminate() 强杀没机会删文件——stop 读后按存活校验，
-    # bootstrap 重启会覆盖，陈旧 PID 自然失效。
-    try:
-        with open(os.path.join(_proj_root, '.vd_backdrop.pid'), 'w',
-                  encoding='utf-8', newline='') as f:
-            f.write(str(os.getpid()))
-    except Exception:
-        pass
 
     # 声明 ConfigManager 身份：backdrop_manager 维护 notification_panel / thinking_log
     try:
@@ -107,21 +100,7 @@ def _run_backdrop_process(pipe_conn, config_path=None):
             create_thinking_log_panel = None
             print("[QtBackdrop] qt_thinking_log module not found, thinking panel disabled", flush=True)
 
-    # 公用 Mac 风格 Dock（桌面 #0/#1 唯一绘制源，见 front/desktop_toolbar.py）
-    bring_main_display_here = None
-    try:
-        from front.desktop_toolbar import DesktopToolbar
-        from front.desktop_toolbar import bring_main_display_to_current_desktop \
-            as bring_main_display_here
-    except ImportError:
-        try:
-            from desktop_toolbar import DesktopToolbar
-            from desktop_toolbar import bring_main_display_to_current_desktop \
-                as bring_main_display_here
-        except ImportError:
-            DesktopToolbar = None
-            print("[QtBackdrop] desktop_toolbar module not found, dock toolbar disabled",
-                  flush=True)
+    # 底部 Dock 已移至独立 Toolbar 常驻服务（virtualdesk 包），本进程不再导入。
 
     # ── Windows 常量 ──
     GWL_STYLE = -16
@@ -283,9 +262,7 @@ def _run_backdrop_process(pipe_conn, config_path=None):
             """强制将窗口置于Z-order底部。"""
             self._apply_win32_style()
 
-    # DockToolbarWidget 已抽离为公用组件 front/desktop_toolbar.DesktopToolbar：
-    # 主桌面 #0（本进程）与 UU 桌面 #1（front/uu_dock.py）共用同一份 Qt 绘制代码，
-    # 「设置/电脑」动作通过回调注入，不再在此维护第二份实现。
+    # 底部 Dock 不在本进程：由独立 Toolbar 常驻服务（virtualdesk 包）统一绘制。
 
     # ──────────────────────────────────────────────────────────────────
     # CATCH-ALL wrapper so any error in the Qt child process is reported
@@ -385,108 +362,35 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                     traceback.print_exc()
                     thinking_window = None
     
-        dock_window = None
-        if DesktopToolbar is not None:
-            edit_mode_shown = {"v": False}
-
-            def _on_dock_settings():
-                """主桌面 #0「设置」：切换全部卡片编辑模式，并联动通知/思考窗。
-                行为与原内嵌 DockToolbar._toggle_edit_mode 完全一致。"""
-                edit_mode_shown["v"] = not edit_mode_shown["v"]
-                show = edit_mode_shown["v"]
-                if pipe_conn:
-                    try:
-                        pipe_conn.send({'cmd': 'toggle_edit_mode', 'show': show})
-                    except Exception:
-                        pass
-                if notif_window:
-                    try:
-                        notif_window._set_edit_mode(show)
-                        notif_window.update()
-                    except Exception as e:
-                        print(f"[DockToolbar] Toggle notif edit error: {e}", flush=True)
-                if thinking_window:
-                    try:
-                        thinking_window._set_edit_mode(show)
-                        thinking_window.update()
-                    except Exception as e:
-                        print(f"[DockToolbar] Toggle thinking edit error: {e}", flush=True)
-                dock_window.set_settings_active(show)
-
-            def _on_dock_computer():
-                """主桌面 Dock「电脑」：detached 拉起 virtual_desktop.py uu-open，
-                创建/启动/切换的全部决策都交给 uu-open：
-                  · UU 桌面 + UU 已存在 → 只切换桌面（不重复创建/启动）；
-                  · 桌面不存在 → 新建虚拟桌面并启动 GameViewer + 回程 Dock。
-                不在 Qt 进程里直接调 pyvda：切桌/COM 轮询放到独立进程，不卡 UI。"""
-                import subprocess
+        # 底部 Dock 已不在本进程。通知/思考面板的编辑模式由 server 经 pipe
+        # （cmd=set_panels_edit_mode）在 HTTP /display/edit_mode 链路中驱动；
+        # scrcpy 卡片的编辑模式由 server 端 display_manager 直接处理。
+        def _set_panels_edit_mode(show):
+            if notif_window:
                 try:
-                    proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                    script = os.path.join(proj_root, 'virtual_desktop.py')
-                    log_path = os.path.join(proj_root, '.vd_uu.log')
-                    # 标准句柄会被复制给子进程，父进程 Popen 后即可关闭自己的副本，
-                    # 避免每次点按都在 Qt 长生命周期进程里泄漏一个文件句柄。
-                    log_fp = open(log_path, 'a', encoding='utf-8')
-                    try:
-                        creationflags = (
-                            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-                            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-                        )
-                        p = subprocess.Popen(
-                            [sys.executable, script, 'uu-open'],
-                            cwd=proj_root,
-                            stdout=log_fp, stderr=subprocess.STDOUT,
-                            stdin=subprocess.DEVNULL, close_fds=True,
-                            creationflags=creationflags,
-                        )
-                    finally:
-                        log_fp.close()
-                    print(f"[DockToolbar] 已触发 uu-open（PID={p.pid}）：按需创建/切换 UU 远程桌面"
-                          f"（已存在则只切换），日志见 .vd_uu.log", flush=True)
+                    notif_window._set_edit_mode(show)
+                    notif_window.update()
                 except Exception as e:
-                    print(f"[DockToolbar] 触发 uu-open 失败: {e}", flush=True)
+                    print(f"[QtBackdrop] Toggle notif edit error: {e}", flush=True)
+            if thinking_window:
+                try:
+                    thinking_window._set_edit_mode(show)
+                    thinking_window.update()
+                except Exception as e:
+                    print(f"[QtBackdrop] Toggle thinking edit error: {e}", flush=True)
 
-            def _on_dock_phone():
-                """主桌面 #0「手机」：把手机主屏（main_display）嵌入当前所在桌面。
-                在 #0 点＝留在/搬回 #0；用户切到 #1 用 UU 回程 Dock 点则嵌到 #1。"""
-                if bring_main_display_here is None:
-                    print("[DockToolbar] 手机动作不可用（desktop_toolbar 未加载）",
-                          flush=True)
-                    return
-                bring_main_display_here()
-
-            try:
-                dock_window = DesktopToolbar(
-                    window_title="AR Dock",
-                    on_settings=_on_dock_settings,
-                    on_phone=_on_dock_phone,
-                    on_computer=_on_dock_computer,
-                )
-                dock_window.setWindowOpacity(0.0)
-                dock_window.show()
-                QTimer.singleShot(100, dock_window._apply_win32_style)
-                QTimer.singleShot(300, dock_window._apply_win32_style)
-                print("[QtBackdrop] Dock toolbar created", flush=True)
-            except Exception as e:
-                print(f"[QtBackdrop] Failed to create dock toolbar: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-                dock_window = None
-    
         bg_hwnd = _safe_hwnd(widget.winId())
         notif_hwnd = _safe_hwnd(notif_window.winId()) if notif_window else 0
         thinking_hwnd = _safe_hwnd(thinking_window.winId()) if thinking_window else 0
-        dock_hwnd = _safe_hwnd(dock_window.winId()) if dock_window else 0
         pipe_conn.send({
             'status': 'ready',
             'hwnd': bg_hwnd,
             'notif_hwnd': notif_hwnd,
             'thinking_hwnd': thinking_hwnd,
-            'dock_hwnd': dock_hwnd,
         })
     
         def poll_pipe():
-            nonlocal widget, notif_window, thinking_window, dock_window
+            nonlocal widget, notif_window, thinking_window
             while pipe_conn.poll():
                 try:
                     msg = pipe_conn.recv()
@@ -498,6 +402,10 @@ def _run_backdrop_process(pipe_conn, config_path=None):
                         return
                     elif cmd == 'ensure_bottom':
                         widget.ensure_bottom()
+                    elif cmd == 'set_panels_edit_mode':
+                        # server HTTP /display/edit_mode 联动：只切通知/思考面板，
+                        # scrcpy 卡片编辑模式由 server 端 display_manager 处理。
+                        _set_panels_edit_mode(bool(msg.get('show', False)))
                     elif cmd == 'show_notification':
                         if notif_window:
                             notif_window.show()
@@ -578,15 +486,7 @@ def _run_backdrop_process(pipe_conn, config_path=None):
         thinking_timer = QTimer()
         thinking_timer.timeout.connect(_ensure_thinking_topmost)
         thinking_timer.start(3000)
-    
-        def _ensure_dock_topmost():
-            if dock_window:
-                dock_window._apply_win32_style()
-    
-        dock_timer = QTimer()
-        dock_timer.timeout.connect(_ensure_dock_topmost)
-        dock_timer.start(3000)
-    
+
         sys.exit(app.exec())
         # ── end of _inner_main ──
 
@@ -613,7 +513,6 @@ class QtBackdropManager:
         self._backdrop_hwnd = None
         self._notif_hwnd = None
         self._thinking_hwnd = None
-        self._dock_hwnd = None
         self._ready = False
         self._notif_timer = None
         self._notif_parser = None
@@ -648,9 +547,8 @@ class QtBackdropManager:
                     self._backdrop_hwnd = msg.get('hwnd')
                     self._notif_hwnd = msg.get('notif_hwnd', 0)
                     self._thinking_hwnd = msg.get('thinking_hwnd', 0)
-                    self._dock_hwnd = msg.get('dock_hwnd', 0)
                     self._ready = True
-                    print(f"[QtBackdrop] Started successfully, hwnd={self._backdrop_hwnd}, notif_hwnd={self._notif_hwnd}, thinking_hwnd={self._thinking_hwnd}, dock_hwnd={self._dock_hwnd}", flush=True)
+                    print(f"[QtBackdrop] Started successfully, hwnd={self._backdrop_hwnd}, notif_hwnd={self._notif_hwnd}, thinking_hwnd={self._thinking_hwnd}", flush=True)
                     self._start_notification_refresh()
                     self._start_listener()
                     return True
@@ -732,13 +630,23 @@ class QtBackdropManager:
                     print(f"[QtBackdrop] Listener error: {e}", flush=True)
         self._listener_thread = threading.Thread(target=_listen_loop, daemon=True)
         self._listener_thread.start()
-        print("[QtBackdrop] Dock command listener started", flush=True)
+        print("[QtBackdrop] Child->parent command listener started", flush=True)
 
     def ensure_bottom(self):
         if not self._ready or not self._parent_conn:
             return
         try:
             self._parent_conn.send({'cmd': 'ensure_bottom'})
+        except Exception:
+            pass
+
+    def set_panels_edit_mode(self, show: bool):
+        """联动通知/思考面板的编辑模式（不涉及 scrcpy 卡片——卡片由 server 端
+        display_manager 在 /display/edit_mode 中处理）。backdrop 未启动时静默跳过。"""
+        if not self._ready or not self._parent_conn:
+            return
+        try:
+            self._parent_conn.send({'cmd': 'set_panels_edit_mode', 'show': bool(show)})
         except Exception:
             pass
 
@@ -856,11 +764,22 @@ class QtBackdropManager:
         self._proc = None
         self._backdrop_hwnd = None
         self._notif_hwnd = None
-        self._dock_hwnd = None
 
     @property
     def is_running(self):
         return self._proc is not None and self._proc.is_alive() and self._ready
+
+    @property
+    def child_pid(self):
+        """multiprocessing spawn 子进程 PID；未启动/已退出返回 None。
+        供 server 经 GET /status 报给 virtual_desktop（跨域只走 HTTP，不落文件）。"""
+        if self._proc is not None:
+            try:
+                if self._proc.is_alive():
+                    return self._proc.pid
+            except Exception:
+                return None
+        return None
 
     @property
     def backdrop_hwnd(self):
@@ -869,10 +788,6 @@ class QtBackdropManager:
     @property
     def notification_hwnd(self):
         return self._notif_hwnd
-
-    @property
-    def dock_hwnd(self):
-        return self._dock_hwnd
 
 
 _backdrop_manager = None

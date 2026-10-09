@@ -3,7 +3,8 @@
 Phone Agent HTTP Server - 将 Phone Agent 作为 HTTP 服务运行
 
 使用方法：
-    python server.py --port 8080
+    python server.py                      # 启动参数读同目录 start_proporties.yaml
+    python server.py --port 9000          # 命令行参数覆盖 YAML 同名项
 
 API 端点：
     POST /run  - 执行任务
@@ -505,6 +506,40 @@ def refresh_notifications():
     return jsonify({'success': True})
 
 
+# 启动参数 YAML（与 server.py 同目录）：python server.py 默认读取
+_START_PROPERTIES_NAME = 'start_proporties.yaml'
+
+
+def _load_start_properties(config_path=None):
+    """读取启动参数 YAML，返回 dict。
+
+    单一配置来源策略：命令行显式参数 > YAML > 代码内置默认值。
+    文件缺失/解析失败只告警并返回 {}（回退内置默认值），绝不阻断启动。
+    """
+    path = config_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), _START_PROPERTIES_NAME)
+    if not os.path.isfile(path):
+        print(f"[server] ℹ️ 未找到启动参数文件 {path}，使用命令行/内置默认值。")
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        print("[server] ⚠️ 未安装 PyYAML，无法读取 "
+              f"{_START_PROPERTIES_NAME}（pip install pyyaml）；回退命令行/内置默认值。")
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"[server] ⚠️ 解析启动参数文件 {path} 失败，回退命令行/内置默认值：{e!r}")
+        return {}
+    if not isinstance(data, dict):
+        print(f"[server] ⚠️ 启动参数文件 {path} 顶层不是键值映射，已忽略。")
+        return {}
+    print(f"[server] ⚙️ 已加载启动参数文件：{path}（命令行同名参数优先）")
+    return data
+
+
 def main():
     # ── 统一 adb 来源：优先使用 scrcpy 自带的 adb.exe，必须早于任何
     #    adbutils / "adb" 子进程调用（adbutils 每次按 PATH 实时解析）──
@@ -523,18 +558,50 @@ def main():
         # Never let the tee bootstrap crash server startup
         print(f"[server] console_tee install skipped: {_tee_err}", flush=True)
 
+    # 参数默认值一律为 None：用于区分「命令行显式传入」与「未传」。
+    # 未传时回退 start_proporties.yaml，再回退下面的内置默认值
+    # （优先级：命令行 > YAML > 内置默认），保证 `python server.py`
+    # 与 virtual_desktop.py bootstrap 传参两种启动方式都不被破坏。
     parser = argparse.ArgumentParser(description='Phone Agent HTTP Server')
-    parser.add_argument('--host', default='127.0.0.1', help='Host to bind to')
-    parser.add_argument('--port', type=int, default=8080, help='Port to listen on')
-    parser.add_argument('--base-url', default='https://open.bigmodel.cn/api/paas/v4', 
-                        help='Model API base URL')
-    parser.add_argument('--model', default='autoglm-phone', help='Model name')
-    parser.add_argument('--apikey', default='cae66fb0786343ee9e078a00ec683721.3HmwuIx9d5Vf22DD', help='API key')
-    parser.add_argument('--no-main-display', action='store_true', help='Do not start main display on startup')
-    parser.add_argument('--no-screen-monitor', action='store_true', help='Do not start screen lock monitor')
-    parser.add_argument('--no-backdrop', action='store_true', help='Do not start Qt Linux desktop backdrop')
-    args = parser.parse_args()
-    
+    parser.add_argument('--config', default=None,
+                        help=f'启动参数 YAML 路径（默认=server.py 同目录 {_START_PROPERTIES_NAME}）')
+    parser.add_argument('--host', default=None, help='Host to bind to（默认读 YAML: 127.0.0.1）')
+    parser.add_argument('--port', type=int, default=None, help='Port to listen on（默认读 YAML: 8080）')
+    parser.add_argument('--base-url', default=None,
+                        help='Model API base URL（默认读 YAML）')
+    parser.add_argument('--model', default=None, help='Model name（默认读 YAML: autoglm-phone）')
+    parser.add_argument('--apikey', default=None, help='API key（默认读 YAML）')
+    # store_true 的 default 必须是 None（而非 False），否则无法识别
+    # 「用户没传该 flag」——显式传入时值为 False，未传为 None → 回退 YAML。
+    parser.add_argument('--no-main-display', action='store_true', default=None,
+                        help='Do not start main display on startup（YAML: no_main_display）')
+    parser.add_argument('--no-screen-monitor', action='store_true', default=None,
+                        help='Do not start screen lock monitor（YAML: no_screen_monitor）')
+    parser.add_argument('--no-backdrop', action='store_true', default=None,
+                        help='Do not start Qt Linux desktop backdrop（YAML: no_backdrop）')
+    cli_args = parser.parse_args()
+
+    props = _load_start_properties(cli_args.config)
+
+    def _pick(cli_val, yaml_key, builtin_default):
+        """命令行显式值优先；否则取 YAML；YAML 无此项再用内置默认。"""
+        if cli_val is not None:
+            return cli_val
+        return props.get(yaml_key, builtin_default)
+
+    args = argparse.Namespace(
+        host=str(_pick(cli_args.host, 'host', '127.0.0.1')),
+        port=int(_pick(cli_args.port, 'port', 8080)),
+        base_url=str(_pick(cli_args.base_url, 'base_url',
+                           'https://open.bigmodel.cn/api/paas/v4')),
+        model=str(_pick(cli_args.model, 'model', 'autoglm-phone')),
+        apikey=str(_pick(cli_args.apikey, 'apikey',
+                         'cae66fb0786343ee9e078a00ec683721.3HmwuIx9d5Vf22DD')),
+        no_main_display=bool(_pick(cli_args.no_main_display, 'no_main_display', False)),
+        no_screen_monitor=bool(_pick(cli_args.no_screen_monitor, 'no_screen_monitor', False)),
+        no_backdrop=bool(_pick(cli_args.no_backdrop, 'no_backdrop', False)),
+    )
+
     # Initialize agent config
     print("🔧 Initializing Phone Agent...")
     initialize_config(

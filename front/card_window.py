@@ -1951,9 +1951,12 @@ class WindowsCardDecorator:
             self.set_edit_mode(scrcpy_hwnd, not card.editing)
 
     def set_all_edit_mode(self, editing):
-        for scrcpy_hwnd in list(self._cards.keys()):
+        hwnds = list(self._cards.keys())
+        for scrcpy_hwnd in hwnds:
             self.set_edit_mode(scrcpy_hwnd, editing)
-        print(f"[CardWindow] All cards edit mode: {'ON' if editing else 'OFF (pinned)'}", flush=True)
+        print(f"[CardWindow] All cards edit mode: {'ON' if editing else 'OFF (pinned)'} "
+              f"({len(hwnds)} window(s))", flush=True)
+        return len(hwnds)
 
     def refresh_card_overlay(self, scrcpy_hwnd):
         """Re-sync the overlay window position/size after programmatic window move/resize."""
@@ -1993,6 +1996,9 @@ class X11CardDecorator:
 
     def set_edit_mode(self, xid, editing):
         pass
+
+    def set_all_edit_mode(self, editing):
+        return 0
 
     def toggle_edit_mode(self, xid):
         pass

@@ -1,0 +1,23 @@
+# =============================================================================
+# start_proporties.yaml —— server.py 启动参数（单一配置来源）
+#
+# 优先级：命令行显式参数 > 本文件 > server.py 内置默认值
+#   · 直接 `python server.py` 即按本文件启动；
+#   · 命令行传同名参数时覆盖本文件对应项（如 python server.py --port 9000）；
+#   · 本文件缺失或损坏时自动回退内置默认值，不阻断启动。
+# 布尔项只接受 true / false（YAML 原生布尔）。
+# =============================================================================
+
+# HTTP 服务监听地址与端口
+host: 127.0.0.1
+port: 8080
+
+# 模型 API
+base_url: https://open.bigmodel.cn/api/paas/v4
+model: autoglm-phone
+apikey: "cae66fb0786343ee9e078a00ec683721.3HmwuIx9d5Vf22DD"
+
+# 启动行为开关
+no_main_display: false    # true = 启动时不开主手机画面（scrcpy 主屏）
+no_screen_monitor: false  # true = 不启动锁屏监测
+no_backdrop: false        # true = 不启动黑色背景容器（虚拟屏卡片将浮在普通桌面上）

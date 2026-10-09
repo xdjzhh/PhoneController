@@ -93,6 +93,162 @@ def _teardown_failed_process(process, window_title):
     return tail
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 设备端 scrcpy 进程 / VirtualDisplay 回收
+#
+# 背景：--new-display 创建的 VirtualDisplay 归设备端 scrcpy server
+# （app_process，shell 身份）所有，正常释放链路是：
+#   PC 端 scrcpy.exe 退出 → adb tunnel 断开 → server socket EOF →
+#   server 退出 → binder death → system_server 回收 VirtualDisplay。
+# PC 端被硬杀（taskkill /F、断电）、WiFi adb TCP 半开、或系统 ANR 时，
+# 设备端 server 收不到断连 → 进程与虚拟屏双双泄漏（实测僵尸块如
+# mDisplayId=7396，rootTasks=0 且 isKeyguardShowing 恒 true）。
+# 本模块工具用于两处兜底：
+#   1) bootstrap 启动任何 scrcpy 前，一次性回收全部孤儿 server/虚拟屏；
+#   2) 单卡片 stop() 后轮询确认虚拟屏确已释放，必要时在设备端 kill -9
+#      （binder death 对 SIGKILL 同样触发，VD 由 system_server 回收）。
+
+_SCRCPY_SERVER_TOKEN = "com.genymobile.scrcpy.Server"
+_SCRCPY_CLEANUP_TOKEN = "com.genymobile.scrcpy.CleanUp"
+
+
+def _get_device(device_serial=None):
+    """获取 adbutils 设备对象；无设备返回 None。"""
+    try:
+        if device_serial:
+            return adbutils.adb.device(device_serial)
+        devices = adbutils.adb.device_list()
+        return devices[0] if devices else None
+    except Exception:
+        return None
+
+
+def list_device_scrcpy_processes(device):
+    """枚举设备端 scrcpy 相关进程。
+
+    返回 [{"pid": int, "kind": "sh"|"server"|"cleanup",
+           "scid": str|None, "new_display": "WxH"|None}]；失败返回 []。
+    设备侧进程组三兄弟：
+      sh -c CLASSPATH=...scrcpy-server... app_process / ...Server scid=X
+      app_process / com.genymobile.scrcpy.Server 4.1 scid=X [new_display=...]
+      app_process / com.genymobile.scrcpy.CleanUp ...
+    """
+    out = None
+    try:
+        out = device.shell("ps -A -o PID,ARGS")
+    except Exception:
+        try:
+            out = device.shell("ps -A")  # 个别 ROM toybox 不支持 -o
+        except Exception:
+            return []
+
+    procs = []
+    for line in (out or "").splitlines():
+        m = re.match(r"\s*(\d+)\s+(.*)$", line)
+        if not m:
+            continue
+        pid, args = int(m.group(1)), m.group(2)
+
+        # 顺序敏感：sh 包裹命令行里也含 "com.genymobile.scrcpy.Server" 字样，
+        # 必须先识别 sh -c CLASSPATH 包裹层。
+        if "sh -c CLASSPATH=" in args and "scrcpy-server" in args:
+            kind = "sh"
+        elif _SCRCPY_SERVER_TOKEN in args:
+            kind = "server"
+        elif _SCRCPY_CLEANUP_TOKEN in args:
+            kind = "cleanup"
+        else:
+            continue
+
+        scid_m = re.search(r"scid=([0-9a-zA-Z]+)", args)
+        nd_m = re.search(r"new_display=(\d+x\d+)", args)
+        procs.append({
+            "pid": pid,
+            "kind": kind,
+            "scid": scid_m.group(1) if scid_m else None,
+            "new_display": nd_m.group(1) if nd_m else None,
+        })
+    return procs
+
+
+def list_device_scrcpy_display_ids(device):
+    """dumpsys display → 仍存在的 scrcpy 虚拟屏【全局 displayId】列表。
+
+    不同 ROM 的 dumpsys display 排版差异很大（实测华为 ROM 的
+    DisplayDeviceInfo 详情块不带 'Display Id=' 标题），因此采用两条
+    互相兜底的特征，均为显式 scrcpy 归属，不会误判其他虚拟屏：
+      主：mViewports 行 displayId=N, uniqueId='virtual:com.android.shell,
+          <uid>,scrcpy,<index>'
+      备：Logical Display 详情 DisplayInfo{"scrcpy", displayId N
+    """
+    try:
+        out = device.shell("dumpsys display")
+    except Exception:
+        return []
+    out = out or ""
+    ids = []
+
+    for m in re.finditer(
+            r"displayId=(\d+),\s*uniqueId='virtual:com\.android\.shell,\d+,scrcpy,\d+'",
+            out):
+        did = int(m.group(1))
+        if did != 0 and did not in ids:
+            ids.append(did)
+    if ids:
+        return ids
+
+    for m in re.finditer(r'DisplayInfo\{"scrcpy",\s*displayId[ =](\d+)', out):
+        did = int(m.group(1))
+        if did != 0 and did not in ids:
+            ids.append(did)
+    return ids
+
+
+def kill_device_scrcpy_processes(device, pids):
+    """设备端 kill -9 指定 PID（shell 可杀同 uid 进程）。返回确认已消失的 PID。"""
+    pids = sorted({int(p) for p in pids if p})
+    if not pids:
+        return []
+    pid_arg = " ".join(str(p) for p in pids)
+    try:
+        device.shell(f"kill -9 {pid_arg}")
+    except Exception as e:
+        print(f"[scrcpy-reap] kill -9 {pid_arg} failed: {e}")
+        return []
+    time.sleep(0.5)
+    alive = {p["pid"] for p in list_device_scrcpy_processes(device)}
+    return [p for p in pids if p not in alive]
+
+
+def reap_orphan_scrcpy(device):
+    """回收设备端所有 scrcpy 进程并等待其 VirtualDisplay 被系统回收。
+
+    只能在【本机任何 scrcpy 客户端启动之前】调用（bootstrap 场景）：
+    此刻设备上若还存在 scrcpy server，必属上一轮残留孤儿。
+
+    返回 {"killed": [pid...], "displays_before": [...], "displays_after": [...]}。
+    """
+    procs = list_device_scrcpy_processes(device)
+    displays_before = list_device_scrcpy_display_ids(device)
+    if not procs and not displays_before:
+        return {"killed": [], "displays_before": [], "displays_after": []}
+
+    killed = kill_device_scrcpy_processes(device, [p["pid"] for p in procs])
+
+    # VirtualDisplay 随 binder death 异步回收，轮询最多 3s
+    displays_after = displays_before
+    for _ in range(6):
+        time.sleep(0.5)
+        displays_after = list_device_scrcpy_display_ids(device)
+        if not displays_after:
+            break
+    return {
+        "killed": killed,
+        "displays_before": displays_before,
+        "displays_after": displays_after,
+    }
+
+
 class MainDisplay:
     """
     Main display that mirrors the physical phone screen.
@@ -420,6 +576,10 @@ class MainDisplay:
                                           on_geometry_changed=_on_geom)
                 self._hwnd = hwnd
                 print(f"[{self.window_title}] Registered with card window decorator (traffic lights + drag/resize)")
+                # 继承 Dock 齿轮的全局编辑态（主屏晚于齿轮点击启动的场景）
+                if self.display_manager is not None and \
+                        getattr(self.display_manager, "_global_edit_mode", False):
+                    decorator.set_edit_mode(hwnd, True)
             except Exception as de:
                 print(f"[{self.window_title}] Card decorator registration failed: {de}")
         except Exception as e:
@@ -504,6 +664,9 @@ class AppVirtualDisplay:
         self.monitor_thread = None
         self.stop_monitoring = False
         self.android_display_id = None
+        # 设备端 server 进程快照（stop 兜底回收用，防止硬杀/WiFi 半开泄漏 VD）
+        self._device_server_pid = None
+        self._device_aux_pids = []
         self._hwnd = None
         self._style_thread = None
         self.output_thread = None
@@ -656,6 +819,18 @@ class AppVirtualDisplay:
         # 否则后启动者的 adb reverse（设备端 abstract socket 名固定）会顶掉
         # 本实例的映射 → "Aborted / Server connection failed"。
         with _SCRCPY_BOOT_LOCK:
+            # 启动前快照设备端已有 server PID：启动锁保证此刻只有本实例在建连，
+            # 握手后做差集即可精确定位本实例的设备端进程，供 stop 兜底回收。
+            boot_device = _get_device(self.device_serial)
+            pre_server_pids = set()
+            if boot_device is not None:
+                try:
+                    pre_server_pids = {
+                        p["pid"] for p in list_device_scrcpy_processes(boot_device)
+                        if p["kind"] == "server"}
+                except Exception:
+                    pre_server_pids = set()
+
             try:
                 self.process = subprocess.Popen(
                     cmd,
@@ -683,6 +858,10 @@ class AppVirtualDisplay:
             self.output_thread.start()
 
             handshake_ok = self._wait_handshake()
+
+            # 握手成功 → 差集定位本实例设备端 server PID（仍在启动锁内）
+            if handshake_ok and boot_device is not None:
+                self._snapshot_device_server(boot_device, pre_server_pids)
 
         if not handshake_ok:
             print(f"[{self.window_title}] ❌ FAILED to start: {self._boot_error}")
@@ -824,6 +1003,11 @@ class AppVirtualDisplay:
                                           on_geometry_changed=_on_geom)
                 self._hwnd = hwnd
                 print(f"[{self.window_title}] Registered with card window decorator (traffic lights + drag/resize)")
+                # 继承 Dock 齿轮的全局编辑态：齿轮开启后新开的天气/地图等卡片
+                # 也要立即显示红绿灯与缩放热区
+                if self._display_manager is not None and \
+                        getattr(self._display_manager, "_global_edit_mode", False):
+                    decorator.set_edit_mode(hwnd, True)
             except Exception as de:
                 print(f"[{self.window_title}] Card decorator registration failed: {de}")
 
@@ -1171,6 +1355,92 @@ class AppVirtualDisplay:
         except Exception as e:
             print(f"[{self.window_title}] Monitor failed to start: {e}")
 
+    def _snapshot_device_server(self, device, pre_server_pids):
+        """握手后差集定位本实例的设备端 server PID（启动锁保证串行）。
+
+        优先选「新增且 new_display 尺寸与本卡片一致」的 server；
+        匹配不到时退化为任意新增 server。同时记录同 scid 的 sh 包裹进程。
+        """
+        try:
+            nd_w, nd_h, _ = self.config.resolve_virtual_display_size()
+            want_nd = f"{nd_w}x{nd_h}"
+            post = [p for p in list_device_scrcpy_processes(device)
+                    if p["kind"] == "server"]
+            newborn = [p for p in post if p["pid"] not in pre_server_pids]
+            matched = [p for p in newborn if p.get("new_display") == want_nd] or newborn
+            if not matched:
+                return
+            srv = matched[0]
+            self._device_server_pid = srv["pid"]
+            scid = srv.get("scid")
+            if scid:
+                self._device_aux_pids = [
+                    p["pid"] for p in list_device_scrcpy_processes(device)
+                    if p["kind"] == "sh" and p.get("scid") == scid
+                ]
+            print(f"[{self.window_title}] Device-side server snapshot: "
+                  f"pid={self._device_server_pid} scid={scid} new_display={want_nd}")
+        except Exception as e:
+            print(f"[{self.window_title}] Snapshot device server pid failed: {e}")
+
+    def _ensure_device_display_released(self, timeout_s=4.0):
+        """主机端 scrcpy 退出后，确认设备端 server 与 VirtualDisplay 已释放。
+
+        正常断连（USB / 快速退出）时 1 轮内即消失；若超时仍在（WiFi adb
+        半开、系统 ANR、PC 端被硬杀），按启动快照在设备端 kill -9 兜底，
+        binder death 会触发 system_server 回收 VirtualDisplay。
+        """
+        if self._device_server_pid is None and self.android_display_id is None:
+            return
+        try:
+            device = _get_device(self.device_serial)
+            if device is None:
+                return
+
+            def vd_still_exists():
+                # 仅在精确知道本实例 displayId 时判定；未知时不看全局列表，
+                # 否则其他在跑卡片的虚拟屏会让本卡片 stop 白等并误触兜底
+                if self.android_display_id is None:
+                    return False
+                return self.android_display_id in list_device_scrcpy_display_ids(device)
+
+            def server_still_alive():
+                return self._device_server_pid is not None and any(
+                    p["pid"] == self._device_server_pid
+                    for p in list_device_scrcpy_processes(device))
+
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                if not vd_still_exists() and not server_still_alive():
+                    return
+                time.sleep(0.5)
+
+            # kill 前按当前 ps 重新校验 PID 确属 scrcpy，避免 PID 回收误杀
+            candidates = [self._device_server_pid] + self._device_aux_pids
+            live_scrcpy_pids = {p["pid"] for p in list_device_scrcpy_processes(device)}
+            targets = [p for p in candidates if p and p in live_scrcpy_pids]
+            print(f"[{self.window_title}] Device-side scrcpy survived host exit; "
+                  f"force killing device pids server={self._device_server_pid} "
+                  f"aux={self._device_aux_pids} targets={targets}")
+            if not targets:
+                print(f"[{self.window_title}] Snapshot pids no longer scrcpy "
+                      f"(pid reuse?) — skip device kill; orphan will be reaped "
+                      f"on next bootstrap")
+                return
+            kill_device_scrcpy_processes(device, targets)
+
+            for _ in range(6):
+                time.sleep(0.5)
+                if not vd_still_exists():
+                    print(f"[{self.window_title}] VirtualDisplay released by "
+                          f"device-side fallback (display_id={self.android_display_id})")
+                    return
+            print(f"[{self.window_title}] WARNING: VirtualDisplay still reported "
+                  f"after fallback kill (display_id={self.android_display_id}); "
+                  f"will be reaped on next bootstrap")
+        except Exception as e:
+            print(f"[{self.window_title}] Ensure device display released error: {e}")
+
     def stop(self):
         """Stop the app virtual display: unregister decorator, kill scrcpy."""
         if not self.running:
@@ -1201,6 +1471,9 @@ class AppVirtualDisplay:
                 print(f"[{self.window_title}] Error stopping: {e}")
             finally:
                 self.process = None
+
+        # 校验设备端 server/VirtualDisplay 已随之释放，未释放则设备端兜底 kill
+        self._ensure_device_display_released()
 
         print(f"[{self.window_title}] Virtual display stopped")
 

@@ -285,207 +285,51 @@ def start_main_display():
     # Start the main display
     main_display.start(port=port)
     main_display_running = True
-    
-    # 启动锁屏监控线程
-    _start_screen_monitor()
-    
+
+    # 锁屏监控统一复用 DisplayManager（单一真相源）。
+    # 历史上本文件内维护过一份 _monitor_screen_lock 副本，其全量 dumpsys +
+    # true 优先的判定在多虚拟屏/ANR 快照场景下会误判锁屏并死循环，已删除，
+    # 唯一实现保留在 display_interface.DisplayManager。
+    global _display_manager
+    try:
+        from .display_interface import get_display_manager
+        _display_manager = get_display_manager(
+            scrcpy_path=scrcpy_path, device_serial=device_serial)
+        mon = _display_manager.start_screen_monitor()
+        if mon.get("success"):
+            print("[Main] Screen lock monitor started (via DisplayManager)")
+        else:
+            print(f"[Main] Screen monitor not started: {mon.get('error')}")
+    except Exception as e:
+        print(f"[Main] Failed to start screen monitor via DisplayManager: {e}")
+
     print(f"[Main] Phone screen display started (PID: {main_display.process.pid}, port: {port})")
 
 
 def stop_main_display():
     """Stop the permanent main display."""
-    global main_display, main_display_running, screen_monitor_thread, screen_monitor_stop
-    
+    global main_display, main_display_running, _display_manager
+
     if not main_display_running or not main_display:
         return
-    
+
     main_display_running = False
-    
-    # 停止锁屏监控线程
-    if screen_monitor_thread and screen_monitor_thread.is_alive():
-        screen_monitor_stop = True
-        screen_monitor_thread.join(timeout=3)
-    
+
+    # 停止锁屏监控（复用 DisplayManager 的同一实现）
+    if _display_manager is not None:
+        try:
+            _display_manager.stop_screen_monitor()
+        except Exception as e:
+            print(f"[Main] Failed to stop screen monitor via DisplayManager: {e}")
+
     main_display.stop()
     main_display = None
-    
+
     print("[Main] Phone screen display stopped")
 
 
-# 锁屏监控线程相关变量
-screen_monitor_thread = None
-screen_monitor_stop = False
-
-def _monitor_screen_lock():
-    """监控锁屏状态，自动输入密码解锁并关闭物理屏幕"""
-    global screen_monitor_stop, config
-    
-    def check_keyguard_locked(verbose=False):
-        """检测是否锁屏，尝试多种方式"""
-        # 方式1: dumpsys window (最可靠)
-        try:
-            result = device.shell("dumpsys window | grep -i keyguard")
-            if verbose:
-                print(f"[ScreenMonitor] dumpsys window keyguard:\n{result}")
-            
-            # 检测多种关键字
-            if "isKeyguardShowing=true" in result:
-                return True
-            if "mIsShowing=true" in result:
-                return True
-            # 检查 showing=true (需要更精确的匹配，避免 showingAndNotOccluded 干扰)
-            for line in result.split('\n'):
-                line = line.strip()
-                if line.startswith('showing=') and 'showing=true' in line:
-                    return True
-                if line == 'showing=true':
-                    return True
-            
-            # 明确检测到未锁屏
-            if "isKeyguardShowing=false" in result:
-                return False
-            if "mIsShowing=false" in result:
-                return False
-        except Exception as e:
-            print(f"[ScreenMonitor] dumpsys window keyguard failed: {e}")
-        
-        # 方式2: dumpsys keyguard (某些设备可能没有这个服务)
-        try:
-            result = device.shell("dumpsys keyguard")
-            if verbose:
-                lines = result.strip().split('\n')
-                print(f"[ScreenMonitor] dumpsys keyguard first 20 lines:")
-                for line in lines[:20]:
-                    if line.strip():
-                        print(f"  {line.strip()}")
-            
-            if "mShowing=true" in result:
-                return True
-            if "isShowing=true" in result:
-                return True
-            if "mShowing=false" in result:
-                return False
-        except Exception as e:
-            if verbose:
-                print(f"[ScreenMonitor] dumpsys keyguard failed: {e}")
-        
-        # 方式3: 通过 mWakefulness 和 Display Power State 推断
-        # 注意：这种方式不够准确，仅作为兜底
-        return False
-    
-    # 重新加载配置，确保获取最新的 lock_password
-    try:
-        config = load_config()
-    except Exception as e:
-        print(f"[ScreenMonitor] Failed to reload config: {e}")
-    
-    lock_password = config.get('lock_password', '')
-    if not lock_password:
-        print("[ScreenMonitor] No lock password configured, skipping auto-unlock")
-        print(f"[ScreenMonitor] Config keys: {list(config.keys())}")
-        return
-    
-    print(f"[ScreenMonitor] Starting screen lock monitor (password: {'*' * len(lock_password)})")
-    
-    devices = adbutils.adb.device_list()
-    if not devices:
-        print("[ScreenMonitor] No ADB device found")
-        return
-    device = devices[0]
-    print(f"[ScreenMonitor] Device found: {device.serial}")
-    
-    # 启动宽限期，等待 scrcpy 启动完成
-    grace_cycles = 3
-    debug_printed = False
-    last_locked_state = None
-    
-    while not screen_monitor_stop:
-        try:
-            # 第一次检测时打印详细调试信息
-            verbose = not debug_printed
-            is_locked = check_keyguard_locked(verbose=verbose)
-            if not debug_printed:
-                debug_printed = True
-                print(f"[ScreenMonitor] Initial lock state: is_locked={is_locked}")
-            
-            # 检查电源状态
-            try:
-                power_result = device.shell("dumpsys power | grep 'mWakefulness'")
-                is_asleep = "Asleep" in power_result
-            except:
-                is_asleep = False
-            
-            # 状态变化时打印
-            if is_locked != last_locked_state:
-                print(f"[ScreenMonitor] Lock state changed: {last_locked_state} -> {is_locked}, is_asleep={is_asleep}")
-                last_locked_state = is_locked
-            
-            # 宽限期处理
-            if grace_cycles > 0:
-                grace_cycles -= 1
-                if is_asleep and not is_locked:
-                    print("[ScreenMonitor] Grace period: screen asleep but not locked (normal after startup)")
-                    time.sleep(2)
-                    continue
-            
-            # 如果检测到锁屏
-            if is_locked:
-                print("[ScreenMonitor] Device locked! Attempting to unlock...")
-                time.sleep(0.5)
-                
-                # 1. 唤醒屏幕
-                print("[ScreenMonitor] Waking up screen...")
-                device.shell("input keyevent KEYCODE_WAKEUP")
-                time.sleep(2)
-                
-                # 2. 输入密码
-                print(f"[ScreenMonitor] Inputting password: {'*' * len(lock_password)}")
-                device.shell(f"input text {lock_password}")
-                time.sleep(0.5)
-                
-                # 3. 按回车确认
-                print("[ScreenMonitor] Pressing enter...")
-                device.shell("input keyevent KEYCODE_ENTER")
-                time.sleep(2)
-                
-                # 4. 验证解锁成功
-                keyguard_check = check_keyguard_locked(verbose=True)
-                print(f"[ScreenMonitor] Unlock result: is_locked={keyguard_check}")
-                
-                if not keyguard_check:
-                    print("[ScreenMonitor] ✅ Screen unlocked successfully")
-                    # 5. 解锁成功后，关闭物理屏幕（只关背光，不锁屏）
-                    print("[ScreenMonitor] Turning off physical screen after unlock...")
-                    try:
-                        import scrcpy
-                        _set_screen_power_mode_via_scrcpy_client(scrcpy.POWER_MODE_OFF)
-                    except ImportError:
-                        print("[ScreenMonitor] scrcpy-client not available, skipping screen off")
-                else:
-                    print("[ScreenMonitor] ❌ Unlock may have failed")
-            
-        except Exception as e:
-            print(f"[ScreenMonitor] Error: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        time.sleep(2)  # 每2秒检查一次
-    
-    print("[ScreenMonitor] Screen monitor stopped")
-
-
-def _start_screen_monitor():
-    """启动锁屏监控线程"""
-    global screen_monitor_thread, screen_monitor_stop
-    
-    if screen_monitor_thread and screen_monitor_thread.is_alive():
-        print("[ScreenMonitor] Already running")
-        return
-    
-    screen_monitor_stop = False
-    screen_monitor_thread = threading.Thread(target=_monitor_screen_lock, daemon=True)
-    screen_monitor_thread.start()
-
+# 复用 DisplayManager 单例（锁屏监控唯一实现来源），None=本旧入口从未启动过
+_display_manager = None
 
 def cleanup():
     """Cleanup all displays on exit."""

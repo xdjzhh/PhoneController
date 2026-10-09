@@ -1324,6 +1324,186 @@ def _stop_toolbar_service() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# bootstrap Step 0：最早期优先拉起的两个【外部】后台服务（无窗口、独立项目）
+#   1) HandDetecterForEye\server.py —— Flask，127.0.0.1:8000，启动后自动无预览
+#      跑手势识别（服务自身带单实例锁，重复启动会 exit(2)）；
+#   2) ASR\server.py                —— FastAPI/uvicorn，0.0.0.0:8081，
+#      HTTP 先就绪、模型后台加载，麦克风识别结果默认回调 http://localhost:8080/run
+#      （即本链路稍后启动的 server.py，故必须【先于】它启动）。
+# ASR 无单实例锁，因此启动前一律先 HTTP 探活，已在运行（含用户手动启动的）
+# 就跳过，绝不重复 Popen。两服务与 watcher/toolbar 一样 detached，日志各自落盘。
+# ---------------------------------------------------------------------------
+_AUX_SERVICES: list[dict] = [
+    {
+        "key": "handdetecter",
+        "label": "手势识别 HandDetecter",
+        "script": r"D:\TraeProj\HandDetecterForEye\server.py",
+        "host": "127.0.0.1",
+        "port": 8000,
+        "probe_path": "/status",
+        # mediapipe 模型预热在 Flask 开始服务【之前】同步完成，超时给宽些
+        "ready_timeout_s": 45.0,
+        "log_name": ".vd_aux_handdetecter.log",
+    },
+    {
+        "key": "asr",
+        "label": "语音识别 ASR",
+        "script": r"D:\TraeProj\ASR\server.py",
+        "host": "127.0.0.1",
+        "port": 8081,
+        # /health 在模型加载期也回 200(status=loading)，HTTP 起来即可；
+        # 但 import + uvicorn 监听建立在慢机器/高负载时可能 >20s，给宽到 45s
+        "probe_path": "/health",
+        "ready_timeout_s": 45.0,
+        "log_name": ".vd_aux_asr.log",
+    },
+]
+
+
+def _http_port_answers(host: str, port: int, path: str, *, timeout: float = 1.0) -> bool:
+    """本机 HTTP 探活（显式绕过系统代理）：拿到任意 HTTP 应答即视为端口后有服务。"""
+    import urllib.request as _urllib_request
+    opener = _urllib_request.build_opener(_urllib_request.ProxyHandler({}))
+    try:
+        with opener.open(f"http://{host}:{int(port)}{path}", timeout=timeout) as resp:
+            return 200 <= int(resp.status) < 500
+    except Exception:
+        return False
+
+
+def _tcp_port_open(host: str, port: int, *, timeout: float = 0.5) -> bool:
+    """纯 TCP 连通探测：端口后是否有进程在 listen（不关心协议）。"""
+    import socket as _socket
+    try:
+        with _socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_aux_service(spec: dict) -> Optional[int]:
+    """确保一个外部辅助服务在运行。
+
+      · 探活已应答  → 跳过（可能是用户手动起的/上次 bootstrap 留下的），返回 None；
+      · 脚本缺失/启动失败/提前退出/超时未就绪 → 只告警，返回 None（ASR 超时但
+        进程仍活着时返回 PID：模型后台加载，HTTP 可能稍后就绪）；
+      · 成功新启动并就绪 → 返回新 PID。
+    任何失败都不阻断 bootstrap 主流程（与 Toolbar 服务同策略）。
+    """
+    label = spec["label"]
+    script = _pathlib.Path(spec["script"])
+    host, port = spec["host"], int(spec["port"])
+    probe_path = str(spec.get("probe_path") or "/")
+    timeout_s = float(spec.get("ready_timeout_s", 30.0))
+    log_path = _SCRIPT_DIR / str(spec["log_name"])
+
+    if not script.is_file():
+        print(f"[bootstrap] ⚠️ {label} 脚本不存在：{script}（跳过，不影响主流程）。")
+        return None
+    # 判定顺序必须【TCP 先行】：先最便宜的一次 TCP 连接判断端口是否空闲；
+    # 端口在听才发 HTTP。若先发 HTTP，遇到"接受连接但不讲 HTTP"的占坑程序，
+    # 未 accept 的连接会占满其 backlog，紧随其后的 TCP 探测会误判端口空闲
+    # （曾致 ASR 被强启后 bind 失败——用户看到的"ASR 启动失败"）。
+    port_open = _tcp_port_open(host, port)
+    if port_open and _http_port_answers(host, port, probe_path):
+        print(f"[bootstrap] ✅ {label} 已在运行 http://{host}:{port}（跳过，不重复启动）。")
+        return None
+    if port_open:
+        # 端口在听但 HTTP 不应答 = 被【其他程序】占用（ASR 无单实例锁，强启
+        # 只会 uvicorn bind 10048 后崩溃）。不启、报清。
+        print(f"[bootstrap] ⚠️ {label} 端口 {host}:{port} 已被其他程序监听"
+              f"（HTTP {probe_path} 无应答）。为避免重复启动崩溃，本次不启动；"
+              f"请停止占用程序后重试。")
+        return None
+
+    print(f"[bootstrap] 🚀 优先启动 {label}：{script}")
+    print(f"           监听 http://{host}:{port}，日志 ./{log_path.name}")
+    # detached + stdout 重定向到文件时，子进程 Python 默认按系统 ANSI 代码页
+    # (cp936/GBK) 编码 stdout；ASR server.py main() 第一行就 print emoji（🎤），
+    # GBK 无法编码 → UnicodeEncodeError 在 uvicorn 启动前直接崩溃（2026-10-07
+    # 实测"ASR 启动失败"根因）。HandDetecter 因 app_log 把 sys.stdout 换成
+    # utf-8 Tee 而幸免，但不能依赖每个外部项目都自救——统一在此注入 UTF-8：
+    #   PYTHONIOENCODING=utf-8 → 强制 sys.stdin/out/err 编码；
+    #   PYTHONUTF8=1           → 解释器 UTF-8 模式兜底 open/默认编码。
+    child_env = dict(_os.environ)
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
+    try:
+        log_fp = open(log_path, "a", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            env=child_env,
+            stdout=log_fp, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        )
+    except Exception as e:
+        print(f"[bootstrap] ⚠️ {label} 启动失败（不影响主流程）: {e!r}")
+        return None
+
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        rc = proc.poll()
+        if rc is not None:
+            # HandDetecter 单实例锁拦截时会 exit(2)：属"已在跑"，提示但不算主流程失败；
+            # ASR 无单实例锁，端口被占会 code!=0 崩溃——把日志尾部打出来，真因一目了然。
+            tail = ""
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-900:]
+            except Exception:
+                pass
+            print(f"[bootstrap] ⚠️ {label} 进程提前退出 code={rc}"
+                  f"（常见于单实例锁=已有同名服务，或端口被占 bind 失败；日志尾部如下）：")
+            if tail.strip():
+                for _ln in tail.strip().splitlines()[-12:]:
+                    print(f"    | {_ln}")
+            return None
+        if _http_port_answers(host, port, probe_path):
+            print(f"[bootstrap] ✅ {label} 已就绪 PID={proc.pid} http://{host}:{port}。")
+            return proc.pid
+        _time.sleep(0.6)
+    print(f"[bootstrap] ⚠️ {label} {timeout_s:.0f}s 内未应答 HTTP"
+          f"（PID={proc.pid} 仍在后台运行，详见 {log_path.name}；不影响主流程）。")
+    return proc.pid
+
+
+# 外部辅助服务命令行精准特征（独立项目路径，区别于主项目 Open-AutoGLM\server.py）。
+# stop 时凭此在 state 缺失/PID 失配时兜底定位（只查 python*.exe）。
+_AUX_CMDLINE_PATTERNS = {
+    "handdetecter": _re.compile(r"[\\/]HandDetecterForEye[\\/]server\.py(?:\s|$)"),
+    "asr": _re.compile(r"[\\/]ASR[\\/]server\.py(?:\s|$)"),
+}
+
+
+def _stop_aux_services(st: dict) -> None:
+    """关闭 bootstrap Step 0 拉起的两个外部辅助服务。
+
+    双路径：state 里的 aux_*_pid（本次 bootstrap 新启动）优先；再用命令行精准
+    特征兜底（state 被清 / 用户手动启动 / PID 失配）。ASR 有 uvicorn 子进程，
+    一律 taskkill /T 整树结束。先于主 server 命令行兜底清扫执行，避免外部
+    server.py 被误归为 residual-server。"""
+    for spec in _AUX_SERVICES:
+        key = spec["key"]
+        label = spec["label"]
+        killed = 0
+        pid = st.get(f"aux_{key}_pid")
+        if isinstance(pid, int) and _pid_alive(pid):
+            if _taskkill_tree(pid, label=f"aux-{key}"):
+                killed += 1
+        pat = _AUX_CMDLINE_PATTERNS.get(key)
+        if pat is not None:
+            for cpid in _find_project_pids_by_cmdline({key: pat}).get(key, []):
+                if _pid_alive(cpid) and _taskkill_tree(cpid, label=f"residual-aux-{key}"):
+                    killed += 1
+        if killed:
+            print(f"[stop] {label}（http://{spec['host']}:{spec['port']}）"
+                  f"已停止：{killed} 个进程（含子进程整树）。", flush=True)
+        else:
+            print(f"[stop] {label} 未在运行。", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # 手机连接窗口（macOS 登录风）：bootstrap 首次检测手机不可达时弹出。
 #   · 输入手机局域网 IP（可不带端口，默认 5555）或留空仅重试 USB；
 #   · 连接在后台线程执行（adb connect 最长十余秒），界面不卡死；
@@ -2489,6 +2669,10 @@ def do_stop(args) -> int:
          · watcher（virtual_desktop.py watch，detached）… state PID + 命令行兜底；
          · Toolbar 服务（virtual_desktop.py toolbar，detached）… state PID 优先、
            同域 .vd_toolbar.pid 文件兜底，一个进程托管各虚拟桌面的底部 Dock；
+         · 外部辅助服务（bootstrap Step 0 最先启动，独立项目 detached）…
+           HandDetecterForEye\server.py(127.0.0.1:8000 手势识别) 与
+           ASR\server.py(:8081 语音识别)：state aux_*_pid 优先、独立路径命令行
+           特征兜底，taskkill /T 整树结束（ASR 带 uvicorn 子进程）；
          · server.py（py launcher + python 树）…… CTRL_C 优雅退出，超时强杀 /T；
          · 主桌面 backdrop（qt_backdrop.py 的 multiprocessing spawn 子进程，内含
            Backdrop/通知/思考 3 个窗口）… server finally 会 stop，再用 state 中
@@ -2551,6 +2735,11 @@ def do_stop(args) -> int:
             _taskkill_tree(int(toolbar_pid), label="toolbar")
             print(f"[stop] Toolbar 服务 PID={toolbar_pid} 已停止（各桌面底部 Dock 消失）。",
                   flush=True)
+
+        # ---- 2.5) Step 0 外部辅助服务：手势识别(8000) + ASR(8081) ----
+        #   必须先于下面 4a 的命令行兜底清扫：外部 server.py 的命令行也会被
+        #   _STOP_CMDLINE_PATTERNS["server"] 命中，先在本步按专属 label 干净关闭。
+        _stop_aux_services(st)
 
         # ---- 3) CTRL_C 优雅停 server.py；失败/超时回退整树强杀 ----
         if _pid_alive(server_pid):
@@ -2735,6 +2924,14 @@ def do_status(args) -> int:
           f"{'🟢 运行中' if _pid_alive(st.get('server_pid')) else '⚪ 已退出'} → 桌面 #{st.get('server_desktop')}")
     print(f"  watcher       : PID={st.get('watcher_pid')} "
           f"{'🟢 运行中' if _pid_alive(st.get('watcher_pid')) else '⚪ 已退出'}")
+    # Step 0 外部辅助服务：以端口实时探活为准（PID 仅在本次 bootstrap 新启动时登记）
+    for _aux in _AUX_SERVICES:
+        _pid = st.get(f"aux_{_aux['key']}_pid")
+        _up = _http_port_answers(_aux["host"], _aux["port"], _aux["probe_path"])
+        _pid_txt = (f"PID={_pid} " if _pid else ("外部实例 " if _up else ""))
+        print(f"  {_aux['label']} : {_pid_txt}"
+              f"{'🟢 运行中' if _up else '⚪ 未运行'}"
+              f"（http://{_aux['host']}:{_aux['port']}）")
     tb_pid = _read_pid_file(_pathlib.Path(_TOOLBAR_PID_FILE))
     print(f"  Toolbar 服务  : "
           f"{('PID=' + str(tb_pid) + ' 🟢 运行中') if tb_pid and _pid_alive(tb_pid) else '⚪ 未运行'}"
@@ -2784,6 +2981,15 @@ def do_bootstrap(args) -> int:
     )
     print("-" * 64)
 
+    # Step 0: 【最优先】先于一切启动两个外部后台服务：
+    #   手势识别 HandDetecter(8000) → 语音识别 ASR(8081)。ASR 识别结果回调
+    #   127.0.0.1:8080/run（主 server.py 在后面 Step 2 才启动），故必须先起；
+    #   已在运行则跳过（幂等），任何失败只告警、不阻断后续 bootstrap。
+    aux_pids: dict[str, Optional[int]] = {}
+    for _aux_spec in _AUX_SERVICES:
+        aux_pids[_aux_spec["key"]] = _ensure_aux_service(_aux_spec)
+    print("-" * 64)
+
     # Step 1: 最先拉起 Toolbar 常驻服务（登录窗/手机检测之前）：
     #   底部 Dock（含键盘钮）在登录阶段就可用；独立进程不被模态登录窗屏蔽点击。
     #   取消登录 → 本函数下方停服务并关 osk；登入成功 → 跟随 server 周期（stop 收尾）。
@@ -2819,6 +3025,13 @@ def do_bootstrap(args) -> int:
         if not phone_ok:
             print("[bootstrap] ❌ 已取消手机连接，中止 bootstrap（server.py 未启动）。")
             _stop_toolbar_service()
+            # 回滚 Step 0：只停【本次新启动】的辅助服务（aux_pids 非 None），
+            # 启动前就已存在的外部实例不动。
+            for _aux_spec in _AUX_SERVICES:
+                _aux_pid = aux_pids.get(_aux_spec["key"])
+                if isinstance(_aux_pid, int) and _pid_alive(_aux_pid):
+                    _taskkill_tree(_aux_pid, label=f"aux-{_aux_spec['key']}")
+                    print(f"[bootstrap] 已回滚停止 {_aux_spec['label']} PID={_aux_pid}。")
             try:
                 _pathlib.Path(_TOOLBAR_PID_FILE).unlink(missing_ok=True)
             except Exception:
@@ -3022,6 +3235,10 @@ def do_bootstrap(args) -> int:
             # Toolbar 是 vd 自己 Step 1 拉起的进程，PID 直接登记（其自写的
             # .vd_toolbar.pid 仅作同域单实例锁与 stop 回退）。
             "toolbar_pid": toolbar_pid,
+            # Step 0 最优先拉起的外部服务：None=已在运行的外部实例/启动失败，
+            # 仅作 status 可观测；两者独立常驻，stop 不回收。
+            "aux_handdetecter_pid": aux_pids.get("handdetecter"),
+            "aux_asr_pid": aux_pids.get("asr"),
             # server 域 multiprocessing 孩子，经 HTTP /status 获取（见上）
             "backdrop_pid": backdrop_pid,
             # Toolbar 服务调 server HTTP 接口（设置→编辑模式）所需地址

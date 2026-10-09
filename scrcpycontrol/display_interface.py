@@ -13,6 +13,7 @@ Features:
 import atexit
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -76,6 +77,15 @@ class DisplayManager:
         self._screen_monitor_thread = None
         self._screen_monitor_stop = False
         self._screen_monitor_running = False
+
+        # 启动孤儿回收：本机任何 scrcpy 启动前，清掉设备端上一轮残留的
+        # scrcpy server / --new-display 僵尸虚拟屏（每进程只执行一次）
+        self._orphans_reaped = False
+
+        # 全局布局编辑模式（Dock 齿轮）：开启时所有 scrcpy 卡片
+        # （主屏 + 天气/地图等 app 卡片）显示红绿灯与缩放热区。
+        # 晚启动的卡片在 register_window 后读取此状态继承外观。
+        self._global_edit_mode = False
 
         # Navigation monitor for map auto-zoom
         self._nav_monitor = None
@@ -239,6 +249,10 @@ class DisplayManager:
             print(f"[DisplayManager] ⚠️  {msg}", flush=True)
             return {"success": False, "error": msg, "need_device": True}
 
+        # 启动主屏前先回收上一轮残留的孤儿 scrcpy server / 僵尸虚拟屏
+        # （内部有每进程一次的开关，与卡片路径共用同一次回收）
+        self._reap_orphan_scrcpy_once()
+
         cfg = self.load_config()
         main_cfg = cfg.get("main_display", {})
 
@@ -339,9 +353,48 @@ class DisplayManager:
             self._main_display_running = False
             time.sleep(0.5)
 
+    def _reap_orphan_scrcpy_once(self):
+        """启动任何本机 scrcpy 之前，回收设备端上一轮残留的孤儿 scrcpy。
+
+        泄漏场景：PC 端被硬杀（taskkill /F、断电）、WiFi adb TCP 半开、
+        系统 ANR → 设备端 scrcpy server 收不到客户端断连而常驻，其
+        --new-display VirtualDisplay 随之变成僵尸块（实测 mDisplayId=7396，
+        rootTasks=0 且 isKeyguardShowing 恒为 true，还会污染锁屏判定）。
+
+        此刻（bootstrap 早期、本进程尚未启动任何 scrcpy）设备上若还存在
+        scrcpy server，必属上一轮残留 → 全部 kill -9，VD 由 binder death
+        触发 system_server 回收。每个进程只执行一次；无设备/异常均静默跳过。
+        """
+        if self._orphans_reaped:
+            return
+        self._orphans_reaped = True
+        if not self.device_serial:
+            return
+        try:
+            from .multi_virtualdisplay import _get_device, reap_orphan_scrcpy
+            device = _get_device(self.device_serial)
+            if device is None:
+                return
+            result = reap_orphan_scrcpy(device)
+            if result["killed"] or result["displays_before"]:
+                print(
+                    f"[DisplayManager] ♻️ 启动前回收孤儿 scrcpy："
+                    f"设备端 kill {len(result['killed'])} 个进程"
+                    f"（{result['killed']}），残留虚拟屏 "
+                    f"{result['displays_before']} → {result['displays_after']}",
+                    flush=True)
+                if result["displays_after"]:
+                    print("[DisplayManager] ⚠️ 部分虚拟屏 kill 后仍未消失"
+                          "（可能需重启手机/SystemUI 释放）", flush=True)
+        except Exception as e:
+            print(f"[DisplayManager] orphan scrcpy reap skipped: {e}", flush=True)
+
     def _get_multi_display(self):
         """Get or create MultiVirtualDisplay instance."""
         if self._multi_display is None:
+            # 首个卡片启动前同样先回收孤儿（覆盖 default_load=false、
+            # 主屏未启动但直接开卡片的路径）
+            self._reap_orphan_scrcpy_once()
             self._multi_display = MultiVirtualDisplay(
                 device_serial=self.device_serial,
                 scrcpy_path=self.scrcpy_path,
@@ -837,65 +890,85 @@ class DisplayManager:
 
     def _is_keyguard_locked(self, device=None, verbose=False):
         """
-        Check if the keyguard (lock screen) is showing.
-
-        Args:
-            device: adbutils device object. Auto-detected if None.
-            verbose: Print debug info.
+        Check if the keyguard (lock screen) is showing on the DEFAULT display.
 
         Returns:
             True if locked, False if unlocked.
+
+        注意：旧实现用 `dumpsys window | grep -i keyguard` 后做全局子串匹配。
+        但完整 dumpsys 里：
+          1) DISPLAY CONTENTS 会 dump 两遍，第一遍包含 scrcpy 创建的虚拟屏，
+             其 DisplayPolicy 恒报 isKeyguardShowing=true；
+          2) 同一遍里主屏还会残留 mDreamingLockscreen=true 的过期值。
+        手机实际已解锁时，输出里仍然存在 isKeyguardShowing=true，于是误判
+        为锁定并反复"解锁"，形成死循环。
+        修复：用 `dumpsys window displays`（只含系统屏），并只解析
+        mDisplayId=0 块内的状态；再以 policy 中 KeyguardStateMonitor 兜底。
         """
         if device is None:
             device = self._get_adb_device()
         if device is None:
             return False
 
-        # Method 1: dumpsys window (most reliable)
+        # Method 1: 默认屏 DisplayPolicy 状态（最可靠）
         try:
-            result = device.shell("dumpsys window | grep -i keyguard")
+            result = device.shell("dumpsys window displays")
+            block = self._extract_display_block(result, 0)
             if verbose:
-                print(f"[ScreenMonitor] dumpsys window keyguard:\n{result}")
-
-            if "isKeyguardShowing=true" in result:
-                return True
-            if "mIsShowing=true" in result:
-                return True
-            for line in result.split('\n'):
-                line = line.strip()
-                if line.startswith('showing=') and 'showing=true' in line:
-                    return True
-                if line == 'showing=true':
-                    return True
-
-            if "isKeyguardShowing=false" in result:
-                return False
-            if "mIsShowing=false" in result:
-                return False
+                print("[ScreenMonitor] default display keyguard lines:")
+                key_lines = [ln for ln in block.splitlines()
+                             if "keyguard" in ln.lower()]
+                for ln in key_lines or block.splitlines()[:0]:
+                    print(f"  {ln.strip()}")
+            state = self._parse_keyguard_state(block)
+            if state is not None:
+                return state
         except Exception as e:
-            print(f"[ScreenMonitor] dumpsys window keyguard failed: {e}")
+            print(f"[ScreenMonitor] dumpsys window displays failed: {e}")
 
-        # Method 2: dumpsys keyguard
+        # Method 2: 全局 KeyguardStateMonitor（KeyguardService 单一实例状态，
+        # 不随显示块重复，本机 dumpsys keyguard 服务不存在，故从 policy 取）
         try:
-            result = device.shell("dumpsys keyguard")
-            if verbose:
-                lines = result.strip().split('\n')
-                print(f"[ScreenMonitor] dumpsys keyguard first 20 lines:")
-                for line in lines[:20]:
-                    if line.strip():
-                        print(f"  {line.strip()}")
-
-            if "mShowing=true" in result:
-                return True
-            if "isShowing=true" in result:
-                return True
-            if "mShowing=false" in result:
-                return False
+            result = device.shell("dumpsys window policy")
+            match = re.search(r"KeyguardStateMonitor\s*\n\s*mIsShowing=(true|false)",
+                              result)
+            if match:
+                return match.group(1) == "true"
         except Exception as e:
             if verbose:
-                print(f"[ScreenMonitor] dumpsys keyguard failed: {e}")
+                print(f"[ScreenMonitor] dumpsys window policy failed: {e}")
 
         return False
+
+    @staticmethod
+    def _extract_display_block(dumpsys_text: str, display_id: int) -> str:
+        """从 dumpsys window displays 文本中切出指定 mDisplayId 的块
+        （到下一个 'Display:' 行为止；找不到返回空串）。"""
+        lines = dumpsys_text.splitlines()
+        start = None
+        for i, line in enumerate(lines):
+            if re.match(rf"\s*Display:\s+mDisplayId={display_id}\b", line):
+                start = i
+                break
+        if start is None:
+            return ""
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if re.match(r"\s*Display:\s+mDisplayId=", lines[j]):
+                end = j
+                break
+        return "\n".join(lines[start:end])
+
+    @staticmethod
+    def _parse_keyguard_state(display_block: str):
+        """从单个 Display 块中解析锁屏状态；找不到返回 None。"""
+        for pattern in (r"\bisKeyguardShowing=(true|false)",
+                        r"\bmIsShowing=(true|false)"):
+            for line in display_block.splitlines():
+                match = re.search(pattern, line)
+                if match:
+                    return match.group(1) == "true"
+        return None
 
     def _get_window_title_for_app(self, app_package):
         """Get window title for an app virtual display (alias for _get_window_title)."""
@@ -1397,14 +1470,30 @@ class DisplayManager:
             Dict with success status.
         """
         from front.card_window import get_card_window_decorator
+        decorator = get_card_window_decorator()
 
+        # 全局开关（Dock 齿轮，app_package 缺省/"main"）：一次切换【所有】已注册
+        # 卡片——主屏与天气/地图等 app 卡片都注册在同一个 decorator 上。
+        # 历史上这里只切主屏，导致齿轮只能控制 maindisplay（notif/thinking 由
+        # server 路由额外联动 backdrop），天气和地图卡片永远不显示红绿灯。
         if app_package is None or app_package == "main":
-            cfg = self.load_config()
-            title = cfg.get("main_display", {}).get("window_title", "手机桌面")
-            display_obj = self._main_display
-        else:
-            title = self._get_window_title_for_app(app_package)
-            display_obj = self._app_display_map.get(app_package)
+            try:
+                self._global_edit_mode = bool(editing)
+                count = decorator.set_all_edit_mode(editing)
+                return {
+                    "success": True,
+                    "scope": "all",
+                    "window_count": count,
+                    "editing": editing,
+                    "message": f"Global edit mode {'ON' if editing else 'OFF (pinned)'} "
+                               f"for {count} window(s)",
+                }
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+        # 单卡片路径：仅切换指定 app 卡片
+        title = self._get_window_title_for_app(app_package)
+        display_obj = self._app_display_map.get(app_package)
 
         if not display_obj:
             return {"success": False, "error": f"Display not found for: {app_package}"}
@@ -1416,7 +1505,6 @@ class DisplayManager:
             return {"success": False, "error": f"Window not found: {title}"}
 
         try:
-            decorator = get_card_window_decorator()
             decorator.set_edit_mode(hwnd, editing)
             return {
                 "success": True,
@@ -1451,6 +1539,8 @@ class DisplayManager:
         grace_cycles = 3
         debug_printed = False
         last_locked_state = None
+        # 连续解锁失败计数：用于指数退避，避免每 2s 一轮唤醒/输密码的刷屏式死循环
+        failed_unlock_streak = 0
 
         while not self._screen_monitor_stop:
             try:
@@ -1469,6 +1559,9 @@ class DisplayManager:
                 if is_locked != last_locked_state:
                     print(f"[ScreenMonitor] Lock state changed: {last_locked_state} -> {is_locked}, is_asleep={is_asleep}")
                     last_locked_state = is_locked
+
+                if not is_locked:
+                    failed_unlock_streak = 0
 
                 if grace_cycles > 0:
                     grace_cycles -= 1
@@ -1552,14 +1645,18 @@ class DisplayManager:
                             import traceback
                             traceback.print_exc()
                     else:
-                        print("[ScreenMonitor] Unlock may have failed - retrying on next cycle")
+                        failed_unlock_streak += 1
+                        backoff_s = min(2 * (2 ** failed_unlock_streak), 60)
+                        print(f"[ScreenMonitor] Unlock may have failed - next retry "
+                              f"in {backoff_s}s (consecutive failures: {failed_unlock_streak})")
 
             except Exception as e:
                 print(f"[ScreenMonitor] Error: {e}")
                 import traceback
                 traceback.print_exc()
 
-            time.sleep(2)
+            cycle_delay = min(2 * (2 ** failed_unlock_streak), 60) if failed_unlock_streak else 2
+            time.sleep(cycle_delay)
 
         print("[ScreenMonitor] Screen monitor stopped")
         self._screen_monitor_running = False

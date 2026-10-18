@@ -113,11 +113,31 @@ class ActionHandler:
         return handlers.get(action_name)
 
     def _convert_relative_to_absolute(
-        self, element: list[int], screen_width: int, screen_height: int
+        self, element: list[int], screen_width: int, screen_height: int,
+        label: str = "point",
     ) -> tuple[int, int]:
-        """Convert relative coordinates (0-1000) to absolute pixels."""
-        x = int(element[0] / 1000 * screen_width)
-        y = int(element[1] / 1000 * screen_height)
+        """Convert model coordinates to absolute device pixels.
+
+        协议要求模型给 0~999 相对坐标；但实测部分视觉模型（如 glm-5.3-flash）
+        会直接输出【截图像素坐标】（1920x1080 横屏下 [542,980] 这类值），
+        再乘一次 /1000 会让点击落点偏移近一倍（导航按钮就是这样点不中的）。
+        任一维 >999 时像素意图是确定的（相对坐标不可能出现），此时按像素
+        坐标直接使用并裁剪到屏幕范围内；≤999 仍按协议相对坐标换算。
+        """
+        rx, ry = element[0], element[1]
+        if rx > 999 or ry > 999:
+            x = max(0, min(int(rx), screen_width - 1))
+            y = max(0, min(int(ry), screen_height - 1))
+            print(f"[ActionHandler] {label}: 模型输出疑似像素坐标 {[rx, ry]} "
+                  f"（截图 {screen_width}x{screen_height}）→ 直接按像素落点 ({x},{y})",
+                  flush=True)
+            return x, y
+
+        x = round(rx / 1000 * screen_width)
+        y = round(ry / 1000 * screen_height)
+        print(f"[ActionHandler] {label}: 相对坐标 {[rx, ry]} "
+              f"（截图 {screen_width}x{screen_height}）→ 像素落点 ({x},{y})",
+              flush=True)
         return x, y
 
     def _handle_launch(self, action: dict, width: int, height: int) -> ActionResult:
@@ -329,7 +349,7 @@ class ActionHandler:
         if not element:
             return ActionResult(False, False, "No element coordinates")
 
-        x, y = self._convert_relative_to_absolute(element, width, height)
+        x, y = self._convert_relative_to_absolute(element, width, height, label="tap")
 
         # Check for sensitive operation
         if "message" in action:
@@ -341,6 +361,8 @@ class ActionHandler:
                 )
 
         device_factory = get_device_factory()
+        print(f"[ActionHandler] tap → display="
+              f"{device_factory.active_display_id or 'main(0)'} ({x},{y})", flush=True)
         device_factory.tap(x, y, self.device_id)
         return ActionResult(True, False)
 
@@ -376,10 +398,15 @@ class ActionHandler:
         if not start or not end:
             return ActionResult(False, False, "Missing swipe coordinates")
 
-        start_x, start_y = self._convert_relative_to_absolute(start, width, height)
-        end_x, end_y = self._convert_relative_to_absolute(end, width, height)
+        start_x, start_y = self._convert_relative_to_absolute(
+            start, width, height, label="swipe-start")
+        end_x, end_y = self._convert_relative_to_absolute(
+            end, width, height, label="swipe-end")
 
         device_factory = get_device_factory()
+        print(f"[ActionHandler] swipe → display="
+              f"{device_factory.active_display_id or 'main(0)'} "
+              f"({start_x},{start_y})→({end_x},{end_y})", flush=True)
         device_factory.swipe(start_x, start_y, end_x, end_y, device_id=self.device_id)
         return ActionResult(True, False)
 
@@ -527,6 +554,70 @@ class ActionHandler:
         print(f"{message}\n(no manual wait, continuing to next screenshot)")
 
 
+# 模型输出里动作调用的起始位置（do( / finish(，排除 my_do( 这类前缀误匹配）
+_ACTION_CALL_RE = re.compile(r"(?<![A-Za-z0-9_])(do|finish)\s*\(")
+
+
+def _extract_action_call(raw: str) -> str | None:
+    """从可能夹带噪声的模型输出中提取完整的 do(...) / finish(...) 调用串。
+
+    更换模型后输出常带包装，例如尾部 ``</answer>`` 标签、```python 代码围栏、
+    <answer> 标签或前后解释性文字。这里用【字符串感知】的括号配对扫描定位完整
+    调用——参数文本里出现括号（如 text="打开（设置）"）也不会截断。
+    提取不到完整调用时返回 None。
+    """
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+
+    # 去掉 ```python ... ``` / ``` ... ``` 代码围栏（无闭合围栏则回退全文搜索）
+    fence = re.search(r"```(?:[A-Za-z0-9_+-]*)?\s*(.*?)```", text, flags=re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+
+    m = _ACTION_CALL_RE.search(text)
+    if not m:
+        return None
+    start = m.start()
+
+    # 从调用左括号起做字符串感知的括号配对
+    depth = 0
+    quote = None       # 非 None 表示当前位于字符串内，值为引号字符（' 或 "）
+    triple = False     # 当前字符串是否为三引号
+    j = m.end() - 1    # m 的末尾即 '('
+    while j < len(text):
+        ch = text[j]
+        if quote is not None:
+            if triple:
+                if text.startswith(quote * 3, j):
+                    quote, triple = None, False
+                    j += 3
+                    continue
+            else:
+                if ch == "\\":
+                    j += 2  # 跳过转义对，避免 \" 提前闭合字符串
+                    continue
+                if ch == quote:
+                    quote = None
+            j += 1
+            continue
+
+        if ch in ("'", '"'):
+            triple = text.startswith(ch * 3, j)
+            quote = ch
+            if triple:
+                j += 3
+                continue
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:j + 1].strip()
+        j += 1
+    return None  # 括号未闭合
+
+
 def parse_action(response: str) -> dict[str, Any]:
     """
     Parse action from model response.
@@ -541,48 +632,51 @@ def parse_action(response: str) -> dict[str, Any]:
         ValueError: If the response cannot be parsed.
     """
     print(f"Parsing action: {response}")
-    try:
-        response = response.strip()
-        if response.startswith('do(action="Type"') or response.startswith(
-            'do(action="Type_Name"'
-        ):
-            text = response.split("text=", 1)[1][1:-2]
-            action = {"_metadata": "do", "action": "Type", "text": text}
-            return action
-        elif response.startswith("do"):
-            # Use AST parsing instead of eval for safety
+    raw = (response or "").strip()
+    if not raw:
+        raise ValueError("Action response is empty (model returned no do()/finish())")
+
+    # 先剥离模型可能附加的 XML 标签 / 代码围栏 / 解释文字，只留动作调用本身
+    call_text = _extract_action_call(raw)
+    if call_text is None:
+        snippet = raw if len(raw) <= 200 else raw[:200] + "…"
+        raise ValueError(f"No do()/finish() call found in action response: {snippet!r}")
+
+    if call_text.startswith('do(action="Type"') or call_text.startswith(
+        'do(action="Type_Name"'
+    ):
+        text = call_text.split("text=", 1)[1][1:-2]
+        return {"_metadata": "do", "action": "Type", "text": text}
+
+    if call_text.startswith("do"):
+        # Use AST parsing instead of eval for safety
+        # Escape special characters (newlines, tabs, etc.) for valid Python syntax
+        escaped = call_text.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        try:
+            tree = ast.parse(escaped, mode="eval")
+        except SyntaxError as e:
+            raise ValueError(f"Failed to parse do() action {call_text!r}: {e}") from e
+        if not isinstance(tree.body, ast.Call):
+            raise ValueError(f"Expected a function call, got: {call_text!r}")
+
+        # Extract keyword arguments safely
+        action = {"_metadata": "do"}
+        for keyword in tree.body.keywords:
+            key = keyword.arg
             try:
-                # Escape special characters (newlines, tabs, etc.) for valid Python syntax
-                response = response.replace('\n', '\\n')
-                response = response.replace('\r', '\\r')
-                response = response.replace('\t', '\\t')
-
-                tree = ast.parse(response, mode="eval")
-                if not isinstance(tree.body, ast.Call):
-                    raise ValueError("Expected a function call")
-
-                call = tree.body
-                # Extract keyword arguments safely
-                action = {"_metadata": "do"}
-                for keyword in call.keywords:
-                    key = keyword.arg
-                    value = ast.literal_eval(keyword.value)
-                    action[key] = value
-
-                return action
-            except (SyntaxError, ValueError) as e:
-                raise ValueError(f"Failed to parse do() action: {e}")
-
-        elif response.startswith("finish"):
-            action = {
-                "_metadata": "finish",
-                "message": response.replace("finish(message=", "")[1:-2],
-            }
-        else:
-            raise ValueError(f"Failed to parse action: {response}")
+                action[key] = ast.literal_eval(keyword.value)
+            except ValueError as e:
+                raise ValueError(
+                    f"Failed to parse argument {key!r} in {call_text!r}: {e}") from e
         return action
-    except Exception as e:
-        raise ValueError(f"Failed to parse action: {e}")
+
+    if call_text.startswith("finish"):
+        return {
+            "_metadata": "finish",
+            "message": call_text.replace("finish(message=", "")[1:-2],
+        }
+
+    raise ValueError(f"Unsupported action call: {call_text!r}")
 
 
 def do(**kwargs) -> dict[str, Any]:

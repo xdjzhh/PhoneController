@@ -94,9 +94,15 @@ def tap(
 
     input_cmd = _get_input_cmd(device_id, display_id)
 
-    subprocess.run(
+    result = subprocess.run(
         input_cmd + ["tap", str(x), str(y)], capture_output=True
     )
+    err = (result.stderr or b"").decode("utf-8", "replace").strip() if result.stderr else ""
+    if result.returncode != 0 or err:
+        # 典型：-d 指定的虚拟 display id 已失效 / 注入被系统拒绝。
+        # 以前这里静默吞掉，日志上表现为"点了没反应"且无法定位。
+        print(f"[adb.input] tap failed display={display_id or 0} ({x},{y}) "
+              f"rc={result.returncode} err={err!r}", flush=True)
     time.sleep(delay)
 
 

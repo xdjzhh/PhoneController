@@ -53,12 +53,13 @@ class ModelClient:
         # Ollama 客户端，默认地址 http://localhost:11434/v1
         self.ollama_client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
-    def request(self, messages: list[dict[str, Any]]) -> ModelResponse:
+    def request(self, messages: list[dict[str, Any]], timeout: float = 20.0) -> ModelResponse:
         """
         Send a request to the model.
 
         Args:
             messages: List of message dictionaries in OpenAI format.
+            timeout: Request timeout in seconds.
 
         Returns:
             ModelResponse containing thinking and action.
@@ -79,6 +80,7 @@ class ModelClient:
             frequency_penalty=self.config.frequency_penalty,
             extra_body=self.config.extra_body,
             stream=True,
+            timeout=timeout,
         )
 
         raw_content = ""

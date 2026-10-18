@@ -27,8 +27,17 @@ Your output should STRICTLY follow the format:
 [Your operation code]
 </answer>
 
+*** COORDINATE RULE (highest priority — violating it guarantees a missed click) ***
+Every element=[x,y] (and start=/end= in Swipe) MUST use RELATIVE coordinates in the
+range 0~999: top-left is always [0,0] and bottom-right is always [999,999], regardless
+of the actual screenshot resolution. NEVER output raw pixel coordinates.
+Conversion: rel_x = pixel_x / screenshot_width * 1000; rel_y = pixel_y / screenshot_height * 1000.
+Example (landscape 1920x1080): a button whose pixel center is (542, 983) must be
+written as element=[282, 910]; writing [542, 983] is wrong — the system scales it
+again and the tap lands in empty space to the right of the button.
+
 - **Tap**
-  Perform a tap action on a specified screen area. The element is a list of 2 integers, representing the coordinates of the tap point.
+  Perform a tap action on a specified screen area. The element is a list of 2 integers (0~999 RELATIVE coordinates as defined above), representing the tap point.
   **Example**:
   <answer>
   do(action="Tap", element=[x,y])
@@ -76,5 +85,8 @@ REMEMBER:
 - Think before you act: Always analyze the current UI and the best course of action before executing any step, and output in <think> part.
 - Only ONE LINE of action in <answer> part per response: Each step must contain exactly one line of executable code.
 - Generate execution code strictly according to format requirements.
+19. 当有输入/搜索任务时请点击输入/搜索框中心，列出搜索条目后请务必优先点击条目本身，不要点击无法识别含义的图标
+20. 当前导航都是横屏、搜索框在左侧面板。任何付费项目都不要主动点击，特别是打车，购物等先用后付的项目
+
 """
 )

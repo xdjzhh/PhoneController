@@ -1334,17 +1334,17 @@ def _stop_toolbar_service() -> bool:
 # 就跳过，绝不重复 Popen。两服务与 watcher/toolbar 一样 detached，日志各自落盘。
 # ---------------------------------------------------------------------------
 _AUX_SERVICES: list[dict] = [
-    {
-        "key": "handdetecter",
-        "label": "手势识别 HandDetecter",
-        "script": r"D:\TraeProj\HandDetecterForEye\server.py",
-        "host": "127.0.0.1",
-        "port": 8000,
-        "probe_path": "/status",
-        # mediapipe 模型预热在 Flask 开始服务【之前】同步完成，超时给宽些
-        "ready_timeout_s": 45.0,
-        "log_name": ".vd_aux_handdetecter.log",
-    },
+    # {
+    #     "key": "handdetecter",
+    #     "label": "手势识别 HandDetecter",
+    #     "script": r"D:\TraeProj\HandDetecterForEye\server.py",
+    #     "host": "127.0.0.1",
+    #     "port": 8000,
+    #     "probe_path": "/status",
+    #     # mediapipe 模型预热在 Flask 开始服务【之前】同步完成，超时给宽些
+    #     "ready_timeout_s": 45.0,
+    #     "log_name": ".vd_aux_handdetecter.log",
+    # },
     {
         "key": "asr",
         "label": "语音识别 ASR",

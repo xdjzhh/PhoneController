@@ -14,7 +14,7 @@ port: 8080
 
 # 模型 API
 base_url: https://open.bigmodel.cn/api/paas/v4
-model: autoglm-phone
+model: glm-5.3-flash
 apikey: "cae66fb0786343ee9e078a00ec683721.3HmwuIx9d5Vf22DD"
 
 # 启动行为开关

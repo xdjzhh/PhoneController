@@ -20,13 +20,13 @@ virtual_desktop.py  —  Windows 10 / 11 虚拟桌面管理脚本（零额外配
        差异，避免自己手写 IServiceProvider + IVirtualDesktopManagerInternal 两套接口。）
 
 CLI 用法（都可直接双击或命令行调用）：
-  python virtual_desktop.py bootstrap [--phoneaddress HOST:PORT]
+  python virtualdesk/virtual_desktop.py bootstrap [--phoneaddress HOST:PORT]
         # 不建虚拟桌面：在【当前桌面】等 ADB（最长 5min）→ 启 server.py 手机布局
-  python virtual_desktop.py uu-open
+  python virtualdesk/virtual_desktop.py uu-open
         # Dock「电脑」按钮调用：有 UU 桌面只切换；没有则新建桌面→启 UU+回程Dock→切过去
-  python virtual_desktop.py list                   # 打印总数 + 当前所在桌面编号
-  python virtual_desktop.py create                 # 立即新建 1 个虚拟桌面（追加到最右端）
-  python virtual_desktop.py remove --index 1       # 删除指定编号的桌面（窗口自动合并到前一个）
+  python virtualdesk/virtual_desktop.py list                   # 打印总数 + 当前所在桌面编号
+  python virtualdesk/virtual_desktop.py create                 # 立即新建 1 个虚拟桌面（追加到最右端）
+  python virtualdesk/virtual_desktop.py remove --index 1       # 删除指定编号的桌面（窗口自动合并到前一个）
 
 Python 模块用法：
   from virtual_desktop import VirtualDesktops
@@ -249,7 +249,7 @@ class VirtualDesktops:
         ]
         if total < 2:
             lines.append("当前只有 1 个桌面（手机布局）；点 Dock「电脑」按钮会按需新建 UU 桌面，"
-                         "或手动执行：python virtual_desktop.py create")
+                         "或手动执行：python virtualdesk/virtual_desktop.py create")
         return "\n".join(lines)
 
     def launch_on_desktop(self, index: int, command: list[str], *,
@@ -450,8 +450,15 @@ import pathlib as _pathlib
 import shutil as _shutil
 
 _SCRIPT_DIR = _pathlib.Path(__file__).resolve().parent
-_DEFAULT_PROJECT_ROOT = _SCRIPT_DIR              # 默认把 virtual_desktop.py 同目录当项目根
-_DEFAULT_SERVER_SCRIPT = "server.py"              # 默认要启动的 server 脚本
+# _PROJECT_ROOT 仅供 sys.path 注入（virtualdesk 包导入锚），与 Open-AutoGLM 无关；
+# server.py 地址一律走 config services 清单的 open_autoglm 条目，与 aux 同源。
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+
+# 脚本位于 virtualdesk/ 内，包导入（from virtualdesk.xxx import）需要项目根在
+# sys.path。用 append 而非 insert(0)：sys.path[0]（脚本目录 virtualdesk/）优先，
+# 保证 `import virtual_desktop` 命中本模块而非项目根下的同名模块。
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(_PROJECT_ROOT))
 
 # UU远程 / 向日葵 / ToDesk 的常见默认安装位（按命中概率从高到低排）
 #   第 1 条来自用户显式指定：UU远程 GameViewer 默认安装位
@@ -913,29 +920,33 @@ def _wait_until_hwnds_ready(
     return best_count, elapsed_ms
 
 
-def _locate_python(explicit: Optional[str]) -> str:
-    """选 python 解释器：用户显式传入 > 当前 sys.executable > PATH 里的 python。"""
-    if explicit:
-        p = _pathlib.Path(explicit)
-        if p.is_file():
-            return str(p)
-        in_path = _shutil.which(explicit)
-        if in_path:
-            return in_path
-        raise FileNotFoundError(f"找不到指定的 Python 解释器：{explicit}")
-    return sys.executable
-
-
-def _locate_server_py(project_root: Optional[str], script_name: str) -> _pathlib.Path:
-    """定位 server.py 绝对路径。默认使用 virtual_desktop.py 同目录作项目根。"""
-    root = _pathlib.Path(project_root).expanduser().resolve() if project_root else _DEFAULT_PROJECT_ROOT
-    server_py = root / script_name
-    if not server_py.is_file():
-        raise FileNotFoundError(
-            f"找不到 server 脚本：\n    候选路径 = {server_py}\n"
-            f"    请通过 --project-root / --server-script 指定，或将脚本放入 {_DEFAULT_PROJECT_ROOT}"
-        )
-    return server_py
+def _get_open_autoglm_spec() -> dict:
+    """config services 清单中 key=="open_autoglm" 的条目：Open-AutoGLM server.py
+    的启动声明（与 handdetecter/asr 完全同构）。
+      · script   —— server.py 绝对路径
+      · host/port —— 探活/停止/嵌入参数地址（单一真相源）
+      · cmd_args —— 追加在 `python server.py` 之后的启动参数（如 --model）
+      · embed_host_port —— True 时启动命令嵌入 --host/--port（server.py 的
+        CLI > YAML 合并优先级要求显式传参才能覆盖 YAML）
+    兼容：旧版顶层 "open_autoglm" 条目仍可识别（services 缺该 key 时回落）。
+    缺失/非法字段自动补默认值，坏 config 不阻断。"""
+    for spec in _get_aux_services():
+        if spec.get("key") == "open_autoglm":
+            return spec
+    entry = _load_config().get("open_autoglm")
+    spec = dict(entry) if isinstance(entry, dict) else {}
+    spec.setdefault("key", "open_autoglm")
+    spec.setdefault("label", "Open-AutoGLM server")
+    spec.setdefault("probe_path", "/status")
+    try:
+        spec["port"] = int(spec.get("port") or 8080)
+    except Exception:
+        spec["port"] = 8080
+    if not spec.get("host"):
+        spec["host"] = "127.0.0.1"
+    if not isinstance(spec.get("cmd_args"), list):
+        spec["cmd_args"] = []
+    return spec
 
 
 def _find_uu_remote(explicit: Optional[str]) -> str:
@@ -959,7 +970,7 @@ def _find_uu_remote(explicit: Optional[str]) -> str:
     raise FileNotFoundError(
         "[uu-open] ❌ 无法自动定位 UU远程 / 向日葵 / ToDesk exe。\n"
         "    请显式传入：\n"
-        "        python virtual_desktop.py uu-open --uu-remote-path \"C:/你的完整路径/UURemote.exe\""
+        "        python virtualdesk/virtual_desktop.py uu-open --uu-remote-path \"C:/你的完整路径/UURemote.exe\""
     )
 
 
@@ -1329,20 +1340,32 @@ def _stop_toolbar_service() -> bool:
 #      HTTP 先就绪、模型后台加载，麦克风识别结果默认回调 http://localhost:8080/run
 #      （即本链路稍后启动的 server.py，故必须【先于】它启动）。
 # ASR 无单实例锁，因此启动前一律先 HTTP 探活，已在运行（含用户手动启动的）
-# 就跳过，绝不重复 Popen。两服务与 toolbar 一样 detached，日志各自落盘。
+# 就跳过，绝不重复 Popen。服务全部 detached；无窗口服务的后台日志由各服务
+# 内部自行落盘（HandDetecter=app_log 的 logs/、ASR=logs/asr.log、
+# Open-AutoGLM=logs/server.log），vd 不再代管日志。
 # ---------------------------------------------------------------------------
-_AUX_SERVICES: list[dict] = [
-    # {
-    #     "key": "handdetecter",
-    #     "label": "手势识别 HandDetecter",
-    #     "script": r"D:\TraeProj\HandDetecterForEye\server.py",
-    #     "host": "127.0.0.1",
-    #     "port": 8000,
-    #     "probe_path": "/status",
-    #     # mediapipe 模型预热在 Flask 开始服务【之前】同步完成，超时给宽些
-    #     "ready_timeout_s": 45.0,
-    #     "log_name": ".vd_aux_handdetecter.log",
-    # },
+# 服务清单已配置化：virtual_desktop_config.json 的 "services" 数组优先，缺失/非法
+# 时回落到下面这份内置默认（= 历史硬编码清单，零破坏迁移）。
+# 字段：key/script/host/port 必填；label/probe_path/ready_timeout_s/embed_host_port
+# 常规可选；embed_host_port=True 表示启动命令嵌入 --host/--port（自带这两个
+# 参数的服务用）；new_console=True 表示弹独立控制台窗口（默认全部不弹、
+# 无窗口后台运行；需要实时观察某个服务输出时才给该条目加 true），
+# 后台日志一律由各服务内部自行落盘。
+# cmd_args：追加在 `python script` 之后的启动参数（可选）；
+# stop_pattern：stop 兜底清扫的命令行正则（可选，缺省由 script 完整路径推导）。
+_DEFAULT_AUX_SERVICES: list[dict] = [
+    {
+        "key": "handdetecter",
+        "label": "手势识别 HandDetecter",
+        "script": r"D:\TraeProj\HandDetecterForEye\server.py",
+        "host": "127.0.0.1",
+        "port": 8000,
+        "probe_path": "/status",
+        # mediapipe 模型预热在 Flask 开始服务【之前】同步完成，超时给宽些
+        "ready_timeout_s": 45.0,
+        "embed_host_port": True,
+        "stop_pattern": r"[\\/]HandDetecterForEye[\\/]server\.py(?:\s|$)",
+    },
     {
         "key": "asr",
         "label": "语音识别 ASR",
@@ -1353,9 +1376,52 @@ _AUX_SERVICES: list[dict] = [
         # 但 import + uvicorn 监听建立在慢机器/高负载时可能 >20s，给宽到 45s
         "probe_path": "/health",
         "ready_timeout_s": 45.0,
-        "log_name": ".vd_aux_asr.log",
+        "embed_host_port": True,
+        "stop_pattern": r"[\\/]ASR[\\/]server\.py(?:\s|$)",
+    },
+    {
+        "key": "open_autoglm",
+        "label": "Open-AutoGLM server",
+        # 兜底默认：当前部署形态（virtualdesk 位于 Open-AutoGLM 项目内）
+        "script": str(_SCRIPT_DIR.parent / "server.py"),
+        "host": "127.0.0.1",
+        "port": 8080,
+        # /status 在 backdrop/主屏初始化后应答（app.run 前），scrcpy 树懒创建不影响就绪
+        "probe_path": "/status",
+        "ready_timeout_s": 18.0,
+        "embed_host_port": True,
+        "stop_pattern": r"[\\/]Open-AutoGLM[\\/]server\.py(?:\s|$)",
     },
 ]
+
+
+def _get_aux_services() -> list[dict]:
+    """运行时服务清单：config 有 "services" 数组则用之，否则用内置默认。
+    bootstrap 启动、stop 回滚/清扫、status 展示统一走这里。
+    任何校验失败都只告警并回落默认，绝不让坏配置阻断主流程。"""
+    cfg = _load_config()
+    raw = cfg.get("services")
+    if not raw:
+        return _DEFAULT_AUX_SERVICES
+    if not isinstance(raw, list):
+        print("[services] ⚠️ config 里 services 不是数组，已忽略（使用内置默认）。")
+        return _DEFAULT_AUX_SERVICES
+    specs: list[dict] = []
+    for i, item in enumerate(raw):
+        if (not isinstance(item, dict)
+                or not all(item.get(k) for k in ("key", "script", "host", "port"))):
+            print(f"[services] ⚠️ services[{i}] 缺 key/script/host/port，已跳过该条。")
+            continue
+        spec = dict(item)  # 拷贝：不改动用户 config 的结构
+        spec.setdefault("label", str(spec["key"]))
+        spec.setdefault("probe_path", "/")
+        spec.setdefault("ready_timeout_s", 30.0)
+        spec.setdefault("cmd_args", [])
+        specs.append(spec)
+    if not specs:
+        print("[services] ⚠️ services 数组无有效条目，使用内置默认。")
+        return _DEFAULT_AUX_SERVICES
+    return specs
 
 
 def _http_port_answers(host: str, port: int, path: str, *, timeout: float = 1.0) -> bool:
@@ -1393,7 +1459,6 @@ def _ensure_aux_service(spec: dict) -> Optional[int]:
     host, port = spec["host"], int(spec["port"])
     probe_path = str(spec.get("probe_path") or "/")
     timeout_s = float(spec.get("ready_timeout_s", 30.0))
-    log_path = _SCRIPT_DIR / str(spec["log_name"])
 
     if not script.is_file():
         print(f"[bootstrap] ⚠️ {label} 脚本不存在：{script}（跳过，不影响主流程）。")
@@ -1415,26 +1480,45 @@ def _ensure_aux_service(spec: dict) -> Optional[int]:
         return None
 
     print(f"[bootstrap] 🚀 优先启动 {label}：{script}")
-    print(f"           监听 http://{host}:{port}，日志 ./{log_path.name}")
-    # detached + stdout 重定向到文件时，子进程 Python 默认按系统 ANSI 代码页
-    # (cp936/GBK) 编码 stdout；ASR server.py main() 第一行就 print emoji（🎤），
-    # GBK 无法编码 → UnicodeEncodeError 在 uvicorn 启动前直接崩溃（2026-10-07
-    # 实测"ASR 启动失败"根因）。HandDetecter 因 app_log 把 sys.stdout 换成
-    # utf-8 Tee 而幸免，但不能依赖每个外部项目都自救——统一在此注入 UTF-8：
+    _win_desc = "独立控制台窗口，输出实时可见" if spec.get("new_console") \
+        else "无窗口后台运行，日志见服务内部文件"
+    print(f"           监听 http://{host}:{port}（{_win_desc}）")
+    # 新控制台窗口默认按系统 ANSI 代码页 (cp936/GBK) 编码；ASR server.py main()
+    # 第一行就 print emoji（🎤），GBK 无法编码 → UnicodeEncodeError 在 uvicorn
+    # 启动前直接崩溃（2026-10-07 实测"ASR 启动失败"根因）。HandDetecter 因
+    # app_log 把 sys.stdout 换成 utf-8 Tee 而幸免，但不能依赖每个外部项目都
+    # 自救——统一在此注入 UTF-8：
     #   PYTHONIOENCODING=utf-8 → 强制 sys.stdin/out/err 编码；
     #   PYTHONUTF8=1           → 解释器 UTF-8 模式兜底 open/默认编码。
     child_env = dict(_os.environ)
     child_env["PYTHONIOENCODING"] = "utf-8"
     child_env["PYTHONUTF8"] = "1"
     try:
-        log_fp = open(log_path, "a", encoding="utf-8")
+        extra_args = [str(a) for a in (spec.get("cmd_args") or [])]
+        if spec.get("embed_host_port"):
+            # server.py 等自带 --host/--port 参数的服务：显式嵌入（CLI > YAML
+            # 合并优先级，不传则 YAML 值生效、与探活地址脱节）
+            extra_args = ["--host", str(host), "--port", str(port), *extra_args]
+        # 窗口语义按条目 new_console 字段：默认一律 False（无窗口后台运行，
+        # stdout/stderr 丢弃，后台日志由各服务内部自行落盘）；需要实时观察
+        # 某个服务输出时才在 config 给该条目加 new_console=true（弹独立
+        # 控制台）。CREATE_NEW_PROCESS_GROUP 统一保留：在 vd 控制台按
+        # Ctrl+C 不会顺带杀服务（停止统一走 stop）。
+        new_console = bool(spec.get("new_console"))
+        if new_console:
+            _creation = 0x00000010 | 0x00000200  # CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP
+            _stdout_kw = {}                      # 不重定向：输出直接进新控制台
+        else:
+            _creation = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            _stdout_kw = dict(stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         proc = subprocess.Popen(
-            [sys.executable, str(script)],
+            [sys.executable, str(script), *extra_args],
             cwd=str(script.parent),
             env=child_env,
-            stdout=log_fp, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
             close_fds=True,
-            creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            creationflags=_creation,
+            **_stdout_kw,
         )
     except Exception as e:
         print(f"[bootstrap] ⚠️ {label} 启动失败（不影响主流程）: {e!r}")
@@ -1445,60 +1529,119 @@ def _ensure_aux_service(spec: dict) -> Optional[int]:
         rc = proc.poll()
         if rc is not None:
             # HandDetecter 单实例锁拦截时会 exit(2)：属"已在跑"，提示但不算主流程失败；
-            # ASR 无单实例锁，端口被占会 code!=0 崩溃——把日志尾部打出来，真因一目了然。
-            tail = ""
-            try:
-                tail = log_path.read_text(encoding="utf-8", errors="replace")[-900:]
-            except Exception:
-                pass
+            # ASR 无单实例锁，端口被占会 code!=0 崩溃。进程退出则控制台窗口随即关闭，
+            # 输出来不及看——以返回码 + 常见成因提示定位。
             print(f"[bootstrap] ⚠️ {label} 进程提前退出 code={rc}"
-                  f"（常见于单实例锁=已有同名服务，或端口被占 bind 失败；日志尾部如下）：")
-            if tail.strip():
-                for _ln in tail.strip().splitlines()[-12:]:
-                    print(f"    | {_ln}")
+                  f"（常见于单实例锁=已有同名服务，或端口被占 bind 失败；"
+                  f"控制台窗口已随进程关闭）。")
             return None
         if _http_port_answers(host, port, probe_path):
             print(f"[bootstrap] ✅ {label} 已就绪 PID={proc.pid} http://{host}:{port}。")
             return proc.pid
         _time.sleep(0.6)
     print(f"[bootstrap] ⚠️ {label} {timeout_s:.0f}s 内未应答 HTTP"
-          f"（PID={proc.pid} 仍在后台运行，详见 {log_path.name}；不影响主流程）。")
+          f"（PID={proc.pid} 仍在运行，输出见其控制台窗口；不影响主流程）。")
     return proc.pid
 
 
-# 外部辅助服务命令行精准特征（独立项目路径，区别于主项目 Open-AutoGLM\server.py）。
-# stop 时凭此在 state 缺失/PID 失配时兜底定位（只查 python*.exe）。
-_AUX_CMDLINE_PATTERNS = {
-    "handdetecter": _re.compile(r"[\\/]HandDetecterForEye[\\/]server\.py(?:\s|$)"),
-    "asr": _re.compile(r"[\\/]ASR[\\/]server\.py(?:\s|$)"),
-}
+# ---------------------------------------------------------------------------
+# 服务清单 config 化后，stop 兜底正则内聚到每条 spec 的 stop_pattern；
+# 缺省时由 script 完整路径推导（Popen 传的就是完整路径，命令行必然命中）。
+# ---------------------------------------------------------------------------
+
+
+def _stop_service_http(*, label: str, host: str, port: int,
+                       probe_path: str = "/", pid: Optional[int] = None,
+                       pattern: Optional["_re.Pattern"] = None,
+                       wait_s: float = 15.0) -> None:
+    """统一三段式停止（services 清单全部服务同一流程，open_autoglm 也在内）：
+
+      1) POST /exit（短超时）：服务回 200 后由进程内 shutdown 信号走各自
+         框架的优雅退出链（Flask：httpd.shutdown()；uvicorn：should_exit；
+         server：finally 停 backdrop + atexit 停全部 scrcpy 显示）。旧实例
+         无此端点/已死 → 404/连接失败，不报错直接进兜底。
+      2) 轮询探活等断联（wait_s 上限）——正常路径到此为止。
+      3) 仍存活 → taskkill 兜底：state pid 整树强杀 + 命令行特征清扫
+         （覆盖 /exit 卡死、半死状态、手动启动实例）。
+
+    服务地址来自 config 静态声明——停止链路不依赖 .vd_state.json 的
+    server_pid/backdrop_pid（服务内部收自己的子进程树，taskkill /T 从
+    服务进程根出发天然覆盖 spawn 子进程）。"""
+    base = f"http://{host}:{port}"
+    if _http_port_answers(host, port, probe_path, timeout=0.8):
+        asked = False
+        try:
+            import urllib.request as _urllib_request
+            req = _urllib_request.Request(f"{base}/exit", data=b"", method="POST")
+            opener = _urllib_request.build_opener(_urllib_request.ProxyHandler({}))
+            with opener.open(req, timeout=2.0) as resp:
+                asked = (200 <= resp.status < 500)
+        except Exception:
+            asked = False
+        if asked:
+            print(f"[stop] {label}：已请求 /exit（服务进程内 shutdown 优雅链），"
+                  f"等断联最多 {wait_s:.0f}s ...", flush=True)
+            t0 = _time.monotonic()
+            while _time.monotonic() - t0 < wait_s:
+                if not _http_port_answers(host, port, probe_path, timeout=0.8):
+                    break
+                _time.sleep(0.5)
+            if not _http_port_answers(host, port, probe_path, timeout=0.8):
+                print(f"[stop] ✅ {label} 已优雅退出（端口断联）；"
+                      f"子进程收尾留 1s。", flush=True)
+                _time.sleep(1.0)  # finally/atexit 的 scrcpy/uvicorn 收割时间
+                return
+            print(f"[stop] ⚠️ {label} /exit 后 {wait_s:.0f}s 仍未断联"
+                  f"（退出链卡住/半死），taskkill 兜底强杀...", flush=True)
+        else:
+            print(f"[stop] {label}：/exit 不可用（旧实例无端点），taskkill 兜底...",
+                  flush=True)
+    else:
+        print(f"[stop] {label}：端口未应答（未运行或无 HTTP 面），走 PID/特征兜底...",
+              flush=True)
+    killed = 0
+    if isinstance(pid, int) and _pid_alive(pid) and _taskkill_tree(pid, label=label):
+        killed += 1
+    if pattern is not None:
+        for cpid in _find_project_pids_by_cmdline({label: pattern}).get(label, []):
+            if _pid_alive(cpid) and _taskkill_tree(cpid, label=f"residual-{label}"):
+                killed += 1
+    if killed:
+        print(f"[stop] {label} 兜底结束：taskkill {killed} 个进程（含子树）。", flush=True)
+    else:
+        print(f"[stop] {label} 无存活进程。", flush=True)
 
 
 def _stop_aux_services(st: dict) -> None:
-    """关闭 bootstrap Step 0 拉起的两个外部辅助服务。
+    """关闭 config 清单里的全部外部辅助服务（统一走 _stop_service_http
+    三段式：/exit 优雅 → 断联确认 → state PID + 命令行特征 taskkill 兜底）。
 
-    双路径：state 里的 aux_*_pid（本次 bootstrap 新启动）优先；再用命令行精准
-    特征兜底（state 被清 / 用户手动启动 / PID 失配）。ASR 有 uvicorn 子进程，
-    一律 taskkill /T 整树结束。先于主 server 命令行兜底清扫执行，避免外部
-    server.py 被误归为 residual-server。"""
-    for spec in _AUX_SERVICES:
+    并行停止：每个服务一个独立线程（各自 POST /exit、各自等断联、各自
+    兜底），join 全部后才返回——总耗时 = 最慢一个而非逐个之和；服务间
+    无依赖（各自收各自的子进程树），先于 Toolbar/UU 桌面回收执行，
+    避免外部 server.py 被误归为 residual-server。"""
+    threads = []
+    for spec in _get_aux_services():
         key = spec["key"]
-        label = spec["label"]
-        killed = 0
+        pat_raw = spec.get("stop_pattern")
+        pat = (_re.compile(pat_raw) if pat_raw
+               else _re.compile(_re.escape(str(spec["script"])) + r"(?:\s|$)"))
         pid = st.get(f"aux_{key}_pid")
-        if isinstance(pid, int) and _pid_alive(pid):
-            if _taskkill_tree(pid, label=f"aux-{key}"):
-                killed += 1
-        pat = _AUX_CMDLINE_PATTERNS.get(key)
-        if pat is not None:
-            for cpid in _find_project_pids_by_cmdline({key: pat}).get(key, []):
-                if _pid_alive(cpid) and _taskkill_tree(cpid, label=f"residual-aux-{key}"):
-                    killed += 1
-        if killed:
-            print(f"[stop] {label}（http://{spec['host']}:{spec['port']}）"
-                  f"已停止：{killed} 个进程（含子进程整树）。", flush=True)
-        else:
-            print(f"[stop] {label} 未在运行。", flush=True)
+        t = _threading.Thread(
+            target=_stop_service_http,
+            kwargs=dict(
+                label=key,
+                host=str(spec["host"]), port=int(spec["port"]),
+                probe_path=str(spec.get("probe_path") or "/"),
+                pid=pid if isinstance(pid, int) else None,
+                pattern=pat,
+            ),
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
 
 
 # ---------------------------------------------------------------------------
@@ -1970,9 +2113,10 @@ def _autodetect_phone(phoneaddress: Optional[str]):
 
 # ---------------------------------------------------------------------------
 # 状态文件 / 进程工具 / stop
-#   bootstrap 把 server.py / UU 的 PID 落盘到 .vd_state.json，
-#   `python virtual_desktop.py stop` 凭此优雅终止整条链路（CTRL_C →
-#   server.py 的 atexit stop_all 清理全部 scrcpy），无状态文件也不工作。
+#   state（.vd_state.json）只登记 vd 侧观测字段（toolbar/aux/UU PID、
+#   桌面编号）；server 地址与停止全走 config（open_autoglm 条目）POST /exit
+#   三段式（服务进程内 shutdown 信号 → finally 停 backdrop + atexit stop_all
+#   清全部 scrcpy），不依赖 state 的 server 侧 PID。无 state 也能孤儿清扫。
 # ---------------------------------------------------------------------------
 import json as _json
 from datetime import datetime as _datetime
@@ -2153,14 +2297,6 @@ def _sweep_scrcpy(*, label: str = "residual-scrcpy") -> int:
 #      taskkill 报 Access is denied，但旧代码 capture_output 把错误吞了；
 #   B) CTRL_C 或强杀只干掉父进程，python/scrcpy/adb 子孙变孤儿继续跑。
 # ===========================================================================
-def _is_elevated() -> Optional[bool]:
-    """当前 stop 进程是否持有提升令牌（管理员 High IL）。检测失败返回 None。"""
-    try:
-        return bool(_ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return None
-
-
 def _diag_snapshot_table() -> dict[int, tuple[int, str]]:
     """一次 Toolhelp 进程快照 → {pid: (ppid, exe名)}。"""
     table: dict[int, tuple[int, str]] = {}
@@ -2285,37 +2421,6 @@ def _update_state(**changes) -> Optional[dict]:
     st.update(changes)
     _save_state(st)
     return st
-
-
-def _get_server_status(host: str, port: int, *, timeout: float = 1.0) -> Optional[dict]:
-    """单次 GET /status，返回 JSON dict；任何异常/非 200 返回 None。"""
-    import urllib.request as _urllib_request
-    url = f"http://{host}:{int(port)}/status"
-    try:
-        with _urllib_request.urlopen(url, timeout=timeout) as resp:
-            return _json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
-        return None
-
-
-def _fetch_server_backdrop_pid(host: str, port: int, *,
-                               timeout_s: float = 12.0) -> Optional[int]:
-    """server 启动后轮询 GET /status，取其 multiprocessing 孩子 backdrop 的 PID。
-
-    责任域约定：virtual_desktop 不读 server 侧任何文件，跨域信息只走 HTTP。
-    server 在 app.run 之前已完成 backdrop 初始化，故 /status 一旦应答即为
-    终态：有 backdrop_pid 直接返回，无字段（未启用/启动失败）立即返回 None；
-    只有连接失败/响应异常才轮询至超时。"""
-    deadline = _time.monotonic() + timeout_s
-    while _time.monotonic() < deadline:
-        # 单次请求超时受剩余 deadline 约束，避免最后一轮多等一个完整超时周期
-        remaining = max(0.1, min(1.0, deadline - _time.monotonic()))
-        data = _get_server_status(host, port, timeout=remaining)
-        if data is not None:
-            pid = data.get("backdrop_pid")
-            return int(pid) if pid else None
-        _time.sleep(0.5)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2479,74 +2584,6 @@ def _move_wrong_hwnds(pids: set[int], target_idx: int,
     return moved
 
 
-def do_signal_pid(args) -> int:
-    """【内部】一次性信号助手：AttachConsole 到目标控制台并广播 CTRL_C 后退出。
-    必须以 CREATE_NEW_PROCESS_GROUP 启动：助手自己的进程组=其 PID≠0，
-    而 CTRL_C 只能投递给进程组 0，所以助手发出的信号永远不会杀死自己。
-    返回码：0=已发送；2=AttachConsole 失败（目标无控制台）；3=发送失败。"""
-    pid = int(args.pid)
-    try:
-        _kernel32.FreeConsole()
-    except Exception:
-        pass
-    if not _kernel32.AttachConsole(pid):
-        # [stop-diag] 常见：目标以 CREATE_NO_WINDOW/无控制台启动，或已退出
-        print(f"[signal-pid] AttachConsole({pid}) 失败 "
-              f"GetLastError={_ctypes.get_last_error()}", file=sys.stderr, flush=True)
-        return 2
-    try:
-        _kernel32.SetConsoleCtrlHandler(None, True)
-        ok = bool(_kernel32.GenerateConsoleCtrlEvent(0, 0))
-        if not ok:
-            print(f"[signal-pid] GenerateConsoleCtrlEvent(CTRL_C, 0) 失败 "
-                  f"GetLastError={_ctypes.get_last_error()}", file=sys.stderr, flush=True)
-        _time.sleep(0.3)
-    finally:
-        try:
-            _kernel32.FreeConsole()
-        except Exception:
-            pass
-        _kernel32.SetConsoleCtrlHandler(None, False)
-    return 0 if ok else 3
-
-
-def _send_ctrl_c_and_wait(pid: int, timeout_s: float = 12.0) -> bool:
-    """派生独立进程组的信号助手给 pid 的控制台发 CTRL_C，然后等待其优雅退出。
-    不在 stop 主进程里直接发——Python 自带 CTRL handler，自屏蔽时序不可靠，
-    会把 stop 自己也打断（state 来不及清理）。
-    返回 True=进程已退出。目标无控制台（--server-no-window）→ False，调用方回退强杀。"""
-    try:
-        helper = subprocess.run(
-            [sys.executable, str(_SCRIPT_DIR / "virtual_desktop.py"),
-             "signal-pid", "--pid", str(pid)],
-            capture_output=True, text=True, errors="replace", timeout=10,
-            creationflags=0x00000200,  # CREATE_NEW_PROCESS_GROUP：与目标控制台组 0 隔离
-        )
-    except Exception as e:
-        print(f"[stop-diag] signal-pid 助手启动/执行异常：{e!r}", flush=True)
-        return False
-    print(f"[stop-diag] signal-pid 助手 rc={helper.returncode} "
-          f"stdout={helper.stdout.strip()!r} stderr={helper.stderr.strip()!r}",
-          flush=True)
-    if helper.returncode != 0:
-        return False
-    deadline = _time.time() + timeout_s
-    while _time.time() < deadline:
-        if not _pid_alive(pid):
-            return True
-        _time.sleep(0.3)
-    return not _pid_alive(pid)
-
-
-def _wait_pid_exit(pid: int, timeout_s: float) -> bool:
-    deadline = _time.time() + timeout_s
-    while _time.time() < deadline:
-        if not _pid_alive(pid):
-            return True
-        _time.sleep(0.3)
-    return not _pid_alive(pid)
-
-
 def _taskkill_tree(pid: int, *, label: str = "") -> bool:
     """taskkill /PID /T /F 强杀进程树。返回 rc==0；诊断期打印真实报错
     （旧代码 capture_output 把 'Access is denied' 吞掉，导致只看到仍存活）。"""
@@ -2571,15 +2608,17 @@ def do_stop(args) -> int:
        进程拓扑与各自归宿：
          · Toolbar 服务（virtual_desktop.py toolbar，detached）… state PID 优先、
            同域 .vd_toolbar.pid 文件兜底，一个进程托管各虚拟桌面的底部 Dock；
-         · 外部辅助服务（bootstrap Step 0 最先启动，独立项目 detached）…
-           HandDetecterForEye\server.py(127.0.0.1:8000 手势识别) 与
-           ASR\server.py(:8081 语音识别)：state aux_*_pid 优先、独立路径命令行
-           特征兜底，taskkill /T 整树结束（ASR 带 uvicorn 子进程）；
-         · server.py（py launcher + python 树）…… CTRL_C 优雅退出，超时强杀 /T；
-         · 主桌面 backdrop（qt_backdrop.py 的 multiprocessing spawn 子进程，内含
-           Backdrop/通知/思考 3 个窗口）… server finally 会 stop，再用 state 中
-           经 HTTP /status 登记的 backdrop_pid 核验补刀（强杀 server 时 daemon
-           回收机制会失效）；
+         · config services 清单全部服务（handdetecter / asr / open_autoglm）…
+           统一三段式：POST /exit（服务进程内 shutdown 信号走自身优雅链：
+           server finally 停 backdrop + atexit 停全部 scrcpy 显示树；Flask
+           httpd.shutdown()；uvicorn should_exit 官方 graceful shutdown）
+           → 端口断联确认 → taskkill 兜底（state PID 整树 + 命令行特征
+           清扫）。地址全部来自 config 静态声明，停止链路不依赖 state 的
+           server 侧 PID；全部服务并行停止（各自独立线程），总耗时 = 最
+           慢一个而非逐个之和；
+         · 主桌面 backdrop（qt_backdrop.py 的 multiprocessing spawn 子进程，
+           内含 Backdrop/通知/思考 3 个窗口）… /exit 优雅链由 server finally
+           收尾；兜底路径 taskkill /T 从 server 根出发整树覆盖 spawn 孩子；
          · scrcpy.exe × N …… atexit stop_all 后仍无条件按进程名扫尾；
          · UU 主程序（GameViewer.exe 及其 webview2/crashpad 子孙）… 默认 /T 整棵
            关闭（--no-kill-uu 保留）；后台服务无窗口默认不动；
@@ -2587,36 +2626,24 @@ def do_stop(args) -> int:
            Win+Ctrl+O 关闭；
          · UU 虚拟桌面 …… 默认删除（--no-remove-desktops 保留）。
 
-       无 state 也执行「孤儿清扫模式」：state 失配/被清后仍能按命令行特征、
-       同域 PID 文件、进程名把残留清干净；唯 backdrop 子进程命令行无特征，
-       state 缺失时无法定位（优雅退出路径不受影响）。
+       无 state 也执行「孤儿清扫模式」：state 失配/被清后仍能按 config 服务
+       地址请求 /exit，再按命令行特征、同域 PID 文件、进程名把残留清干净。
        注：adb fork-server（5037）是全机共享服务，默认不动（结尾给出提示）。"""
     st = _load_state() or {}
-    forced = getattr(args, "server_pid", None)
     if not st:
-        if forced:
-            print(f"[stop] 未找到 {_STATE_FILE.name}，使用命令行指定的 server PID={forced}。",
-                  flush=True)
-            st = {"server_pid": int(forced)}
-        else:
-            print(f"[stop] 未找到 {_STATE_FILE.name}：进入【孤儿清扫模式】——不发 "
-                  f"CTRL_C，按命令行特征 / 同域 PID 文件 / 进程名清理"
-                  f"Toolbar 服务、scrcpy、UU（backdrop 子进程无特征，无法定位）。",
-                  flush=True)
-            st = {}
+        print(f"[stop] 未找到 {_STATE_FILE.name}：进入【孤儿清扫模式】——按 config "
+              f"服务地址请求 /exit，再按命令行特征 / 同域 PID 文件 / 进程名清理。",
+              flush=True)
+        st = {}
 
-    server_pid = st.get("server_pid")
     kill_uu = bool(getattr(args, "kill_uu", True))
     remove_desktops = bool(getattr(args, "remove_desktops", True))
 
-    # 从这里起本进程忽略 CTRL_C：助手把 CTRL_C 广播到 server 所在控制台的
-    # 进程组 0，若调用方恰好共享该控制台（单控制台宿主/同窗口调试），
-    # 不屏蔽的话 stop 自己会被 KeyboardInterrupt 打断，清理会半途而废。
+    # 从这里起本进程忽略 CTRL_C：防清理途中被手按 Ctrl+C 打断导致半途而废。
     _kernel32.SetConsoleCtrlHandler(None, True)
     try:
-        print(f"[stop-diag] state 记录的 PID：server={server_pid} "
-              f"toolbar={st.get('toolbar_pid')} "
-              f"backdrop={st.get('backdrop_pid')}；"
+        print(f"[stop-diag] state 记录的 PID：toolbar={st.get('toolbar_pid')} "
+              f"backdrop(旧 state 兼容)={st.get('backdrop_pid')}；"
               f"kill_uu={kill_uu} remove_desktops={remove_desktops}", flush=True)
         print("[stop-diag] 停止前相关进程快照（python/scrcpy/adb/uu）：", flush=True)
         _diag_dump_related()
@@ -2632,42 +2659,15 @@ def do_stop(args) -> int:
             print(f"[stop] Toolbar 服务 PID={toolbar_pid} 已停止（各桌面底部 Dock 消失）。",
                   flush=True)
 
-        # ---- 2.5) Step 0 外部辅助服务：手势识别(8000) + ASR(8081) ----
-        #   必须先于下面 4a 的命令行兜底清扫：外部 server.py 的命令行也会被
-        #   _STOP_CMDLINE_PATTERNS["server"] 命中，先在本步按专属 label 干净关闭。
+        # ---- 2.5) config services 清单全部服务（含 open_autoglm 主 server）：
+        #      统一 _stop_aux_services 三段式，顺序 = config 条目顺序
+        #      （open_autoglm 放最后：aux 先停、server 后停，与历史语义一致）。
+        #      必须先于下面 4a 的命令行兜底清扫：外部 server.py 的命令行也会被
+        #      _STOP_CMDLINE_PATTERNS["server"] 命中，先在本步按专属 label 干净关闭。
         _stop_aux_services(st)
 
-        # ---- 3) CTRL_C 优雅停 server.py；失败/超时回退整树强杀 ----
-        if _pid_alive(server_pid):
-            print(f"[stop] 向 server.py PID={server_pid} 发送 CTRL_C"
-                  f"（优雅退出，最多等 12s）...", flush=True)
-            print(f"[stop-diag] CTRL_C 前 server PID={server_pid} 进程树：", flush=True)
-            _diag_dump_tree(int(server_pid))
-            try:
-                graceful = _send_ctrl_c_and_wait(int(server_pid))
-            except KeyboardInterrupt:
-                print("[stop] （本进程收到同源 CTRL_C，已忽略，继续等待 server 退出…）",
-                      flush=True)
-                graceful = _wait_pid_exit(int(server_pid), 8.0)
-            print(f"[stop-diag] CTRL_C 等待结束 graceful={graceful}，"
-                  f"此刻 server PID={server_pid} 进程树：", flush=True)
-            _diag_dump_tree(int(server_pid))
-            if graceful:
-                print("[stop] ✅ server.py 已优雅退出（finally 停 toolbar + "
-                      "atexit stop_all 停 scrcpy）。", flush=True)
-                _time.sleep(1.0)  # 给 daemon 子进程回收 / atexit 留点收尾时间
-            else:
-                print("[stop] ⚠️ CTRL_C 未送达或超时，回退 taskkill /PID /T /F"
-                      "（整棵 server 树一起清）...", flush=True)
-                _taskkill_tree(int(server_pid), label="server")
-                _time.sleep(1.5)
-                print("[stop-diag] 强杀后 server 进程树：", flush=True)
-                _diag_dump_tree(int(server_pid))
-                if _pid_alive(server_pid):
-                    print(f"[stop] ❌ server PID={server_pid} 仍存活，"
-                          f"稍后命令行兜底会再试一次。", flush=True)
-        elif server_pid:
-            print(f"[stop] server.py PID={server_pid} 已不在运行。", flush=True)
+        # ---- 3)（已并入 2.5）server.py 与 aux 同走 _stop_service_http；backdrop
+        #      由 server /exit 优雅链收尾，taskkill /T 整树覆盖 spawn 孩子 ----
 
         # ---- 4) 无条件兜底清扫（不信赖任何隐式回收，只认真实存活）----
         # 4a. 命令行特征：toolbar / server（覆盖 PID 失配、
@@ -2684,18 +2684,9 @@ def do_stop(args) -> int:
             if _pid_alive(pid) and _taskkill_tree(pid, label="residual-uu-dock"):
                 print(f"[stop] 兜底结束旧版残留 uu_dock PID={pid}。", flush=True)
 
-        # 4b. 主桌面 backdrop：PID 来自 state（bootstrap 经 HTTP /status 登记）。
-        #     spawn 子进程命令行无特征，无法枚举——state 缺失（孤儿清扫模式）时
-        #     此项只能跳过；正常链路 server 被 CTRL_C 优雅退出时 daemon 孩子会
-        #     被 Python 回收，仅强杀/崩溃场景才需要这里补刀。
-        bd_pid = st.get("backdrop_pid")
-        if bd_pid is not None:
-            if _pid_alive(bd_pid):
-                _taskkill_tree(bd_pid, label="backdrop(qt_backdrop)")
-                print(f"[stop] 主桌面 backdrop（qt_backdrop.py）PID={bd_pid} 已停止。",
-                      flush=True)
-            else:
-                print(f"[stop] 主桌面 backdrop PID={bd_pid} 已自行退出。", flush=True)
+        # 4b.（已并入三段式）主桌面 backdrop：/exit 优雅链由 server finally
+        #     收尾；兜底路径 taskkill /T 从 server 进程根出发整树覆盖
+        #     spawn 子进程（旧 state 的 backdrop_pid 不再被消费）。
 
         # 4c. 系统屏幕键盘 osk：高完整性无法 taskkill（UIPI error 5），
         #     Toolbar 服务已杀，再用 Win+Ctrl+O 系统开关关闭 osk
@@ -2750,7 +2741,7 @@ def do_stop(args) -> int:
             server_idx = st.get("server_desktop", 0)
             if uu_idx is None:
                 print("[stop] 无 UU 桌面记录（state.uu_desktop 为空）；"
-                      "若确有多余空桌面，请手动：python virtual_desktop.py list "
+                      "若确有多余空桌面，请手动：python virtualdesk/virtual_desktop.py list "
                       "→ remove --index N", flush=True)
             elif int(uu_idx) == int(server_idx):
                 print(f"[stop] UU 桌面 #{uu_idx} 与手机桌面相同，不删。", flush=True)
@@ -2816,10 +2807,8 @@ def do_status(args) -> int:
         return 1
     print(f"活动 bootstrap 会话（{_STATE_FILE.name}）：")
     print(f"  启动时间      : {st.get('started_at')}")
-    print(f"  server.py     : PID={st.get('server_pid')} "
-          f"{'🟢 运行中' if _pid_alive(st.get('server_pid')) else '⚪ 已退出'} → 桌面 #{st.get('server_desktop')}")
-    # Step 0 外部辅助服务：以端口实时探活为准（PID 仅在本次 bootstrap 新启动时登记）
-    for _aux in _AUX_SERVICES:
+    # config services 清单统一探活展示（open_autoglm 与 aux 同一行式）
+    for _aux in _get_aux_services():
         _pid = st.get(f"aux_{_aux['key']}_pid")
         _up = _http_port_answers(_aux["host"], _aux["port"], _aux["probe_path"])
         _pid_txt = (f"PID={_pid} " if _pid else ("外部实例 " if _up else ""))
@@ -2854,19 +2843,17 @@ def do_bootstrap(args) -> int:
       2) 检测一次手机 ADB 可达性；不可达则弹出 macOS 登录风连接窗口
          （输入手机局域网 IP 或插好 USB 后点「登入」重试；失败保持窗口
          并显示/打印错误；取消则中止）——不再后台循环等待 5 分钟；
-      3) 在当前桌面 Popen server.py，以 HTTP /status 应答为就绪判据
-         （不再数顶层窗口：卡片懒创建、窗口数天然波动）；
-      4) 目标即当前桌面时跳过 sweeper（零耗时）；仅跨桌面启动才 join 扫尾
-         poller（无新窗口 4s 提前收工，上限 ~9s）；
-      5) 审计报告：枚举 server 子孙 PID 的全部 HWND 与真实桌面归属；
-      6) state 落盘（uu_active=False，UU 相关字段为空）。
+      3) Step 0 启动 config services 清单里除 open_autoglm 外的全部服务；
+         手机 ADB 就绪后，Step 2 用同一 _ensure_aux_service 启动
+         open_autoglm（探活已在跑则跳过；失败仅告警不阻断）；
+      4) 审计报告：枚举 server 子孙 PID 的全部 HWND 与真实桌面归属；
+      5) state 落盘（uu_active=False，UU 相关字段为空；aux_{key}_pid
+         含 open_autoglm 在内的本次新启动服务 PID）。
     """
     vd = VirtualDesktops()
     server_desk = vd.current_index()
-    launch_mode = getattr(args, "launch_mode", "auto") or "auto"
 
     print(f"[bootstrap] 开始：手机布局将直接启动在【当前桌面 #{server_desk}】")
-    print(f"[bootstrap] launch_mode = {launch_mode}")
     print(
         "[bootstrap] 🛡️  懒创建模式：不新建虚拟桌面、不启动 UU。\n"
         "           server.py + 全部 scrcpy 手机卡片都在当前桌面启动；\n"
@@ -2875,12 +2862,16 @@ def do_bootstrap(args) -> int:
     )
     print("-" * 64)
 
-    # Step 0: 【最优先】先于一切启动两个外部后台服务：
-    #   手势识别 HandDetecter(8000) → 语音识别 ASR(8081)。ASR 识别结果回调
-    #   127.0.0.1:8080/run（主 server.py 在后面 Step 2 才启动），故必须先起；
-    #   已在运行则跳过（幂等），任何失败只告警、不阻断后续 bootstrap。
+    # Step 0: 【最优先】先于一切启动 config services 清单里的外部后台服务：
+    #   内置默认 = 手势识别 HandDetecter(8000) → 语音识别 ASR(8081)。ASR 识别
+    #   结果回调 127.0.0.1:8080/run（主 server.py 在后面 Step 2 才启动），故
+    #   必须先起；已在运行则跳过（幂等），任何失败只告警、不阻断后续 bootstrap。
+    #   open_autoglm（主 server）例外：须等手机 ADB 就绪（Step 1.5）后于 Step 2
+    #   启动，本循环跳过——但启动函数与 aux 完全同一 _ensure_aux_service。
     aux_pids: dict[str, Optional[int]] = {}
-    for _aux_spec in _AUX_SERVICES:
+    for _aux_spec in _get_aux_services():
+        if _aux_spec.get("key") == "open_autoglm":
+            continue
         aux_pids[_aux_spec["key"]] = _ensure_aux_service(_aux_spec)
     print("-" * 64)
 
@@ -2921,7 +2912,7 @@ def do_bootstrap(args) -> int:
             _stop_toolbar_service()
             # 回滚 Step 0：只停【本次新启动】的辅助服务（aux_pids 非 None），
             # 启动前就已存在的外部实例不动。
-            for _aux_spec in _AUX_SERVICES:
+            for _aux_spec in _get_aux_services():
                 _aux_pid = aux_pids.get(_aux_spec["key"])
                 if isinstance(_aux_pid, int) and _pid_alive(_aux_pid):
                     _taskkill_tree(_aux_pid, label=f"aux-{_aux_spec['key']}")
@@ -2933,79 +2924,23 @@ def do_bootstrap(args) -> int:
             return 1
         print(f"[bootstrap] ✅ {phone_msg}")
 
-    # —— Step 2 命令组装：server.py ——
-    py = _locate_python(getattr(args, "python", None))
-    server_py = _locate_server_py(
-        getattr(args, "project_root", None),
-        getattr(args, "server_script", _DEFAULT_SERVER_SCRIPT),
-    )
-    server_cmd: list[str] = [py, str(server_py)]
-    if getattr(args, "model", None):
-        server_cmd += ["--model", str(args.model)]
-    if getattr(args, "host", None):
-        server_cmd += ["--host", str(args.host)]
-    if getattr(args, "port", None):
-        server_cmd += ["--port", str(args.port)]
-    if getattr(args, "device_id", None):
-        server_cmd += ["--device-id", str(args.device_id)]
-
-    # —— 参数整理（懒创建模型下 bootstrap 只关心 server.py；
-    #    UU 的 exe 路径/等待参数归 uu-open 子命令所有）——
-    server_wait_ms = max(6000, int(getattr(args, "server_wait_ms", 18000)))
-    server_no_win  = bool(getattr(args, "server_no_window", False))
-    server_host    = getattr(args, "host", None) or "127.0.0.1"
-    server_port    = int(getattr(args, "port", None) or 8080)
-
-    pollers_to_wait: list[_threading.Thread] = []
-    srv_mode_used = launch_mode if launch_mode != "auto" else "switch_wait_switchback"
-
-    # 就绪判据：HTTP /status 应答（server 在 app.run 前已完成 backdrop/主屏
-    # 初始化）。不再数顶层窗口——窗口数随控制台/crashpad/懒创建卡片波动，
-    # 固定阈值（如 7）可能永远等不到。探针闭包顺带留存首次成功的 status。
-    server_status_holder: dict[str, Optional[dict]] = {"status": None}
-
-    def _server_ready_probe() -> bool:
-        st = _get_server_status(server_host, server_port, timeout=1.0)
-        if st is not None:
-            server_status_holder["status"] = st
-            return True
-        return False
+    # =====================================================================
+    # Step 2：启动 Open-AutoGLM server —— 与 aux 同一 _ensure_aux_service：
+    #   探活已在跑则跳过（幂等复用）/ 无窗口 detached / 日志
+    #   .vd_aux_open_autoglm.log / --host --port 嵌入（embed_host_port）/
+    #   /status 就绪轮询（ready_timeout_s）/ 失败仅告警。
+    #   script/host/port/cmd_args 全来自 config services 条目（单一真相源）；
+    #   单桌面出生即正确，无需切桌时序。
+    # =====================================================================
+    print(f"\n=== Step 2 / 2 ：当前桌面 #{server_desk} → Open-AutoGLM server ===")
+    oag = _get_open_autoglm_spec()
+    aux_pids[oag["key"]] = _ensure_aux_service(oag)
 
     # =====================================================================
-    # Step 2：在【当前桌面】启 server.py（不切桌面），就绪以 /status 应答为准
-    #   手机桌面布局直接显示在用户当前所在的桌面上。
+    # Step 3（已并入 Step 2）：旧 sweeper poller join 段随强隔离壳一并移除；
+    #   UU 远程与回程 Dock 不在 bootstrap 启动——由 Dock「电脑」按钮触发
+    #   `uu-open` 按需创建，见 do_uu_open()。
     # =====================================================================
-    print(f"\n=== Step 2 / 2 ：当前桌面 #{server_desk} → server.py ===")
-    p_server, srv_poller, srv_mode_used = vd.launch_on_desktop(
-        server_desk, server_cmd,
-        cwd=str(server_py.parent),
-        wait_window_ms=server_wait_ms,
-        label=f"{server_py.name} → #{server_desk}",
-        no_window=server_no_win,
-        mode=launch_mode,
-        ready_probe=_server_ready_probe if srv_mode_used == "switch_wait_switchback" else None,
-    )
-    if p_server is None:
-        print("[bootstrap] ⚠️  server.py 启动失败。")
-    else:
-        if srv_poller is not None:
-            pollers_to_wait.append(srv_poller)
-
-    # =====================================================================
-    # Step 3：跨桌面启动时 join sweeper poller（它自身安静 4s 即提前收工）
-    #   懒创建模型下 server 在当前桌面启动，poller 已跳过，本步零耗时。
-    #   UU 远程与回程 Dock 已不在 bootstrap 启动——改由 Dock「电脑」按钮
-    #   触发 `uu-open` 按需创建，见 do_uu_open()。
-    # =====================================================================
-    if pollers_to_wait:
-        wait_join_s = max(8000, server_wait_ms // 2) / 1000.0 + 1.0
-        print(
-            f"\n[bootstrap] 🧹 扫尾阶段：等 {len(pollers_to_wait)} 个 sweeper poller 结束"
-            f"（最多 {wait_join_s:.1f}s；无新窗口 4s 即提前收工）..."
-        )
-        for th in pollers_to_wait:
-            th.join(timeout=wait_join_s)
-        print("[bootstrap] ✅ Sweeper poller 结束。\n")
 
     # =====================================================================
     # Step 4：审计报告 —— 逐条打印 server PID 树的 HWND + 真实桌面编号
@@ -3015,7 +2950,7 @@ def do_bootstrap(args) -> int:
     print("=" * 80)
     print("[bootstrap] 🧾 窗口归属审计：逐个窗口核对「真实桌面归属」")
     print("=" * 80)
-    print(f"  launch_mode: server={srv_mode_used}（懒创建：无 UU 桌面）")
+    print("  启动方式: _ensure_aux_service 统一启动（单桌面出生即正确，无切桌时序）")
     print(f"  虚拟桌面范围: [0, {vd.count() - 1}]（bootstrap 未创建任何桌面）")
     print(f"  脚本结束当前桌面: #{vd.current_index()}")
     print("-" * 80)
@@ -3066,15 +3001,17 @@ def do_bootstrap(args) -> int:
         print(f"    汇总: {correct} 个在 #{expected_idx}，{wrong} 个不在（共 {len(hwnds)} 个窗口）。")
         return correct, wrong
 
+    oag_pid = aux_pids.get("open_autoglm")
     total_ok, total_ng = _audit_one(
         f"桌面 #{server_desk} / server.py 的子孙窗口（手机布局）",
-        p_server.pid if p_server else None, server_desk,
+        oag_pid if isinstance(oag_pid, int) else None, server_desk,
     )
 
     print()
     print("-" * 80)
-    srv_state = ("OK  PID=" + str(p_server.pid)) if p_server else "FAILED"
-    print(f"  当前桌面 #{server_desk} / server.py（手机布局）→ {srv_state}  |  cwd = {server_py.parent}")
+    srv_state = (f"OK  PID={oag_pid}" if isinstance(oag_pid, int)
+                 else "外部实例复用/未启动（无本次 PID，跳过审计）")
+    print(f"  当前桌面 #{server_desk} / server.py（手机布局）→ {srv_state}  |  cwd = {oag['script']}")
     print(f"  UU 远程桌面 → 未创建（点 Dock「电脑」按钮按需创建）")
     if total_ng == 0:
         print(f"\n  🎯 审计通过：共 {total_ok} 个窗口全部在当前桌面 #{server_desk}。")
@@ -3093,55 +3030,36 @@ def do_bootstrap(args) -> int:
     #   窗口归属约定：初始窗口靠强隔离时序出生即正确（bootstrap 窗口期内
     #   活跃桌面=目标桌面且无人能切走）；后续动态窗口跟随当前所在桌面，
     #   人为搬窗不干预——不设常驻归位。
-    #   stop 子命令凭状态文件 CTRL_C 优雅停 server。
+    #   stop 按 config 地址 POST /exit 三段式停 server（服务进程内 shutdown
+    #   信号走自身优雅链收子进程树），state 不登记 server 侧 PID 与地址，只留 vd
+    #   侧观测字段（toolbar/aux/UU/桌面）。
     # =====================================================================
-    if p_server is not None:
-        # backdrop PID 优先复用就绪探针首次成功时留存的 /status（零额外等待）；
-        # 探针超时（server 起得慢）时再补一轮短轮询。跨域只走 HTTP。
-        ready_status = server_status_holder.get("status")
-        backdrop_pid = None
-        if isinstance(ready_status, dict):
-            bp = ready_status.get("backdrop_pid")
-            backdrop_pid = int(bp) if bp else None
-        if backdrop_pid is None:
-            backdrop_pid = _fetch_server_backdrop_pid(server_host, server_port, timeout_s=10.0)
-        if backdrop_pid:
-            print(f"[bootstrap] 🪟 已从 /status 获取 backdrop 子进程 PID={backdrop_pid}")
-        else:
-            print("[bootstrap] ℹ️  未获取到 backdrop PID（未启用或超时），stop 将跳过该项")
-        state = {
-            "started_at": _datetime.now().isoformat(timespec="seconds"),
-            "project_root": str(_SCRIPT_DIR),
-            "server_pid": p_server.pid,
-            # [stop-diag] 记录启动时权限：server 子进程继承该完整性级别，
-            # stop 端若级别更低，taskkill 会 Access is denied
-            "bootstrap_elevated": _is_elevated(),
-            "server_desktop": server_desk,
-            # —— UU 懒创建字段：bootstrap 阶段全部为空，由 uu-open 回填 ——
-            "uu_active": False,
-            "uu_desktop": None,
-            "uu_pids": [],
-            "uu_preexisting": False,
-            "uu_dock_pid": None,
-            # Toolbar 是 vd 自己 Step 1 拉起的进程，PID 直接登记（其自写的
-            # .vd_toolbar.pid 仅作同域单实例锁与 stop 回退）。
-            "toolbar_pid": toolbar_pid,
-            # Step 0 最优先拉起的外部服务：None=已在运行的外部实例/启动失败，
-            # 仅作 status 可观测；两者独立常驻，stop 不回收。
-            "aux_handdetecter_pid": aux_pids.get("handdetecter"),
-            "aux_asr_pid": aux_pids.get("asr"),
-            # server 域 multiprocessing 孩子，经 HTTP /status 获取（见上）
-            "backdrop_pid": backdrop_pid,
-            # Toolbar 服务调 server HTTP 接口（设置→编辑模式）所需地址
-            "server_host": server_host,
-            "server_port": server_port,
-        }
-        _save_state(state)
-        print(f"[bootstrap] 💾 会话状态已写入 {_STATE_FILE.name}；"
-              f"停止整条链路请执行：python virtual_desktop.py stop")
-        # Toolbar 服务已在 Step 1 启动并将持续跟随 server 周期（stop 统一收尾）。
+    if not isinstance(aux_pids.get("open_autoglm"), int):
+        print("[bootstrap] ⚠️  server.py 本次未新启动（已在运行被复用，或启动失败"
+              "仅告警不阻断）；stop 将按 config 地址请求 /exit，再由命令行特征兜底清扫。")
+    state = {
+        "started_at": _datetime.now().isoformat(timespec="seconds"),
+        "server_desktop": server_desk,
+        # —— UU 懒创建字段：bootstrap 阶段全部为空，由 uu-open 回填 ——
+        "uu_active": False,
+        "uu_desktop": None,
+        "uu_pids": [],
+        "uu_preexisting": False,
+        "uu_dock_pid": None,
+        # Toolbar 是 vd 自己 Step 1 拉起的进程，PID 直接登记（其自写的
+        # .vd_toolbar.pid 仅作同域单实例锁与 stop 回退）。
+        "toolbar_pid": toolbar_pid,
+        # Step 0 最优先拉起的外部服务：None=已在运行的外部实例/启动失败，
+        # 仅作 status 可观测；两者独立常驻，stop 不回收。
+        # 服务清单 config 化：每个 key 一条 aux_{key}_pid（do_stop/status 动态读）
+        **{f"aux_{k}_pid": v for k, v in aux_pids.items()},
+    }
+    _save_state(state)
+    print(f"[bootstrap] 💾 会话状态已写入 {_STATE_FILE.name}；"
+          f"停止整条链路请执行：python virtualdesk/virtual_desktop.py stop")
+    # Toolbar 服务已在 Step 1 启动并将持续跟随 server 周期（stop 统一收尾）。
 
-    return 0 if p_server is not None else 1
+    return 0
 
 
 def do_uu_open(args) -> int:
@@ -3291,33 +3209,8 @@ def main() -> int:
              "UU 桌面/UU 远程由 toolbar 电脑钮触发 uu-open 按需懒创建",
     )
     # ===== 模式 =====
-    p_boot.add_argument("--launch-mode",
-                        choices=["auto", "switch_wait_switchback", "switch_then_sleep", "move_after"],
-                        default="auto",
-                        help=("server 启动模式（默认=auto → switch_wait_switchback）：\n"
-                              "  · switch_wait_switchback（推荐 ✅）：Popen→等≥N个窗口真出现；100%%落在当前桌面\n"
-                              "  · switch_then_sleep：死sleep毫秒（老兼容模式）\n"
-                              "  · move_after：事后迁移（隔离不稳定）"))
-    # server 相关
-    p_boot.add_argument("--python",
-                        help="server.py 使用的 Python 解释器路径（默认=当前 sys.executable）")
-    p_boot.add_argument("--project-root",
-                        help=f"项目根目录（默认=脚本同目录：{_DEFAULT_PROJECT_ROOT}）")
-    p_boot.add_argument("--server-script", default=_DEFAULT_SERVER_SCRIPT,
-                        help=f"要在主桌面 #0 启动的脚本名（默认={_DEFAULT_SERVER_SCRIPT}）")
-    p_boot.add_argument("--server-no-window", action="store_true",
-                        help="隐藏 server.py 的控制台黑框（CREATE_NO_WINDOW）")
-    p_boot.add_argument("--server-wait-ms", type=int, default=18000,
-                        help="server 启动后等 HTTP /status 应答的最长时间（默认 18000ms）；\n"
-                             "server 在 app.run 前完成 backdrop/主屏初始化，应答即就绪。\n"
-                             "兼容启动模式（--launch-mode）下同时作为 HWND 等待/扫尾窗口。")
-    p_boot.add_argument("--server-min-hwnds", type=int, default=2,
-                        help="【已废弃·仅兼容启动模式生效】默认启动以 /status 就绪为准，\n"
-                             "不再数顶层窗口；仅当显式 --launch-mode move_after/switch_then_sleep 时有意义。")
-    p_boot.add_argument("--model", help="传给 server.py 的 --model 参数（如 autoglm-phone）")
-    p_boot.add_argument("--host", help="传给 server.py 的 --host 参数")
-    p_boot.add_argument("--port", type=int, help="传给 server.py 的 --port 参数")
-    p_boot.add_argument("--device-id", help="传给 server.py 的 --device-id 参数")
+    # server 启动参数全在 config services 清单的 open_autoglm 条目静态声明
+    # （script/host/port/cmd_args/ready_timeout_s），bootstrap 不再有动态透传。
     p_boot.add_argument("--phoneaddress", default=None,
                         help="启动 server 前若无 ADB 有线(USB)设备，则对该地址执行 "
                              "`adb connect`，如 --phoneaddress 192.168.1.100:5555"
@@ -3344,22 +3237,17 @@ def main() -> int:
     p_uu.add_argument("--no-uu-dock", action="store_true",
                       help=argparse.SUPPRESS)  # 已废弃：Dock 改由 Toolbar 服务托管，参数仅为兼容旧命令行
 
-    # signal-pid（内部命令：stop 的一次性 CTRL_C 信号助手）
-    p_sig = sub.add_parser("signal-pid", help=argparse.SUPPRESS)
-    p_sig.add_argument("--pid", type=int, required=True)
-
     # toolbar（内部命令：bootstrap 最早期 detached 自启的底部 Dock 常驻 Qt 服务）
     sub.add_parser("toolbar", help=argparse.SUPPRESS)
 
     # stop：全量停止——默认连 UU 主程序、UU 虚拟桌面一起清理，做到零项目进程残留
     p_stop = sub.add_parser(
         "stop",
-        help="全量停止：CTRL_C 优雅停 server（超时强杀）+ Toolbar 服务 + "
-             "全部 scrcpy；默认同时关闭 UU 主程序并删除 UU 虚拟桌面；无 state 也清扫孤儿",
+        help="全量停止：POST /exit 优雅停 server 与全部辅助服务（断联确认，"
+             "超时 taskkill 兜底）+ Toolbar 服务 + 全部 scrcpy；默认同时关闭 "
+             "UU 主程序并删除 UU 虚拟桌面；无 state 也清扫孤儿",
     )
     p_stop.set_defaults(kill_uu=True, remove_desktops=True)
-    p_stop.add_argument("--server-pid", type=int, default=None,
-                        help="无 .vd_state.json 时直接指定 server.py 的 PID")
     p_stop.add_argument("--kill-uu", action="store_true",
                         help="（默认行为，保留仅为兼容）关闭 UU 远程主程序整棵进程树")
     p_stop.add_argument("--no-kill-uu", dest="kill_uu", action="store_false",
@@ -3387,8 +3275,6 @@ def main() -> int:
         except (FileNotFoundError, ValueError) as e:
             print(f"[uu-open] ❌ {e}")
             return 1
-    if args.cmd == "signal-pid":
-        return do_signal_pid(args)
     if args.cmd == "toolbar":
         from virtualdesk.toolbar_service import run_toolbar_service
         return run_toolbar_service()

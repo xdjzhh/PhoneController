@@ -54,6 +54,9 @@ display_manager = None
 agent = None
 agent_initialized = False
 backdrop_manager = None
+# HTTP 服务句柄（/exit 用 httpd.shutdown() 进程内优雅停；无控制台进程收不到
+# CTRL_C 事件，信号方案已弃用）
+_httpd = None
 
 _task_lock = threading.Lock()
 _task_running = False
@@ -310,6 +313,26 @@ def get_status():
     return jsonify(status_info)
 
 
+@app.route('/exit', methods=['POST'])
+def exit_server():
+    """virtualdesk stop 的优雅停止入口：回 200 后延迟 httpd.shutdown()——
+    进程内标志（无控制台进程也可靠送达；CTRL_C 事件在 CREATE_NO_WINDOW
+    进程里投递不到 handler，GenerateConsoleCtrlEvent 成空操作，已弃用）。
+    serve_forever 返回 → 走 main() finally 停 backdrop + atexit 停全部
+    scrcpy 显示树。失败不强退，交由 virtualdesk 的 taskkill 兜底收尾。"""
+    def _self_shutdown():
+        import time as _time
+        _time.sleep(0.5)
+        print("\n[exit] 收到 /exit 请求：httpd.shutdown()，走 finally/atexit 优雅链...", flush=True)
+        try:
+            _httpd.shutdown()
+        except Exception as e:
+            print(f"[exit] ⚠️ shutdown 失败（由外部 taskkill 兜底）：{e}", flush=True)
+
+    threading.Thread(target=_self_shutdown, daemon=True).start()
+    return jsonify({'success': True, 'message': 'exiting via httpd.shutdown()'})
+
+
 @app.route('/reset', methods=['POST'])
 def reset_agent():
     """重置 Agent"""
@@ -506,6 +529,60 @@ def refresh_notifications():
     return jsonify({'success': True})
 
 
+# ---------------------------------------------------------------------------
+# 后台日志：stdout/stderr 追加镜像到 logs/server.log（控制台/思考卡片显示
+# 之外多一份文件记录，进程崩溃或无窗口场景也能事后追查）。tee 尽量早装，
+# 之后的所有 print/traceback 都会落盘。
+# ---------------------------------------------------------------------------
+class _FileTee:
+    """stdout/stderr 透传包装：原样写原流 + 追加写日志文件。"""
+
+    def __init__(self, underlying, fp):
+        self._underlying = underlying
+        self._fp = fp
+
+    def write(self, s):
+        try:
+            self._underlying.write(s)
+        except Exception:
+            pass
+        try:
+            self._fp.write(s)
+            self._fp.flush()
+        except Exception:
+            pass
+        return len(s)
+
+    def writelines(self, lines):
+        for ln in lines:
+            self.write(ln)
+
+    def flush(self):
+        for target in (self._underlying, self._fp):
+            try:
+                target.flush()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self._underlying, name)
+
+
+def _install_file_tee():
+    try:
+        import time as _time
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        fp = open(os.path.join(log_dir, 'server.log'), 'a', encoding='utf-8')
+        fp.write(f"\n===== server start {_time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} =====\n")
+        fp.flush()
+        sys.stdout = _FileTee(sys.stdout, fp)
+        sys.stderr = _FileTee(sys.stderr, fp)
+        print(f"[server] 📄 后台日志已开启：{os.path.join(log_dir, 'server.log')}")
+    except Exception as _tee_err:
+        print(f"[server] file log tee skipped: {_tee_err}", flush=True)
+
+
 # 启动参数 YAML（与 server.py 同目录）：python server.py 默认读取
 _START_PROPERTIES_NAME = 'start_proporties.yaml'
 
@@ -540,7 +617,50 @@ def _load_start_properties(config_path=None):
     return data
 
 
+def _acquire_singleton_lock(lock_name: str):
+    """服务级单例锁（跨平台文件锁：msvcrt 区域锁 / fcntl.flock）：锁在服务
+    身份上，与端口/参数无关（换端口启动同样被拦）。进程存活期间持有；正常
+    退出或被强杀后由 OS 自动释放——无残留死锁，无需 PID 活性检查与 atexit
+    清理。返回的句柄引用必须保留（丢引用=GC 关闭文件=锁释放）。"""
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             f"{lock_name}.lock")
+    fp = open(lock_path, "a+", encoding="utf-8")
+    fp.write(" ")          # 字节 0 = 锁区占位；PID 写在其后（冲突方可读）
+    fp.flush()
+    try:
+        fp.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)   # Windows：区域锁
+        else:
+            import fcntl
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # Linux/macOS：整文件锁
+    except OSError:
+        old_pid = ""
+        try:
+            fp.seek(1)     # 跳过锁区（字节 0 被独占，读不到）
+            old_pid = fp.read().strip()
+        except Exception:
+            pass
+        print(f"[singleton] 已有实例在运行{f'（PID={old_pid}）' if old_pid else ''}，"
+              f"锁文件={lock_path}，本次启动退出。", flush=True)
+        sys.exit(0)
+    try:
+        fp.seek(0)
+        fp.truncate()
+        fp.write(" ")          # 字节 0 = 锁区占位
+        fp.write(str(os.getpid()))  # PID 写在锁区外，冲突方可读
+        fp.flush()
+    except Exception:
+        pass
+    # fp 故意不关闭：进程存续期间持锁，退出后由 OS 释放
+    return fp
+
+
 def main():
+    # ── 单例锁必须最先：已有实例（任意端口/参数启动）在跑就直接退出 ──
+    _singleton_lock = _acquire_singleton_lock("open_autoglm")
+
     # ── 统一 adb 来源：优先使用 scrcpy 自带的 adb.exe，必须早于任何
     #    adbutils / "adb" 子进程调用（adbutils 每次按 PATH 实时解析）──
     try:
@@ -557,6 +677,9 @@ def main():
     except Exception as _tee_err:
         # Never let the tee bootstrap crash server startup
         print(f"[server] console_tee install skipped: {_tee_err}", flush=True)
+
+    # ── 后台日志文件 tee：在 console_tee 之后套一层，print 双写文件 ──
+    _install_file_tee()
 
     # 参数默认值一律为 None：用于区分「命令行显式传入」与「未传」。
     # 未传时回退 start_proporties.yaml，再回退下面的内置默认值
@@ -659,7 +782,14 @@ def main():
     print(f"\nPress Ctrl+C to stop")
 
     try:
-        app.run(host=args.host, port=args.port, debug=False, threaded=True)
+        # 不用 app.run：直接持有 httpd——/exit 需要 httpd.shutdown() 做进程内
+        # 优雅停（app.run 不暴露 shutdown 句柄）。threaded=True 与原 app.run
+        # 语义一致（/run 长任务不阻塞 /status）。
+        from werkzeug.serving import make_server
+        global _httpd
+        _httpd = make_server(args.host, args.port, app, threaded=True)
+        print(f"✅ HTTP server listening on http://{args.host}:{args.port}")
+        _httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
     finally:

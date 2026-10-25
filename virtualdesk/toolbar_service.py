@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Toolbar 常驻服务（`python virtual_desktop.py toolbar`，detached 长驻）。
+Toolbar 常驻服务（`python virtualdesk/virtual_desktop.py toolbar`，detached 长驻）。
 
 一个 Qt 进程为【每个虚拟桌面】各托管一个 DesktopToolbar：
 
     桌面 #0（server 手机控制桌面，"AR Dock"）
       设置 → POST server /display/edit_mode（编辑模式）
       手机 → 手机主屏嵌入当前桌面
-      电脑 → detached 拉起 virtual_desktop.py uu-open（懒创建/切换 UU 桌面）
+      电脑 → detached 拉起 virtualdesk/virtual_desktop.py uu-open（懒创建/切换 UU 桌面）
       键盘 → 开/关系统屏幕键盘 osk
     其余桌面（"AR UU Dock"，如 UU 远程桌面 #1）
       设置 → 占位无功能
@@ -26,13 +26,15 @@ import subprocess
 import sys
 import time
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_STATE_FILE = os.path.join(_PROJECT_ROOT, ".vd_state.json")
-_VD_SCRIPT = os.path.join(_PROJECT_ROOT, "virtual_desktop.py")
+# 服务文件（state/pid/log/脚本）随服务包落在 virtualdesk/ 内，与
+# virtual_desktop.py 的 _SCRIPT_DIR 锚指向同一目录（单一真相源）。
+_SERVICE_DIR = os.path.dirname(os.path.abspath(__file__))
+_STATE_FILE = os.path.join(_SERVICE_DIR, ".vd_state.json")
+_VD_SCRIPT = os.path.join(_SERVICE_DIR, "virtual_desktop.py")
 
-TOOLBAR_PID_FILE = os.path.join(_PROJECT_ROOT, ".vd_toolbar.pid")
-TOOLBAR_LOG = os.path.join(_PROJECT_ROOT, ".vd_toolbar.log")
-_UU_LOG = os.path.join(_PROJECT_ROOT, ".vd_uu.log")
+TOOLBAR_PID_FILE = os.path.join(_SERVICE_DIR, ".vd_toolbar.pid")
+TOOLBAR_LOG = os.path.join(_SERVICE_DIR, ".vd_toolbar.log")
+_UU_LOG = os.path.join(_SERVICE_DIR, ".vd_uu.log")
 
 
 # ── state 读取 ────────────────────────────────────────────────────────────
@@ -124,7 +126,7 @@ def _spawn_uu_open() -> None:
             )
             p = subprocess.Popen(
                 [sys.executable, _VD_SCRIPT, "uu-open"],
-                cwd=_PROJECT_ROOT,
+                cwd=_SERVICE_DIR,
                 stdout=log_fp, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, close_fds=True,
                 creationflags=creationflags,

@@ -37,12 +37,12 @@ py -3.10 -m pip install pyvda
 ## 3. 一键启动（日常只用这一条）
 
 ```powershell
-py -3.10 virtual_desktop.py bootstrap --server-min-hwnds 7 --server-wait-ms 25000 --phoneaddress 192.168.43.1:5555
+py -3.10 virtualdesk/virtual_desktop.py bootstrap --server-min-hwnds 7 --server-wait-ms 25000 --phoneaddress 192.168.43.1:5555
 ```
 
 执行后自动完成：
 
-1. **拉起 Toolbar 常驻服务**（`python virtual_desktop.py toolbar`，detached，日志 `.vd_toolbar.log`、PID 落盘 `.vd_toolbar.pid`）：屏幕底部居中的 Dock 在登录阶段即可用；
+1. **拉起 Toolbar 常驻服务**（`python virtualdesk/virtual_desktop.py toolbar`，detached，日志 `.vd_toolbar.log`、PID 落盘 `.vd_toolbar.pid`）：屏幕底部居中的 Dock 在登录阶段即可用；
 2. **不新建虚拟桌面**：记录当前桌面编号（通常 #0），手机布局直接启动在该桌面；
 3. **单次**确认手机 ADB 可达（有 USB 设备直接通过，否则对 `--phoneaddress` 执行 `adb connect`）；不可达则弹出手机连接窗口由用户交互处理（输入 IP 或插 USB 后点「登入」重试，取消则中止并停掉 Toolbar 服务）；
 4. 在当前桌面启动 `server.py`，等到 ≥7 个窗口真正出现（保证高德、天气等 scrcpy 卡片都已就位）；
@@ -70,7 +70,7 @@ py -3.10 virtual_desktop.py bootstrap --server-min-hwnds 7 --server-wait-ms 2500
 也可手动执行（排障用）：
 
 ```powershell
-py -3.10 virtual_desktop.py uu-open
+py -3.10 virtualdesk/virtual_desktop.py uu-open
 ```
 
 ### 4.1 底部 AR Dock（Toolbar 常驻服务，每个虚拟桌面一个）
@@ -91,7 +91,7 @@ py -3.10 virtual_desktop.py uu-open
 ## 5. 查看运行状态
 
 ```powershell
-py -3.10 virtual_desktop.py status
+py -3.10 virtualdesk/virtual_desktop.py status
 ```
 
 bootstrap 后、尚未打开 UU 时：
@@ -115,7 +115,7 @@ bootstrap 后、尚未打开 UU 时：
 ## 6. 停止服务（全量关闭，默认零残留）
 
 ```powershell
-py -3.10 virtual_desktop.py stop
+py -3.10 virtualdesk/virtual_desktop.py stop
 ```
 
 一条命令默认清理**全部项目进程 + UU 虚拟桌面**，结束后打印零残留核验报告：
@@ -136,13 +136,13 @@ py -3.10 virtual_desktop.py stop
 
 ```powershell
 # 保留 UU 主程序（只停项目，继续远程）
-py -3.10 virtual_desktop.py stop --no-kill-uu
+py -3.10 virtualdesk/virtual_desktop.py stop --no-kill-uu
 
 # 保留 UU 虚拟桌面（只停进程，空桌面留着下次直接用）
-py -3.10 virtual_desktop.py stop --no-remove-desktops
+py -3.10 virtualdesk/virtual_desktop.py stop --no-remove-desktops
 
 # 没有状态文件时，手动指定 server.py 的 PID
-py -3.10 virtual_desktop.py stop --server-pid 23656
+py -3.10 virtualdesk/virtual_desktop.py stop --server-pid 23656
 ```
 
 **按策略保留的进程**（不算残留）：
@@ -165,7 +165,7 @@ py.exe (bootstrap 启动器)
         Flask 请求线程、screen_monitor、console_tee、通知刷新、listener
 
 python.exe  virtual_desktop.py watch             ← detached，独立进程（state 记 PID）
-python.exe  virtual_desktop.py toolbar           ← detached，Toolbar 常驻服务（.vd_toolbar.pid）
+python.exe  virtualdesk/virtual_desktop.py toolbar           ← detached，Toolbar 常驻服务（.vd_toolbar.pid）
 │                                                  一个进程内为每个虚拟桌面各托管 1 个 Dock
 GameViewer.exe                                  ← UU 主程序
 ├─ msedgewebview2.exe × N（界面渲染/GPU/网络等）
@@ -176,7 +176,7 @@ adb.exe  fork-server（5037）                     ← 全机共享（按策略�
 
 关键事实：
 - backdrop（qt_backdrop）是 `multiprocessing` 的 **spawn 子进程**，其命令行是 spawn 引导串、不含 `qt_backdrop` 字样，**无法用命令行特征枚举**；由 bootstrap 经 HTTP `GET /status` 取得其 PID 并登记进 state 的 `backdrop_pid` 字段追踪（跨域只走 HTTP，无共享文件）；
-- Toolbar 服务是普通 detached python 进程，state `toolbar_pid`、`.vd_toolbar.pid` 与命令行 `virtual_desktop.py toolbar` 三重锚点追踪。
+- Toolbar 服务是普通 detached python 进程，state `toolbar_pid`、`.vd_toolbar.pid` 与命令行 `virtualdesk/virtual_desktop.py toolbar` 三重锚点追踪。
 
 #### B. 为什么是「先优雅（CTRL_C）、后强杀（/T /F）」
 
@@ -197,7 +197,7 @@ adb.exe  fork-server（5037）                     ← 全机共享（按策略�
 |---|---|---|---|
 | 1 | state 单 PID | server / watcher / toolbar / backdrop | PID 被替换、state 丢失 |
 | 2 | 同域 PID 文件 | `.vd_toolbar.pid`（Toolbar 服务，vd 自有文件兜底） | 文件陈旧（读 PID 后校验存活，陈旧自然失效） |
-| 3 | 命令行正则（PowerShell CIM 枚举 `Win32_Process`） | `virtual_desktop.py watch` / `virtual_desktop.py toolbar` / `server.py`（另兼容旧版 `uu_dock.py`） | spawn 孙进程命令行无特征（backdrop 已由级别 1 覆盖；state 丢失则无法定位） |
+| 3 | 命令行正则（PowerShell CIM 枚举 `Win32_Process`） | `virtual_desktop.py watch` / `virtualdesk/virtual_desktop.py toolbar` / `server.py`（另兼容旧版 `uu_dock.py`） | spawn 孙进程命令行无特征（backdrop 已由级别 1 覆盖；state 丢失则无法定位） |
 | 4 | 进程名 | `scrcpy.exe`（全清）、`GameViewer.exe`（树根 `/T`） | — |
 
 附加安全规则：枚举命令行时排除 stop **自身 PID**；杀进程一律以**树根节点 + `/T`** 整棵处置（UU 用 `/T` 才能带走 WebView2/crashpad 子孙，旧版只 `/F` 主程序正是子进程残留的根因）；手机桌面（`server_desktop`）永不删除。
@@ -228,7 +228,7 @@ adb.exe  fork-server（5037）                     ← 全机共享（按策略�
 
 **Toolbar 服务化轮次（virtualdesk 包）追加**：
 
-- 底部 Dock 从 backdrop 进程与 `front/uu_dock.py` 两处实现，收敛为独立常驻服务（`virtual_desktop.py toolbar`，[virtualdesk/](file:///d:/TraeProj/Open-AutoGLM/virtualdesk) 包）一个进程为每个虚拟桌面各托管一个 Dock，桌面增删 2s 内自动 reconcile；`front/desktop_toolbar.py`、`front/uu_dock.py` 已删除；
+- 底部 Dock 从 backdrop 进程与 `front/uu_dock.py` 两处实现，收敛为独立常驻服务（`virtualdesk/virtual_desktop.py toolbar`，[virtualdesk/](file:///d:/TraeProj/Open-AutoGLM/virtualdesk) 包）一个进程为每个虚拟桌面各托管一个 Dock，桌面增删 2s 内自动 reconcile；`front/desktop_toolbar.py`、`front/uu_dock.py` 已删除；
 - 键盘从右下角可拖动小图标改为 Dock 第 4 个按钮（纯点击开/关、osk 打开时上移不遮 Dock、打开期间钉住 Dock）；「设置」改走 server HTTP `/display/edit_mode`，通知/思考面板经 backdrop pipe `set_panels_edit_mode` 联动；
 - Toolbar 服务在 bootstrap 第一步（登录窗前）启动，取消登录即回收；登录窗改固定偏上（400×484）避免与 osk/Dock 几何相交。
 
@@ -250,16 +250,16 @@ Get-Process scrcpy,GameViewer -ErrorAction SilentlyContinue
 cd d:\TraeProj\Open-AutoGLM
 
 # 上班：一键启动手机布局（在当前桌面，不建虚拟桌面）
-py -3.10 virtual_desktop.py bootstrap --server-min-hwnds 7 --server-wait-ms 25000 --phoneaddress 192.168.43.1:5555
+py -3.10 virtualdesk/virtual_desktop.py bootstrap --server-min-hwnds 7 --server-wait-ms 25000 --phoneaddress 192.168.43.1:5555
 
 # 需要远程电脑时：点 Dock「电脑」（首次自动建 UU 桌面），或命令行：
-py -3.10 virtual_desktop.py uu-open
+py -3.10 virtualdesk/virtual_desktop.py uu-open
 
 # 随时查看
-py -3.10 virtual_desktop.py status
+py -3.10 virtualdesk/virtual_desktop.py status
 
 # 下班：一键全量停止（Toolbar 服务/watcher/backdrop/scrcpy 全清，UU 关闭、UU 桌面删除）
-py -3.10 virtual_desktop.py stop
+py -3.10 virtualdesk/virtual_desktop.py stop
 ```
 
 ## 8. bootstrap / uu-open 常用可选参数
@@ -291,11 +291,11 @@ uu-open（只控制 UU 远程桌面）：
 ## 9. 虚拟桌面管理子命令（按需使用）
 
 ```powershell
-py -3.10 virtual_desktop.py list               # 查看桌面总数 / 当前编号
-py -3.10 virtual_desktop.py ensure --count 1   # 确保至少有 N 个桌面（默认 1；UU 桌面交给 uu-open）
-py -3.10 virtual_desktop.py create             # 新建一个桌面（追加到最右）
-py -3.10 virtual_desktop.py switch --index 1   # 切到指定桌面（0-based）
-py -3.10 virtual_desktop.py remove --index 1   # 删除指定桌面（窗口合并到左侧邻居）
+py -3.10 virtualdesk/virtual_desktop.py list               # 查看桌面总数 / 当前编号
+py -3.10 virtualdesk/virtual_desktop.py ensure --count 1   # 确保至少有 N 个桌面（默认 1；UU 桌面交给 uu-open）
+py -3.10 virtualdesk/virtual_desktop.py create             # 新建一个桌面（追加到最右）
+py -3.10 virtualdesk/virtual_desktop.py switch --index 1   # 切到指定桌面（0-based）
+py -3.10 virtualdesk/virtual_desktop.py remove --index 1   # 删除指定桌面（窗口合并到左侧邻居）
 ```
 
 ## 10. 排障备注

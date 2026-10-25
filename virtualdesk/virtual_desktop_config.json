@@ -1,0 +1,40 @@
+{
+  "osk_icon_pos": [1458, 753],
+  "last_phone_address": "192.168.1.2:5555",
+  "services": [
+    {
+      "key": "handdetecter",
+      "label": "手势识别 HandDetecter",
+      "script": "D:\\TraeProj\\HandDetecterForEye\\server.py",
+      "host": "127.0.0.1",
+      "port": 8000,
+      "probe_path": "/status",
+      "ready_timeout_s": 45.0,
+      "embed_host_port": true,
+      "stop_pattern": "[\\\\/]HandDetecterForEye[\\\\/]server\\.py(?:\\s|$)"
+    },
+    {
+      "key": "asr",
+      "label": "语音识别 ASR",
+      "script": "D:\\TraeProj\\ASR\\server.py",
+      "host": "127.0.0.1",
+      "port": 8081,
+      "probe_path": "/health",
+      "ready_timeout_s": 45.0,
+      "embed_host_port": true,
+      "stop_pattern": "[\\\\/]ASR[\\\\/]server\\.py(?:\\s|$)"
+    },
+    {
+      "key": "open_autoglm",
+      "label": "Open-AutoGLM server",
+      "script": "D:\\TraeProj\\Open-AutoGLM\\server.py",
+      "host": "127.0.0.1",
+      "port": 8080,
+      "probe_path": "/status",
+      "ready_timeout_s": 18.0,
+      "embed_host_port": true,
+      "stop_pattern": "[\\\\/]Open-AutoGLM[\\\\/]server\\.py(?:\\s|$)",
+      "cmd_args": []
+    }
+  ]
+}

@@ -13,8 +13,7 @@ virtual_desktop.py  —  Windows 10 / 11 虚拟桌面管理脚本（零额外配
   · UU 桌面（通常 #1，编号=创建时桌面总数-1）= 用户点主桌面 Dock「电脑」按钮时
     才由 `uu-open` 子命令按需创建，并在其中启动 UU GameViewer + 回程 Dock；
     若该桌面与 UU 均已存在，再次点击只切桌面、不重复创建/启动。
-  · 手机主屏（main_display）可由 Dock「手机」按钮在两个桌面间自由嵌入，watcher
-    按标题放行，不回迁。
+  · 手机主屏（main_display）可由 Dock「手机」按钮在两个桌面间自由嵌入。
 
 实现：优先使用 pyvda（已在多个 Windows 项目验证）。若未装 → 自动 `pip install pyvda`
       （pyvda 是纯 Python 包，自动处理 Win10 1903 / Win11 之间 VirtualDesktop COM IID 的 GUID
@@ -354,7 +353,7 @@ class VirtualDesktops:
                     print(f"[launch{label_suffix}] ✅ 就绪探针成功（{el}ms）。")
                 else:
                     print(f"[launch{label_suffix}] ⚠️  就绪探针 {wait_ms}ms 未成功"
-                          f"（继续后续流程，watcher 兜底动态窗口）。")
+                          f"（继续后续流程）。")
             else:
                 _wait_until_hwnds_ready(
                     proc.pid, index,
@@ -365,12 +364,11 @@ class VirtualDesktops:
 
             # Phase 4: 仍留在 desktop#N（调用方决定下一步）。
             #         目标桌面=当前桌面时无窗可搬，不启 sweeper（bootstrap 的
-            #         server 启动每次省掉固定 ~9s；短暂空窗由随后启动的 watcher 兜）；
+            #         server 启动每次省掉固定 ~9s）；
             #         跨桌面启动（如 uu-open）才开扫尾 poller，且安静 4s 即提前收工。
             if was_current:
                 print(
-                    f"[launch{label_suffix}] ⏭️  目标即当前桌面，窗口天然归位，"
-                    f"跳过 sweeper（后续动态卡片归常驻 watcher）。"
+                    f"[launch{label_suffix}] ⏭️  目标即当前桌面，窗口天然归位，跳过 sweeper。"
                 )
                 return proc, None, mode
             sweeper = _start_hwnd_assignment_poller(
@@ -766,7 +764,7 @@ def _start_hwnd_assignment_poller(
     归属正确了，这里只抓那些"迟了 N 秒才冒出来"的残余卡片。
 
     quiet_ms>0 时启用「安静提前收工」：连续 quiet_ms 没有发现任何新窗口即退出
-    （残余卡片由常驻 watcher 兜底），避免把 total_ms 固定熬完。
+    ，避免把 total_ms 固定熬完。
     """
     label_suffix = f" [{label}]" if label else ""
     seen: set[int] = set()
@@ -824,7 +822,7 @@ def _start_hwnd_assignment_poller(
             if quiet_ms and (_time.monotonic() - last_activity) * 1000 >= quiet_ms:
                 print(
                     f"[poller{label_suffix}] 🏁 连续 {quiet_ms}ms 无新窗口，提前收工"
-                    f"（上限 {total_ms}ms，累计 {total_moved} 个 HWND，残余由 watcher 兜底）。"
+                    f"（上限 {total_ms}ms，累计 {total_moved} 个 HWND）。"
                 )
                 return
             _time.sleep(tick_ms / 1000.0)
@@ -1294,7 +1292,7 @@ def _spawn_toolbar_service():
     - 幂等：.vd_toolbar.pid 指向的服务仍存活则直接返回其 PID（服务内也有单实例保护）；
     - offscreen/无头环境不起常驻 UI 进程，返回 None；
     - 启动失败仅告警返回 None（不影响主流程）。
-    与 watcher 相同的 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP detached flags。
+    与 toolbar 相同的 CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP detached flags。
     """
     if _os.environ.get("QT_QPA_PLATFORM") == "offscreen":
         return None
@@ -1331,7 +1329,7 @@ def _stop_toolbar_service() -> bool:
 #      HTTP 先就绪、模型后台加载，麦克风识别结果默认回调 http://localhost:8080/run
 #      （即本链路稍后启动的 server.py，故必须【先于】它启动）。
 # ASR 无单实例锁，因此启动前一律先 HTTP 探活，已在运行（含用户手动启动的）
-# 就跳过，绝不重复 Popen。两服务与 watcher/toolbar 一样 detached，日志各自落盘。
+# 就跳过，绝不重复 Popen。两服务与 toolbar 一样 detached，日志各自落盘。
 # ---------------------------------------------------------------------------
 _AUX_SERVICES: list[dict] = [
     # {
@@ -1508,7 +1506,7 @@ def _stop_aux_services(st: dict) -> None:
 #   · 输入手机局域网 IP（可不带端口，默认 5555）或留空仅重试 USB；
 #   · 连接在后台线程执行（adb connect 最长十余秒），界面不卡死；
 #   · 失败保持窗口并就地显示 + 控制台打印错误；成功/取消才关闭。
-# PySide6 懒导入：只有真正弹窗时才加载，watch/stop 等子命令零开销。
+# PySide6 懒导入：只有真正弹窗时才加载，stop 等子命令零开销。
 # ---------------------------------------------------------------------------
 def _prompt_phone_connection_gui(
     initial_address: Optional[str] = None,
@@ -1971,8 +1969,8 @@ def _autodetect_phone(phoneaddress: Optional[str]):
 
 
 # ---------------------------------------------------------------------------
-# 状态文件 / 进程工具 / 常驻归位 watcher / stop
-#   bootstrap 把 server.py / UU / watcher 的 PID 落盘到 .vd_state.json，
+# 状态文件 / 进程工具 / stop
+#   bootstrap 把 server.py / UU 的 PID 落盘到 .vd_state.json，
 #   `python virtual_desktop.py stop` 凭此优雅终止整条链路（CTRL_C →
 #   server.py 的 atexit stop_all 清理全部 scrcpy），无状态文件也不工作。
 # ---------------------------------------------------------------------------
@@ -1983,7 +1981,6 @@ _STATE_FILE = _SCRIPT_DIR / ".vd_state.json"
 # 用户级持久配置（与临时运行态 state 不同，stop 不清理）：
 #   last_phone_address —— 上次登入成功的手机 IP:端口，下次 bootstrap 先试它。
 _CONFIG_FILE = _SCRIPT_DIR / "virtual_desktop_config.json"
-_WATCHER_LOG = _SCRIPT_DIR / ".vd_watcher.log"
 # uu-open 懒创建的串行锁（防止连点电脑按钮导致 UU 被启动两份）
 _UU_LOCK_FILE = _SCRIPT_DIR / ".vd_uu.lock"
 _UU_LOG = _SCRIPT_DIR / ".vd_uu.log"
@@ -2134,7 +2131,6 @@ def _find_project_pids_by_cmdline(patterns: dict[str, "_re.Pattern"]) -> dict[st
 
 # 本项目 detached / 独立 python 进程的命令行特征（一个命令行只会命中一个 label）
 _STOP_CMDLINE_PATTERNS = {
-    "watcher": _re.compile(r"virtual_desktop\.py[\"']?\s+watch\b"),
     "toolbar": _re.compile(r"virtual_desktop\.py[\"']?\s+toolbar\b"),
     "server": _re.compile(r"[\\/\s]server\.py(?:\s|$|[\"'])"),
 }
@@ -2284,7 +2280,7 @@ def _update_config(**changes) -> dict:
 
 def _update_state(**changes) -> Optional[dict]:
     """读取-合并-原子写回 .vd_state.json；返回合并后的最新 state。
-    供 uu-open 在 watcher 运行期间并发更新 UU 桌面字段（写是原子替换）。"""
+    供 uu-open 运行期间并发更新 UU 桌面字段（写是原子替换）。"""
     st = _load_state() or {}
     st.update(changes)
     _save_state(st)
@@ -2410,11 +2406,11 @@ def _launch_uu_on_desktop(vd: "VirtualDesktops", uu_idx: int, uu_cmd: list[str],
     if preexisting:
         visible = _enum_top_level_hwnds_for_pids(record_pids)
         if visible:
-            mode = "preexisting+watcher"
+            mode = "preexisting"
             print(f"[uu-open] ℹ️  UU 已在运行且主窗口已显示：{existing}", flush=True)
             _move_wrong_hwnds(record_pids, uu_idx, {}, "uu-open-init")
         else:
-            mode = "preexisting-wakeup+watcher"
+            mode = "preexisting-wakeup"
             print(f"[uu-open] ℹ️  UU 已在运行但主窗口缩在系统托盘：{existing}", flush=True)
             print("[uu-open] 单例应用：切到 UU 桌面后再启动一次 exe = 唤出旧实例主窗口…",
                   flush=True)
@@ -2422,7 +2418,7 @@ def _launch_uu_on_desktop(vd: "VirtualDesktops", uu_idx: int, uu_cmd: list[str],
             try:
                 subprocess.Popen(uu_cmd)
             except Exception as e:
-                print(f"[uu-open] ⚠️  唤醒 UU 失败：{e}；可手动从托盘点开，watcher 会自动归位。",
+                print(f"[uu-open] ⚠️  唤醒 UU 失败：{e}；可手动从托盘点开。",
                       flush=True)
             else:
                 deadline = _time.time() + max(3.0, wait_ms / 1000.0)
@@ -2459,7 +2455,7 @@ def _move_wrong_hwnds(pids: set[int], target_idx: int,
     注意：不能用"曾经正确"的 HWND 缓存跳过——窗口随时可能被用户拖拽/其他
     程序/系统操作移出目标桌面，缓存会导致移走后再也搬不回来。
     skip_titles：命中这些精确标题的窗口跳过（手机主屏 main_display 由
-    「手机」Dock 按钮按用户意愿在两个桌面间嵌入，watcher 不得回迁）。"""
+    「手机」Dock 按钮按用户意愿在两个桌面间嵌入）。"""
     skip_titles = skip_titles or set()
     moved = 0
     for hwnd in _enum_top_level_hwnds_for_pids(pids):
@@ -2475,105 +2471,12 @@ def _move_wrong_hwnds(pids: set[int], target_idx: int,
         if ok:
             fail_counts.pop(hwnd, None)
             moved += 1
-            print(f"[watcher:{tag}] ✅ '{title}' #{real}→#{target_idx} ({how})", flush=True)
+            print(f"[move:{tag}] ✅ '{title}' #{real}→#{target_idx} ({how})", flush=True)
         else:
             fail_counts[hwnd] = fail_counts.get(hwnd, 0) + 1
             if fail_counts[hwnd] == 3:
-                print(f"[watcher:{tag}] ⚠️ '{title}' 连续 3 次迁移失败: {how}", flush=True)
+                print(f"[move:{tag}] ⚠️ '{title}' 连续 3 次迁移失败: {how}", flush=True)
     return moved
-
-
-def do_watch(args) -> int:
-    """常驻归位守护（独立 detached 进程）：
-      · server.py 子孙进程的窗口（含 AI 运行中**动态新开**的抖音/微信等 scrcpy
-        卡片）一旦不在 server 桌面，立刻迁回；
-      · 远程客户端（UU/向日葵/ToDesk，**含早已运行的实例**）的窗口
-        只在 UU 桌面已由 uu-open 懒创建（state.uu_active=True）后才归到该桌面；
-        未创建时 UU 尚未启动，保持空闲，绝不向不存在的桌面搬窗；
-      · 每轮重新读取 state 文件——用户运行中点「电脑」按钮创建 UU 桌面后，
-        无需重启 watcher 即可获得新的 uu_desktop；
-      · server.py 连续 3 轮确认退出后本守护自动退出。
-    日志追加写入 .vd_watcher.log。"""
-    state_file = _pathlib.Path(getattr(args, "state_file", None) or _STATE_FILE)
-    interval = max(0.5, float(getattr(args, "interval", 1.5)))
-    # 独立进程必须在本线程先初始化 COM，pyvda 的 COM 调用才能工作
-    try:
-        _ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
-    except Exception:
-        try:
-            _ctypes.windll.ole32.CoInitialize(None)
-        except Exception:
-            pass
-    try:
-        with open(state_file, "r", encoding="utf-8") as f:
-            st = _json.load(f)
-    except Exception as e:
-        print(f"[watcher] 无法读取状态文件 {state_file}: {e!r}", flush=True)
-        return 1
-
-    # 手机主屏（main_display）标题：它由 Dock「手机」按钮按用户意愿在两个
-    # 桌面间嵌入，watcher 必须放行，不能按普通 server 窗口回迁。
-    def _main_display_title(st_now: dict) -> str:
-        title = "手机桌面"
-        proj_root = st_now.get("project_root")
-        if proj_root:
-            cfg_path = _pathlib.Path(proj_root) / "scrcpycontrol" / "display_config.json"
-            try:
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    t = _json.load(f).get("main_display", {}).get("window_title")
-                    if t:
-                        title = str(t)
-            except Exception:
-                pass
-        return title
-
-    server_pid = int(st["server_pid"])
-    skip_server_titles = {_main_display_title(st)}
-    print(f"[watcher] 启动：server PID={server_pid}→#{st.get('server_desktop', 0)}，"
-          f"轮询间隔 {interval}s，手机主屏 {next(iter(skip_server_titles))!r} 跟随用户不回迁；"
-          f"UU 桌面尚未懒创建，UU 归位待机中。",
-          flush=True)
-
-    fail_s: dict[int, int] = {}
-    fail_u: dict[int, int] = {}
-    missed = 0
-    last_uu_active = None
-    while True:
-        # 每轮重读 state：捕获 uu-open 写入的 uu_active/uu_desktop
-        fresh = _load_state()
-        if fresh is not None:
-            st = fresh
-        server_desk = int(st.get("server_desktop", 0))
-
-        if not _pid_alive(server_pid):
-            missed += 1
-            if missed >= 3:
-                print("[watcher] server.py 已退出，watcher 结束。", flush=True)
-                return 0
-        else:
-            missed = 0
-            _move_wrong_hwnds(_collect_descendant_pids(server_pid),
-                              server_desk, fail_s, "server",
-                              skip_titles=skip_server_titles)
-
-        # UU 归位仅在懒创建完成后生效；且目标桌面当前必须真实存在
-        uu_active = bool(st.get("uu_active")) and st.get("uu_desktop") is not None
-        if uu_active != last_uu_active:
-            print(f"[watcher] UU 归位状态切换：{'启用' if uu_active else '停用'}"
-                  f"（uu_desktop={st.get('uu_desktop')}）", flush=True)
-            last_uu_active = uu_active
-        if uu_active:
-            try:
-                total_desktops = len(get_virtual_desktops())
-            except Exception:
-                total_desktops = 0
-            uu_desk = int(st.get("uu_desktop"))
-            if 0 <= uu_desk < total_desktops:
-                # UU 无论 server 死活都持续归位（用户可能在停服后仍使用远程桌面）。
-                # 各桌面的底部 Dock 由 Toolbar 常驻服务自行 reconcile，watcher 不插手
-                # （单进程多 Dock，按进程树归位会误伤其他桌面的 Dock）。
-                _move_wrong_hwnds(_remote_pids(), uu_desk, fail_u, "uu")
-        _time.sleep(interval)
 
 
 def do_signal_pid(args) -> int:
@@ -2666,7 +2569,6 @@ def do_stop(args) -> int:
     """全量停止整条链路并核验「零项目进程残留」（2026-09-26）：
 
        进程拓扑与各自归宿：
-         · watcher（virtual_desktop.py watch，detached）… state PID + 命令行兜底；
          · Toolbar 服务（virtual_desktop.py toolbar，detached）… state PID 优先、
            同域 .vd_toolbar.pid 文件兜底，一个进程托管各虚拟桌面的底部 Dock；
          · 外部辅助服务（bootstrap Step 0 最先启动，独立项目 detached）…
@@ -2698,12 +2600,11 @@ def do_stop(args) -> int:
             st = {"server_pid": int(forced)}
         else:
             print(f"[stop] 未找到 {_STATE_FILE.name}：进入【孤儿清扫模式】——不发 "
-                  f"CTRL_C，按命令行特征 / 同域 PID 文件 / 进程名清理 watcher、"
+                  f"CTRL_C，按命令行特征 / 同域 PID 文件 / 进程名清理"
                   f"Toolbar 服务、scrcpy、UU（backdrop 子进程无特征，无法定位）。",
                   flush=True)
             st = {}
 
-    watcher_pid = st.get("watcher_pid")
     server_pid = st.get("server_pid")
     kill_uu = bool(getattr(args, "kill_uu", True))
     remove_desktops = bool(getattr(args, "remove_desktops", True))
@@ -2714,16 +2615,11 @@ def do_stop(args) -> int:
     _kernel32.SetConsoleCtrlHandler(None, True)
     try:
         print(f"[stop-diag] state 记录的 PID：server={server_pid} "
-              f"watcher={watcher_pid} toolbar={st.get('toolbar_pid')} "
+              f"toolbar={st.get('toolbar_pid')} "
               f"backdrop={st.get('backdrop_pid')}；"
               f"kill_uu={kill_uu} remove_desktops={remove_desktops}", flush=True)
         print("[stop-diag] 停止前相关进程快照（python/scrcpy/adb/uu）：", flush=True)
         _diag_dump_related()
-
-        # ---- 1) 先杀 watcher：防止后续窗口消失/桌面删除时它来回搬窗 ----
-        if _pid_alive(watcher_pid):
-            _taskkill_tree(int(watcher_pid), label="watcher")
-            print(f"[stop] watcher PID={watcher_pid} 已停止。", flush=True)
 
         # ---- 2) 杀 Toolbar 服务（纯 UI 常驻，强杀无副作用）：state 优先，
         #      .vd_toolbar.pid 是 vd 同域文件，仅作旧 state/启动失败时的回退 ----
@@ -2774,10 +2670,10 @@ def do_stop(args) -> int:
             print(f"[stop] server.py PID={server_pid} 已不在运行。", flush=True)
 
         # ---- 4) 无条件兜底清扫（不信赖任何隐式回收，只认真实存活）----
-        # 4a. 命令行特征：watcher / toolbar / server（覆盖 PID 失配、
+        # 4a. 命令行特征：toolbar / server（覆盖 PID 失配、
         #     被 uu-open 补启、强杀后子孙变孤儿等全部场景；另含旧版 uu_dock 兼容）
         hits = _find_project_pids_by_cmdline(_STOP_CMDLINE_PATTERNS)
-        for label in ("watcher", "toolbar", "server"):
+        for label in ("toolbar", "server"):
             for pid in hits.get(label, []):
                 if _pid_alive(pid) and _taskkill_tree(pid, label=f"residual-{label}"):
                     print(f"[stop] 兜底结束残留 {label} PID={pid}。", flush=True)
@@ -2890,7 +2786,7 @@ def do_stop(args) -> int:
             print("[stop] ❌ 仍有项目进程残留（可能权限不足，请任务管理器手动结束）：",
                   flush=True)
             if remain_py:
-                print(f"        python(server/watcher/toolbar) PIDs={remain_py}",
+                print(f"        python(server/toolbar) PIDs={remain_py}",
                       flush=True)
             if remain_bd:
                 print(f"        backdrop qt_backdrop PIDs={remain_bd}", flush=True)
@@ -2899,7 +2795,7 @@ def do_stop(args) -> int:
             if remain_uu:
                 print(f"        UU 主程序 PIDs={remain_uu}", flush=True)
         else:
-            print("[stop] ✅ 项目进程零残留：server / watcher / Toolbar 服务 / "
+            print("[stop] ✅ 项目进程零残留：server / Toolbar 服务 / "
                   "backdrop / scrcpy 全部结束，osk 已关闭"
                   + ("，UU 已关闭" if kill_uu else "（UU 按要求保留）")
                   + "。", flush=True)
@@ -2922,8 +2818,6 @@ def do_status(args) -> int:
     print(f"  启动时间      : {st.get('started_at')}")
     print(f"  server.py     : PID={st.get('server_pid')} "
           f"{'🟢 运行中' if _pid_alive(st.get('server_pid')) else '⚪ 已退出'} → 桌面 #{st.get('server_desktop')}")
-    print(f"  watcher       : PID={st.get('watcher_pid')} "
-          f"{'🟢 运行中' if _pid_alive(st.get('watcher_pid')) else '⚪ 已退出'}")
     # Step 0 外部辅助服务：以端口实时探活为准（PID 仅在本次 bootstrap 新启动时登记）
     for _aux in _AUX_SERVICES:
         _pid = st.get(f"aux_{_aux['key']}_pid")
@@ -2965,7 +2859,7 @@ def do_bootstrap(args) -> int:
       4) 目标即当前桌面时跳过 sweeper（零耗时）；仅跨桌面启动才 join 扫尾
          poller（无新窗口 4s 提前收工，上限 ~9s）；
       5) 审计报告：枚举 server 子孙 PID 的全部 HWND 与真实桌面归属；
-      6) state 落盘（uu_active=False，UU 相关字段为空）+ 启动常驻 watcher。
+      6) state 落盘（uu_active=False，UU 相关字段为空）。
     """
     vd = VirtualDesktops()
     server_desk = vd.current_index()
@@ -3186,23 +3080,21 @@ def do_bootstrap(args) -> int:
         print(f"\n  🎯 审计通过：共 {total_ok} 个窗口全部在当前桌面 #{server_desk}。")
     else:
         print(
-            f"\n  ⚠️  仍有 {total_ng} 个窗口不在当前桌面（watcher 会在运行期间持续补迁）。\n"
+            f"\n  ⚠️  仍有 {total_ng} 个窗口不在当前桌面。\n"
             f"     说明：\n"
             f"       · server 就绪已以 HTTP /status 应答为准，与窗口数量无关；\n"
-            f"       · scrcpy 卡片是懒创建的，启动后陆续冒出由常驻 watcher 每 1.5s 归位。"
+            f"       · scrcpy 卡片是懒创建的，启动后陆续冒出，归属其出生时的当前桌面。"
         )
     print("=" * 80)
 
     # =====================================================================
-    # Step 5：状态落盘 + 启动常驻归位 watcher
-    #   懒创建模型：state 里 UU 字段为空/未激活；uu-open 运行期回填
-    #   （watcher 每轮重读 state，自动接续 UU/回程Dock 的归位）。
-    #   watcher 解决 bootstrap 进程退出后无人管的动态窗口：
-    #     a) server 运行期间 AI 动态新开的 scrcpy 卡片（旧 sweeper 只活十几秒）；
-    #     b) uu-open 创建 UU 桌面后，托盘点开的 UU 窗口归位。
-    #   stop 子命令凭状态文件先杀 watcher，再 CTRL_C 优雅停 server。
+    # Step 5：状态落盘。
+    #   懒创建模型：state 里 UU 字段为空/未激活；uu-open 运行期回填。
+    #   窗口归属约定：初始窗口靠强隔离时序出生即正确（bootstrap 窗口期内
+    #   活跃桌面=目标桌面且无人能切走）；后续动态窗口跟随当前所在桌面，
+    #   人为搬窗不干预——不设常驻归位。
+    #   stop 子命令凭状态文件 CTRL_C 优雅停 server。
     # =====================================================================
-    watcher_pid = None
     if p_server is not None:
         # backdrop PID 优先复用就绪探针首次成功时留存的 /status（零额外等待）；
         # 探针超时（server 起得慢）时再补一轮短轮询。跨域只走 HTTP。
@@ -3231,7 +3123,6 @@ def do_bootstrap(args) -> int:
             "uu_pids": [],
             "uu_preexisting": False,
             "uu_dock_pid": None,
-            "watcher_pid": None,
             # Toolbar 是 vd 自己 Step 1 拉起的进程，PID 直接登记（其自写的
             # .vd_toolbar.pid 仅作同域单实例锁与 stop 回退）。
             "toolbar_pid": toolbar_pid,
@@ -3245,24 +3136,6 @@ def do_bootstrap(args) -> int:
             "server_host": server_host,
             "server_port": server_port,
         }
-        _save_state(state)  # watcher 启动即读，必须先落盘
-        if not bool(getattr(args, "no_watcher", False)):
-            try:
-                log_fp = open(_WATCHER_LOG, "a", encoding="utf-8")
-                wcmd = [
-                    sys.executable, str(_SCRIPT_DIR / "virtual_desktop.py"), "watch",
-                    "--state-file", str(_STATE_FILE), "--interval", "1.5",
-                ]
-                wp = subprocess.Popen(
-                    wcmd, cwd=str(_SCRIPT_DIR),
-                    stdout=log_fp, stderr=subprocess.STDOUT, close_fds=True,
-                    creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-                )
-                watcher_pid = wp.pid
-                print(f"[bootstrap] 🛰️  常驻归位 watcher 已启动 PID={watcher_pid}（日志 .vd_watcher.log）")
-            except Exception as e:
-                print(f"[bootstrap] ⚠️  watcher 启动失败（不影响 server）: {e!r}")
-        state["watcher_pid"] = watcher_pid
         _save_state(state)
         print(f"[bootstrap] 💾 会话状态已写入 {_STATE_FILE.name}；"
               f"停止整条链路请执行：python virtual_desktop.py stop")
@@ -3284,7 +3157,7 @@ def do_uu_open(args) -> int:
       全程结束后停留在 UU 桌面（这正是点「电脑」的目的，无 switchback）。
       各桌面底部 Dock 由 Toolbar 常驻服务 reconcile 自动出现/消失，本函数不管 Dock。
     """
-    # 与 watcher 相同：detached 新进程先初始化 COM，pyvda 调用才可靠
+    # detached 新进程先初始化 COM，pyvda 调用才可靠
     try:
         _ctypes.windll.ole32.CoInitializeEx(None, 0x2)
     except Exception:
@@ -3356,7 +3229,7 @@ def do_uu_open(args) -> int:
         switched = _switch_desktop_verified(vd, uu_idx, tag="uu-open")
         if not switched:
             print(f"[uu-open] ⚠️ 未能确认切换到 #{uu_idx}，仍尝试启动；"
-                  f"若窗口落在别的桌面，watcher 会归位到 #{uu_idx}。", flush=True)
+                  f"若窗口落在别的桌面，已由本次 uu-open 一次性归位到 #{uu_idx}。", flush=True)
         print(f"[uu-open] 🚀 {action}：{uu_exe}", flush=True)
         record_pids, preexisting, mode = _launch_uu_on_desktop(
             vd, uu_idx, uu_cmd, uu_exe,
@@ -3365,7 +3238,7 @@ def do_uu_open(args) -> int:
 
         # 新桌面的底部 Dock 由 Toolbar 服务 reconcile（≤2s）自动补上。
 
-        # 回填最终 state（watcher 下一轮（≤1.5s）即读到并开始 UU 归位）
+        # 回填最终 state（归位已由 uu-open 一次性完成，无需他人接续）
         _update_state(
             uu_active=True,
             uu_desktop=uu_idx,
@@ -3450,8 +3323,6 @@ def main() -> int:
                              "`adb connect`，如 --phoneaddress 192.168.1.100:5555"
                              "（可不写端口，默认 5555）；检测失败会弹出连接窗口让你"
                              "重新输入/插 USB 重试；该参数不会传给 server.py")
-    p_boot.add_argument("--no-watcher", action="store_true",
-                        help="不启动常驻归位 watcher（动态新开的 scrcpy 卡片/uu-open 后托盘点开的 UU 将无人归位）")
 
     # uu-open（toolbar 电脑钮触发）：按需创建 UU 桌面 + 启动/唤醒 UU 远程；已存在则只切桌面
     p_uu = sub.add_parser(
@@ -3473,11 +3344,6 @@ def main() -> int:
     p_uu.add_argument("--no-uu-dock", action="store_true",
                       help=argparse.SUPPRESS)  # 已废弃：Dock 改由 Toolbar 服务托管，参数仅为兼容旧命令行
 
-    # watcher（内部命令，由 bootstrap 以 detached 方式自启，也可手动运行排障）
-    p_watch = sub.add_parser("watch", help=argparse.SUPPRESS)
-    p_watch.add_argument("--state-file", default=None)
-    p_watch.add_argument("--interval", type=float, default=1.5)
-
     # signal-pid（内部命令：stop 的一次性 CTRL_C 信号助手）
     p_sig = sub.add_parser("signal-pid", help=argparse.SUPPRESS)
     p_sig.add_argument("--pid", type=int, required=True)
@@ -3488,7 +3354,7 @@ def main() -> int:
     # stop：全量停止——默认连 UU 主程序、UU 虚拟桌面一起清理，做到零项目进程残留
     p_stop = sub.add_parser(
         "stop",
-        help="全量停止：CTRL_C 优雅停 server（超时强杀）+ Toolbar 服务 + watcher + "
+        help="全量停止：CTRL_C 优雅停 server（超时强杀）+ Toolbar 服务 + "
              "全部 scrcpy；默认同时关闭 UU 主程序并删除 UU 虚拟桌面；无 state 也清扫孤儿",
     )
     p_stop.set_defaults(kill_uu=True, remove_desktops=True)
@@ -3505,10 +3371,10 @@ def main() -> int:
     p_stop.add_argument("--keep-state", action="store_true",
                         help="停止后保留 .vd_state.json（默认删除）")
 
-    sub.add_parser("status", help="查看 bootstrap 会话（server/watcher/UU 存活状态与桌面编号）")
+    sub.add_parser("status", help="查看 bootstrap 会话（server/UU 存活状态与桌面编号）")
 
     args = parser.parse_args()
-    # 虚拟桌面相关命令都需要 vd；bootstrap/watch/stop/status 在各自 do_* 里实例化
+    # 虚拟桌面相关命令都需要 vd；bootstrap/stop/status 在各自 do_* 里实例化
     if args.cmd == "bootstrap":
         try:
             return do_bootstrap(args)
@@ -3521,8 +3387,6 @@ def main() -> int:
         except (FileNotFoundError, ValueError) as e:
             print(f"[uu-open] ❌ {e}")
             return 1
-    if args.cmd == "watch":
-        return do_watch(args)
     if args.cmd == "signal-pid":
         return do_signal_pid(args)
     if args.cmd == "toolbar":

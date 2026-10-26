@@ -139,15 +139,7 @@ adb connect 192.168.1.100:5555
 python server.py
 ```
 
-如果同时连接了多台设备，通过环境变量 `PHONE_AGENT_DEVICE_ID` 指定无线设备：
-
-```bash
-# Windows (PowerShell)
-$env:PHONE_AGENT_DEVICE_ID="192.168.1.100:5555"; python server.py
-
-# MacOS / Linux
-PHONE_AGENT_DEVICE_ID=192.168.1.100:5555 python server.py
-```
+服务会自动检测已连接的设备（连接哪台就控制哪台），不依赖任何环境变量。如果电脑上连接了多台设备，建议先用 `adb disconnect` 断开不需要的设备，只保留要控制的那台。
 
 > 注意：部分手机重启后会自动关闭无线调试，需重新用 USB 执行一次 `adb tcpip 5555` 再连接。
 
@@ -304,8 +296,8 @@ conn.disconnect("192.168.1.100:5555")
 
 **多设备：**
 
-- 使用环境变量 `PHONE_AGENT_DEVICE_ID` 指定要使用的设备
-- 或使用 `adb devices` 查看所有已连接设备
+- 使用 `adb devices` 查看所有已连接设备
+- 服务会自动检测已连接的设备，建议用 `adb disconnect` 断开不需要的设备，只保留要控制的那台
 
 ## 配置
 

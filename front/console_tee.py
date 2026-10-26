@@ -86,7 +86,7 @@ class ConsoleTee:
         try:
             import os as _os
             here = _os.path.dirname(_os.path.abspath(__file__))  # front/
-            project_root = _os.path.dirname(here)                # Open-AutoGLM/
+            project_root = _os.path.dirname(here)                # PhoneController/
             return _os.path.join(project_root, "scrcpycontrol", "display_config.json")
         except Exception:
             return None

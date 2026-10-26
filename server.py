@@ -659,7 +659,7 @@ def _acquire_singleton_lock(lock_name: str):
 
 def main():
     # ── 单例锁必须最先：已有实例（任意端口/参数启动）在跑就直接退出 ──
-    _singleton_lock = _acquire_singleton_lock("open_autoglm")
+    _singleton_lock = _acquire_singleton_lock("phonecontroller")
 
     # ── 统一 adb 来源：优先使用 scrcpy 自带的 adb.exe，必须早于任何
     #    adbutils / "adb" 子进程调用（adbutils 每次按 PATH 实时解析）──

@@ -1,10 +1,10 @@
 # PhoneController
+
+## 项目背景：眼镜的未来到底是什么
 可与手势识别：https://github.com/xdjzhh/HandDetecterForEye
 语音识别：https://github.com/xdjzhh/ASR
 启动框架：https://github.com/xdjzhh/VirtualDesk
 一直食用
-
-## 项目背景：眼镜的未来到底是什么
 
 纵观当前所有眼镜产品，无一例外都在注重功能炫酷，疯狂加码显示清晰度，却没有任何真正的实际用途。在动手做产品之前，我们先思考三个问题：
 

@@ -1,4 +1,7 @@
 # PhoneController
+hand detection：https://github.com/xdjzhh/HandDetecterForEye
+ASR：https://github.com/xdjzhh/ASR
+start framework：https://github.com/xdjzhh/VirtualDesk
 
 ## Background: What Is the Real Future of Smart Glasses?
 
@@ -39,6 +42,11 @@ The server runs as a Flask HTTP server, with tasks dispatched via the `/run` API
 > This project is for research and learning purposes only. It must not be used for illegal information acquisition, system interference, or any other illegal activities.
 
 **Current limitation**: the controller currently runs on Windows and will later be ported to a trimmed-down Linux system for extreme lightweight deployment, further reducing the power consumption and size of the remote control host.
+hand detection：https://github.com/xdjzhh/HandDetecterForEye
+ASR：https://github.com/xdjzhh/ASR
+start framework：https://github.com/xdjzhh/VirtualDesk
+<img width="685" height="501" alt="image" src="https://github.com/user-attachments/assets/53c46a5c-ae37-4899-b824-44dd5ade5e98" />
+<img width="685" height="473" alt="image" src="https://github.com/user-attachments/assets/a8f6ab20-9cce-4524-8b6a-6f5d8ae951e3" />
 
 ## Android Setup
 

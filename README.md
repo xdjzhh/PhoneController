@@ -2,7 +2,7 @@
 可与手势识别：https://github.com/xdjzhh/HandDetecterForEye
 语音识别：https://github.com/xdjzhh/ASR
 启动框架：https://github.com/xdjzhh/VirtualDesk
-一直食用
+一起食用
 ## 项目背景：眼镜的未来到底是什么
 
 

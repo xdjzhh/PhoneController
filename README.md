@@ -1,6 +1,10 @@
 # PhoneController
-
+可与手势识别：https://github.com/xdjzhh/HandDetecterForEye
+语音识别：https://github.com/xdjzhh/ASR
+启动框架：https://github.com/xdjzhh/VirtualDesk
+一直食用
 ## 项目背景：眼镜的未来到底是什么
+
 
 纵观当前所有眼镜产品，无一例外都在注重功能炫酷，疯狂加码显示清晰度，却没有任何真正的实际用途。在动手做产品之前，我们先思考三个问题：
 
@@ -42,6 +46,13 @@ ADB 调试能力，可通过 WiFi 或网络连接设备，实现灵活的远程�
 > 本项目仅供研究和学习使用。严禁用于非法获取信息、干扰系统或任何违法活动。
 
 **当前限制**：控制端当前基于 Windows 实现，后续将迁移至裁剪的 Linux 系统，进行极限轻量化，进一步降低远端控制主机的功耗与体积。
+
+可与手势识别：https://github.com/xdjzhh/HandDetecterForEye
+语音识别：https://github.com/xdjzhh/ASR
+启动框架：https://github.com/xdjzhh/VirtualDesk
+一起食用
+<img width="685" height="501" alt="image" src="https://github.com/user-attachments/assets/53c46a5c-ae37-4899-b824-44dd5ade5e98" />
+<img width="685" height="473" alt="image" src="https://github.com/user-attachments/assets/a8f6ab20-9cce-4524-8b6a-6f5d8ae951e3" />
 
 
 ## Android 环境准备
